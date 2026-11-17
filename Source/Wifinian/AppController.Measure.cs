@@ -67,6 +67,7 @@ internal partial class AppController
 
 		connectionChanged
 			.Where(x => x.ChangedState == ConnectionChangedState.Completed)
+			.Where(_ => !_isProbing) // The test of networks measures the networks it connects to.
 			.GroupBy(x => x.InterfaceId)
 			.SelectMany(x => x.Throttle(_afterConnectDelay))
 			.Subscribe(async x => await MeasureConnectedAsync(SpeedTrigger.AfterConnect, x.InterfaceId))
@@ -81,7 +82,10 @@ internal partial class AppController
 			.Subscribe(x =>
 			{
 				SetAfterConnectPending(x.InterfaceId, false);
-				CancelMeasure(x.InterfaceId);
+
+				// The test of networks handles the changes of connection made by itself.
+				if (!_isProbing)
+					CancelMeasure(x.InterfaceId);
 			})
 			.AddTo(this.Subscription);
 
@@ -97,6 +101,8 @@ internal partial class AppController
 				ResetDwell();
 			})
 			.AddTo(this.Subscription);
+
+		InitiateProbe();
 	}
 
 	/// <summary>
@@ -205,7 +211,8 @@ internal partial class AppController
 	{
 		try
 		{
-			if (_disposed)
+			// While networks are being tested one after another, they are measured by the test itself.
+			if (_disposed || _isProbing)
 				return null;
 
 			// Automatic measurements are for the networks between which this app can switch.
@@ -318,125 +325,15 @@ internal partial class AppController
 					return PutOff();
 			}
 
-			if (!_measureSemaphore.Wait(TimeSpan.Zero))
+			var (sample, isRecorded) = await MeasureProfileAsync(
+				profile,
+				trigger,
+				(trigger is SpeedTrigger.Manual) ? SpeedTestSize.Full : SpeedTestSize.Quick,
+				isRecheck).ConfigureAwait(false);
+
+			// Another measurement is running.
+			if (sample is null)
 				return PutOff();
-
-			SpeedSample sample;
-			var isRecorded = true;
-			CancellationTokenSource cancellation = null;
-			try
-			{
-				IsMeasuring.TurnOn();
-				profile.IsMeasuring = true;
-
-				// The limit of frequency counts only the measurements actually started.
-				if ((trigger is SpeedTrigger.Verify) && !isRecheck)
-				{
-					lock (_switchLock)
-					{
-						_lastVerifyTimes[key] = DateTime.UtcNow;
-					}
-				}
-
-				lock (_measureLock)
-				{
-					_lastAttemptTimes[key] = DateTime.UtcNow;
-
-					cancellation = new CancellationTokenSource();
-					_measureCancellation = cancellation;
-					_measureInterfaceId = targetId;
-				}
-				var token = cancellation.Token;
-
-				try
-				{
-					if (!LinkInspector.IsReady(targetId))
-						await LinkInspector.WaitForAddressAsync(targetId, _addressTimeout, token).ConfigureAwait(false);
-				}
-				catch (OperationCanceledException)
-				{
-					// The measurement will record this as aborted.
-				}
-
-				var linkRate = profile.LinkRate;
-
-				sample = new SpeedSample
-				{
-					Time = DateTime.UtcNow,
-					InterfaceId = targetId,
-					Profile = profile.Name,
-					Bssid = profile.Bssid ?? string.Empty,
-					Band = profile.Band,
-					Channel = profile.Channel,
-					Signal = profile.Signal,
-					LinkRate = (linkRate > 0) ? linkRate : null,
-					Trigger = trigger
-				};
-
-				await _tester.MeasureAsync(
-					sample,
-					(trigger is SpeedTrigger.Manual) ? SpeedTestSize.Full : SpeedTestSize.Quick,
-					token).ConfigureAwait(false);
-
-				// If the connection has changed during the measurement, the result is not of the network.
-				ProfileItem currentProfile;
-				lock (_profilesLock)
-				{
-					currentProfile = Profiles.FirstOrDefault(x => x.IsConnected && (x.InterfaceId == targetId));
-				}
-
-				if (!ReferenceEquals(currentProfile, profile))
-				{
-					sample.Result = SpeedResult.Aborted;
-				}
-				else
-				{
-					var currentBssid = currentProfile.Bssid;
-					if (!string.IsNullOrEmpty(currentBssid)
-						&& !string.IsNullOrEmpty(sample.Bssid)
-						&& !string.Equals(currentBssid, sample.Bssid, StringComparison.OrdinalIgnoreCase))
-					{
-						sample.Result = SpeedResult.Aborted;
-					}
-				}
-
-				var isOffline = sample.Result is SpeedResult.NoInternet or SpeedResult.CaptivePortal;
-				if (isOffline)
-				{
-					lock (_switchLock)
-					{
-						_lastOfflineTimes[key] = DateTime.UtcNow;
-					}
-				}
-
-				// A recheck is repeated at every sample tick and so only what it newly finds is recorded.
-				if (isRecheck)
-				{
-					isRecorded = sample.Valid
-						&& !(isOffline
-							&& (History.GetSummary(key) is { IsOffline: true } recorded)
-							&& (DateTime.UtcNow - recorded.LastTime < _recheckRecordInterval));
-				}
-
-				if (isRecorded)
-				{
-					History.AppendSpeed(sample);
-					ApplySummary(profile);
-				}
-			}
-			finally
-			{
-				profile.IsMeasuring = false;
-
-				lock (_measureLock)
-				{
-					_measureCancellation = null;
-				}
-				cancellation?.Dispose();
-
-				IsMeasuring.TurnOff();
-				_measureSemaphore.Release();
-			}
 
 			if (!isRecorded)
 				return sample;
@@ -462,6 +359,147 @@ internal partial class AppController
 				+ ex);
 			return null;
 		}
+	}
+
+	/// <summary>
+	/// Measures speed of a connected profile and records the result.
+	/// </summary>
+	/// <param name="profile">Connected profile</param>
+	/// <param name="trigger">Trigger</param>
+	/// <param name="size">Size of measurement</param>
+	/// <param name="isRecheck">Whether this is to check again a network found without internet access</param>
+	/// <param name="waitTime">Time to wait for a running measurement to end</param>
+	/// <returns>
+	/// Speed sample and whether it is recorded in history. The sample is null if not measured
+	/// because another measurement is running.
+	/// </returns>
+	/// <remarks>
+	/// No condition for the trigger is checked by this method. If the connection has changed
+	/// during the measurement, the result is recorded as aborted.
+	/// </remarks>
+	private async Task<(SpeedSample sample, bool isRecorded)> MeasureProfileAsync(ProfileItem profile, SpeedTrigger trigger, SpeedTestSize size, bool isRecheck = false, TimeSpan waitTime = default)
+	{
+		var targetId = profile.InterfaceId;
+		var key = HistoryService.GetKey(profile.Name, targetId);
+
+		if (!await _measureSemaphore.WaitAsync(waitTime).ConfigureAwait(false))
+			return (null, false);
+
+		SpeedSample sample;
+		var isRecorded = true;
+		CancellationTokenSource cancellation = null;
+		try
+		{
+			IsMeasuring.TurnOn();
+			profile.IsMeasuring = true;
+
+			// The limit of frequency counts only the measurements actually started.
+			if ((trigger is SpeedTrigger.Verify) && !isRecheck)
+			{
+				lock (_switchLock)
+				{
+					_lastVerifyTimes[key] = DateTime.UtcNow;
+				}
+			}
+
+			lock (_measureLock)
+			{
+				_lastAttemptTimes[key] = DateTime.UtcNow;
+
+				cancellation = new CancellationTokenSource();
+				_measureCancellation = cancellation;
+				_measureInterfaceId = targetId;
+			}
+			var token = cancellation.Token;
+
+			try
+			{
+				if (!LinkInspector.IsReady(targetId))
+					await LinkInspector.WaitForAddressAsync(targetId, _addressTimeout, token).ConfigureAwait(false);
+			}
+			catch (OperationCanceledException)
+			{
+				// The measurement will record this as aborted.
+			}
+
+			var linkRate = profile.LinkRate;
+
+			sample = new SpeedSample
+			{
+				Time = DateTime.UtcNow,
+				InterfaceId = targetId,
+				Profile = profile.Name,
+				Bssid = profile.Bssid ?? string.Empty,
+				Band = profile.Band,
+				Channel = profile.Channel,
+				Signal = profile.Signal,
+				LinkRate = (linkRate > 0) ? linkRate : null,
+				Trigger = trigger
+			};
+
+			await _tester.MeasureAsync(sample, size, token).ConfigureAwait(false);
+
+			// If the connection has changed during the measurement, the result is not of the network.
+			ProfileItem currentProfile;
+			lock (_profilesLock)
+			{
+				currentProfile = Profiles.FirstOrDefault(x => x.IsConnected && (x.InterfaceId == targetId));
+			}
+
+			if (!ReferenceEquals(currentProfile, profile))
+			{
+				sample.Result = SpeedResult.Aborted;
+			}
+			else
+			{
+				var currentBssid = currentProfile.Bssid;
+				if (!string.IsNullOrEmpty(currentBssid)
+					&& !string.IsNullOrEmpty(sample.Bssid)
+					&& !string.Equals(currentBssid, sample.Bssid, StringComparison.OrdinalIgnoreCase))
+				{
+					sample.Result = SpeedResult.Aborted;
+				}
+			}
+
+			var isOffline = sample.Result is SpeedResult.NoInternet or SpeedResult.CaptivePortal;
+			if (isOffline)
+			{
+				lock (_switchLock)
+				{
+					_lastOfflineTimes[key] = DateTime.UtcNow;
+				}
+			}
+
+			// A recheck is repeated at every sample tick and so only what it newly finds is recorded.
+			if (isRecheck)
+			{
+				isRecorded = sample.Valid
+					&& !(isOffline
+						&& (History.GetSummary(key) is { IsOffline: true } recorded)
+						&& (DateTime.UtcNow - recorded.LastTime < _recheckRecordInterval));
+			}
+
+			if (isRecorded)
+			{
+				History.AppendSpeed(sample);
+				ApplySummary(profile);
+			}
+		}
+		finally
+		{
+			profile.IsMeasuring = false;
+
+			lock (_measureLock)
+			{
+				_measureCancellation = null;
+			}
+			cancellation?.Dispose();
+
+			IsMeasuring.TurnOff();
+			_measureSemaphore.Release();
+		}
+
+		return (sample, isRecorded);
 	}
 
 	/// <summary>

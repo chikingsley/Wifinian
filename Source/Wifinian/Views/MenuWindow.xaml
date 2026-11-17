@@ -91,6 +91,15 @@
 						  IsChecked="{Binding Source={x:Static models:Settings.Current}, Path=EngagesSpeed, Mode=TwoWay}"/>
 		</ContentControl>
 
+		<ContentControl Style="{StaticResource MenuItemStyle}">
+			<ToggleButton Padding="8,4"
+						  Style="{StaticResource CheckButtonItemStyle}"
+						  FontSize="13"
+						  Content="{x:Static models:LanguageService.ProbeIdle}"
+						  ToolTip="{x:Static models:LanguageService.TestAllNote}"
+						  IsChecked="{Binding Source={x:Static models:Settings.Current}, Path=ProbesWhenIdle, Mode=TwoWay}"/>
+		</ContentControl>
+
 		<Separator Style="{StaticResource MenuSeparatorStyle}"/>
 
 		<ContentControl Style="{StaticResource MenuItemStyle}">
@@ -99,6 +108,15 @@
 					FontSize="13"
 					Content="{x:Static models:LanguageService.TestSpeed}"
 					Command="{Binding MeasureCommand, Mode=OneTime}"/>
+		</ContentControl>
+
+		<ContentControl Style="{StaticResource MenuItemStyle}">
+			<Button Padding="8,4"
+					Style="{StaticResource MenuButtonItemStyle}"
+					FontSize="13"
+					Content="{Binding ProbeText.Value, Mode=OneWay}"
+					ToolTip="{x:Static models:LanguageService.TestAllNote}"
+					Command="{Binding ProbeCommand, Mode=OneTime}"/>
 		</ContentControl>
 
 		<Separator Style="{StaticResource MenuSeparatorStyle}"/>

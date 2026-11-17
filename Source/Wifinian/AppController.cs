@@ -246,6 +246,7 @@ internal partial class AppController : DisposableBase
 
 		if (disposing)
 		{
+			CancelProbe(true);
 			CancelMeasure();
 			_worker?.Dispose();
 			NotifyIconContainer.Dispose();
@@ -324,7 +325,8 @@ internal partial class AppController : DisposableBase
 	private Task ScanNetworkAsync()
 	{
 		// A scan takes the radio off the channel and so would distort a running speed measurement.
-		if (IsMeasuring.Value)
+		// It would also disturb connection to the networks being tested one after another.
+		if (IsMeasuring.Value || _isProbing)
 			return LoadProfilesAsync();
 
 		Debug.WriteLine("Scan start!");
@@ -519,6 +521,10 @@ internal partial class AppController : DisposableBase
 			if (IsResumed)
 				return;
 
+			// The test of networks loads the profiles and measures by itself.
+			if (_isProbing)
+				return;
+
 			await PurgeHistoryAsync();
 
 			if (await RequiresSampleScanAsync())
@@ -534,6 +540,7 @@ internal partial class AppController : DisposableBase
 			// The measurements requested by switching decisions are started after the update.
 			await MeasureRequestedAsync();
 			await MeasureIfDueAsync();
+			await TryIdleProbeAsync();
 		}
 		catch (Exception ex)
 		{
@@ -867,6 +874,7 @@ internal partial class AppController : DisposableBase
 
 		if (isManual)
 		{
+			CancelProbe(true);
 			EngagesPriority.Value = false;
 			ClearPendingSwitch(targetProfile.InterfaceId);
 		}
@@ -880,6 +888,7 @@ internal partial class AppController : DisposableBase
 
 		if (isManual)
 		{
+			CancelProbe(true);
 			EngagesPriority.Value = false;
 			ClearPendingSwitch(targetProfile.InterfaceId);
 		}

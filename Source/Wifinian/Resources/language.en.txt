@@ -23,7 +23,11 @@ ShowAvailable=Show available networks only
 RecordHistory=Record history
 MeasureSpeed=Measure speed automatically
 EngageSpeed=Engage by measured speed
+ProbeIdle=Test other networks when idle
 TestSpeed=Test speed now
+TestAll=Test all networks
+CancelTest=Cancel test
+TestAllNote=Wi-Fi drops for about 30 seconds per network
 Close=Close
 
 [Message]

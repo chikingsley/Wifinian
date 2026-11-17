@@ -279,6 +279,30 @@ public class Settings : DisposableBase
 	}
 	private int _switchMaxDeferral = 15; // Default
 
+	/// <summary>
+	/// Whether to test networks other than the connected one while this machine is idle
+	/// </summary>
+	/// <remarks>The connection drops for a while during the test.</remarks>
+	public bool ProbesWhenIdle
+	{
+		get => _probesWhenIdle;
+		set => SetProperty(ref _probesWhenIdle, value);
+	}
+	private bool _probesWhenIdle;
+
+	private const int MinProbeInterval = 1;
+	private const int MaxProbeInterval = 48;
+
+	/// <summary>
+	/// Interval (hours) of tests of other networks while this machine is idle
+	/// </summary>
+	public int ProbeInterval
+	{
+		get => _probeInterval;
+		set => SetProperty(ref _probeInterval, value, MinProbeInterval, MaxProbeInterval);
+	}
+	private int _probeInterval = 6; // Default
+
 	#endregion
 
 	internal void Initiate()

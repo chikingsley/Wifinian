@@ -41,7 +41,11 @@ internal static class LanguageService
 	public static string RecordHistory => GetContentValue();
 	public static string MeasureSpeed => GetContentValue();
 	public static string EngageSpeed => GetContentValue();
+	public static string ProbeIdle => GetContentValue();
 	public static string TestSpeed => GetContentValue();
+	public static string TestAll => GetContentValue();
+	public static string CancelTest => GetContentValue();
+	public static string TestAllNote => GetContentValue();
 	public static string Close => GetContentValue();
 
 	// Message
