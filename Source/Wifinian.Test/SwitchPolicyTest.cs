@@ -901,6 +901,45 @@ public class SwitchPolicyTest
 	}
 
 	[TestMethod]
+	public void TestWeakSignalDepartureIsNotReverted()
+	{
+		// A fast network whose signal has dropped still has a positive score.
+		var a = Profile("A", 25, 0, isConnected: true);
+		var b = Profile("B", 60, 1);
+		AddSample("A", TimeSpan.FromMinutes(5), SpeedResult.Ok, 77, 80);
+		AddSample("B", TimeSpan.FromMinutes(5), SpeedResult.Ok, 18, 60);
+
+		var state = CreateState("A", TimeSpan.Zero);
+		SwitchPolicy.Decide([a, b], a, CreateContext(), state);
+
+		var decision = SwitchPolicy.Decide([a, b], a, CreateContext(elapsed: TimeSpan.FromSeconds(31)), state);
+		Assert.AreSame(b, decision.Target);
+		StringAssert.StartsWith(decision.Code, "weak|");
+		Assert.IsTrue(decision.FromScore > 18 / SwitchPolicy.RevertRatio);
+
+		// The network left is not compared with and so never switched back to for low speed.
+		Assert.IsNull(SwitchPolicy.GetRevertScore(decision));
+
+		var landing = new SwitchLanding
+		{
+			FromName = "A",
+			FromScore = SwitchPolicy.GetRevertScore(decision),
+			ToName = "B",
+			Time = _utcNow
+		};
+
+		var later = _utcNow + TimeSpan.FromSeconds(30);
+		Assert.AreEqual(LandingAction.Clear, SwitchPolicy.EvaluateLanding(landing, Sample("B", TimeSpan.FromSeconds(-30), SpeedResult.Ok, 18, 60), later));
+		Assert.AreEqual(LandingAction.Clear, SwitchPolicy.EvaluateLanding(landing, Sample("B", TimeSpan.FromSeconds(-30), SpeedResult.NoInternet, 0, 60), later));
+
+		// The score of the network left for a faster one or for no internet access is kept.
+		Assert.AreEqual(24D, SwitchPolicy.GetRevertScore(new SwitchDecision { Code = "faster|A|B", FromScore = 24 }));
+		Assert.AreEqual(0D, SwitchPolicy.GetRevertScore(new SwitchDecision { Code = "offline|A|B", FromScore = 0 }));
+		Assert.IsNull(SwitchPolicy.GetRevertScore(new SwitchDecision { Code = "nodata|A|B" }));
+		Assert.IsNull(SwitchPolicy.GetRevertScore(null));
+	}
+
+	[TestMethod]
 	public void TestEvaluateLanding()
 	{
 		SwitchLanding Create(double? fromScore = 30, DateTime offlineTime = default) => new()

@@ -406,13 +406,12 @@ internal partial class AppController : DisposableBase
 			// The target of each interface is selected by the switching policy from the profiles
 			// allowed to be connected to. Unless speed is engaged, it is the first one in
 			// priority order whose signal is at or above the threshold.
-			var targetProfiles = (await Task.WhenAll(Profiles
+			var targetProfiles = Profiles
 				.GroupBy(x => x.InterfaceId)
-				.Select(subProfiles => SelectTargetAsync(
+				.Select(subProfiles => SelectTarget(
 					subProfiles.Key,
 					GetCandidates(subProfiles).Where(x => !x.IsAvoided).ToArray(),
 					subProfiles.FirstOrDefault(x => x.IsConnected)))
-				.ToArray()))
 				.Where(x => x is { IsConnected: false })
 				.ToArray();
 

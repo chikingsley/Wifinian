@@ -23,6 +23,7 @@ internal partial class AppController
 	private static readonly TimeSpan _dryRunInterval = TimeSpan.FromHours(1);
 
 	private static readonly TimeSpan _lullWindow = TimeSpan.FromSeconds(5);
+	private static readonly TimeSpan _linkCheckPeriod = TimeSpan.FromSeconds(60);
 	private const double LullRate = 0.2; // Mbps
 
 	private readonly Dictionary<Guid, SwitchState> _switchStates = new();
@@ -32,6 +33,8 @@ internal partial class AppController
 	private readonly Dictionary<Guid, (string code, DateTime time)> _lastDryRuns = new(); // UTC
 	private readonly Dictionary<Guid, SwitchLanding> _landings = new();
 	private readonly HashSet<Guid> _verifyRequests = new(); // Interface IDs
+	private readonly HashSet<Guid> _linkCheckRequests = new(); // Interface IDs
+	private readonly Dictionary<Guid, (bool isBusy, DateTime time)> _linkChecks = new(); // UTC
 	private readonly HashSet<Guid> _revertingIds = new(); // Interface IDs
 	private readonly Dictionary<string, DateTime> _lastVerifyTimes = new(); // UTC
 	private readonly Dictionary<string, DateTime> _lastOfflineTimes = new(); // UTC
@@ -107,23 +110,24 @@ internal partial class AppController
 	/// <param name="candidates">Profiles allowed to be connected to except avoided ones</param>
 	/// <param name="connected">Connected profile (null if none)</param>
 	/// <returns>Profile to connect to (null to stay)</returns>
-	/// <remarks>This method never throws an exception.</remarks>
-	private async Task<ProfileItem> SelectTargetAsync(Guid interfaceId, ProfileItem[] candidates, ProfileItem connected)
+	/// <remarks>
+	/// This method performs no I/O because it is called during an update. Traffic of the link,
+	/// if required by the decision, is checked in background and then the profiles are loaded
+	/// again. This method never throws an exception.
+	/// </remarks>
+	private ProfileItem SelectTarget(Guid interfaceId, ProfileItem[] candidates, ProfileItem connected)
 	{
 		try
 		{
 			var engagesSpeed = Settings.Current.EngagesSpeed;
 
-			var decision = DecideTarget(interfaceId, candidates, connected, engagesSpeed, null);
-			if (decision is { RequestsLinkCheck: true })
-			{
-				// Leaving a working network is put off while the link is in use.
-				var isLinkBusy = await LinkInspector.GetRateMbpsAsync(interfaceId, _lullWindow).ConfigureAwait(false) > LullRate;
-
-				decision = DecideTarget(interfaceId, candidates, connected, engagesSpeed, isLinkBusy);
-			}
+			// Leaving a working network is put off while the link is in use.
+			var decision = DecideTarget(interfaceId, candidates, connected, engagesSpeed, GetLinkCheck(interfaceId));
 			if (decision is null)
 				return null;
+
+			if (decision.RequestsLinkCheck && engagesSpeed)
+				CheckLink(interfaceId);
 
 			SwitchEvent stayEvent = null;
 
@@ -175,6 +179,77 @@ internal partial class AppController
 				+ ex);
 			return null;
 		}
+	}
+
+	/// <summary>
+	/// Gets the latest result of traffic check of an interface.
+	/// </summary>
+	/// <returns>True if the link is in use, false if not, null if not checked recently</returns>
+	private bool? GetLinkCheck(Guid interfaceId)
+	{
+		lock (_switchLock)
+		{
+			if (!_linkChecks.TryGetValue(interfaceId, out var check))
+				return null;
+
+			if ((DateTime.UtcNow - check.time).Duration() < _linkCheckPeriod)
+				return check.isBusy;
+
+			_linkChecks.Remove(interfaceId);
+			return null;
+		}
+	}
+
+	/// <summary>
+	/// Checks traffic of an interface in background and then loads the profiles again so that
+	/// the decision is made with the result.
+	/// </summary>
+	/// <remarks>This method returns immediately and never throws an exception.</remarks>
+	private void CheckLink(Guid interfaceId)
+	{
+		lock (_switchLock)
+		{
+			// A check of the interface is already running.
+			if (!_linkCheckRequests.Add(interfaceId))
+				return;
+		}
+
+		Task.Run(async () =>
+		{
+			var isChecked = false;
+			try
+			{
+				var isBusy = await LinkInspector.GetRateMbpsAsync(interfaceId, _lullWindow).ConfigureAwait(false) > LullRate;
+
+				lock (_switchLock)
+				{
+					// The request is gone if the user connected or disconnected in the meantime.
+					isChecked = _linkCheckRequests.Remove(interfaceId);
+					if (isChecked)
+						_linkChecks[interfaceId] = (isBusy, DateTime.UtcNow);
+				}
+
+				// If an update is running, this load is skipped and the result is used by
+				// the following one as long as it is recent.
+				if (isChecked && !_disposed)
+					await LoadProfilesAsync().ConfigureAwait(false);
+			}
+			catch (Exception ex)
+			{
+				Trace.WriteLine("Failed to check traffic of the link." + Environment.NewLine
+					+ ex);
+			}
+			finally
+			{
+				if (!isChecked)
+				{
+					lock (_switchLock)
+					{
+						_linkCheckRequests.Remove(interfaceId);
+					}
+				}
+			}
+		});
 	}
 
 	private SwitchDecision DecideTarget(Guid interfaceId, ProfileItem[] candidates, ProfileItem connected, bool engagesSpeed, bool? isLinkBusy)
@@ -229,7 +304,8 @@ internal partial class AppController
 				landing = new SwitchLanding
 				{
 					FromName = fromName,
-					FromScore = decision?.FromScore,
+					// The network left for weak signal is never switched back to for speed.
+					FromScore = SwitchPolicy.GetRevertScore(decision),
 					ToName = target.Name,
 					Time = DateTime.UtcNow,
 					FromOfflineTime = GetOfflineTime(fromName, interfaceId)
@@ -388,6 +464,10 @@ internal partial class AppController
 
 		var interfaceId = sample.InterfaceId;
 
+		// The network to switch back to must satisfy the same rule as any other target so that
+		// a network whose signal has become weak is not returned to.
+		var entrySignal = Settings.Current.SpeedSignalThreshold + SwitchPolicy.EntryMargin;
+
 		ProfileItem current;
 		ProfileItem from;
 		lock (_profilesLock)
@@ -397,7 +477,7 @@ internal partial class AppController
 			current = subProfiles.FirstOrDefault(x => x.IsConnected);
 			from = subProfiles.FirstOrDefault(x => !x.IsConnected
 				&& !x.IsAvoided
-				&& (x.Signal > 0)
+				&& (x.Signal >= entrySignal)
 				&& string.Equals(x.Name, landing.FromName, StringComparison.Ordinal));
 		}
 
@@ -419,7 +499,7 @@ internal partial class AppController
 				From = landing.ToName,
 				To = string.Empty,
 				FromScore = sample.DownMbps,
-				Reason = $"{why} but {landing.FromName} is no longer in range"
+				Reason = $"{why} but {landing.FromName} is no longer in range or too weak"
 			});
 			return;
 		}
@@ -525,6 +605,8 @@ internal partial class AppController
 
 			_landings.Remove(interfaceId);
 			_verifyRequests.Remove(interfaceId);
+			_linkCheckRequests.Remove(interfaceId);
+			_linkChecks.Remove(interfaceId);
 		}
 	}
 

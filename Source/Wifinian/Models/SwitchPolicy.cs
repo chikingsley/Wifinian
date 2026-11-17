@@ -263,6 +263,11 @@ internal static class SwitchPolicy
 	/// </summary>
 	public const double RevertRatio = 0.8D;
 
+	/// <summary>
+	/// Code of the decision to leave a network whose signal is too weak
+	/// </summary>
+	public const string WeakCode = "weak";
+
 	public static readonly TimeSpan PersistPeriod = TimeSpan.FromSeconds(30);
 	public static readonly TimeSpan BudgetPeriod = TimeSpan.FromHours(1);
 	public static readonly TimeSpan ExplorePeriod = TimeSpan.FromHours(24);
@@ -342,6 +347,27 @@ internal static class SwitchPolicy
 
 		var ticks = FailureCooldown.Ticks * (1L << Math.Min(count - 1, 10));
 		state.CooldownUntil[targetName] = now.AddTicks(Math.Min(ticks, MaxFailureCooldown.Ticks));
+	}
+
+	/// <summary>
+	/// Gets the score of the network before a switch with which the network switched to is
+	/// compared.
+	/// </summary>
+	/// <param name="decision">Decision of the switch</param>
+	/// <returns>Score if the previous network can be switched back to, null otherwise</returns>
+	/// <remarks>
+	/// A network left because its signal was too weak is never switched back to. Its score is
+	/// positive but returning there would undo the very reason of the switch.
+	/// </remarks>
+	public static double? GetRevertScore(SwitchDecision decision)
+	{
+		if (decision is null)
+			return null;
+
+		if (decision.Code?.StartsWith(WeakCode + "|", StringComparison.Ordinal) is true)
+			return null;
+
+		return decision.FromScore;
 	}
 
 	/// <summary>
@@ -666,7 +692,7 @@ internal static class SwitchPolicy
 			var why = isOffline
 				? $"{name} has no internet"
 				: $"{name} signal too weak ({connected.Signal}%)";
-			var code = isOffline ? "offline" : "weak";
+			var code = isOffline ? "offline" : WeakCode;
 
 			var target = Rank(others).FirstOrDefault();
 			if (target is null)
