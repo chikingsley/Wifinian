@@ -22,6 +22,7 @@ StartSignIn=Start on sign in
 ShowAvailable=Show available networks only
 RecordHistory=Record history
 MeasureSpeed=Measure speed automatically
+EngageSpeed=Engage by measured speed
 TestSpeed=Test speed now
 Close=Close
 

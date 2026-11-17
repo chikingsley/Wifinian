@@ -204,6 +204,81 @@ public class Settings : DisposableBase
 	}
 	private string[] _avoidedProfiles = Array.Empty<string>();
 
+	/// <summary>
+	/// Whether to select the network to connect to by measured speed
+	/// </summary>
+	public bool EngagesSpeed
+	{
+		get => _engagesSpeed;
+		set => SetProperty(ref _engagesSpeed, value);
+	}
+	private bool _engagesSpeed;
+
+	private const int MinSwitchDwellTime = 2;
+	private const int MaxSwitchDwellTime = 60;
+
+	/// <summary>
+	/// Time (min) to stay on a network after connection before switching by speed
+	/// </summary>
+	public int SwitchDwellTime
+	{
+		get => _switchDwellTime;
+		set => SetProperty(ref _switchDwellTime, value, MinSwitchDwellTime, MaxSwitchDwellTime);
+	}
+	private int _switchDwellTime = 10; // Default
+
+	private const int MinSwitchMargin = 20;
+	private const int MaxSwitchMargin = 200;
+
+	/// <summary>
+	/// Margin (percent) by which another network must be faster to be switched to
+	/// </summary>
+	public int SwitchMargin
+	{
+		get => _switchMargin;
+		set => SetProperty(ref _switchMargin, value, MinSwitchMargin, MaxSwitchMargin);
+	}
+	private int _switchMargin = 50; // Default
+
+	private const int MinSufficientSpeed = 5;
+	private const int MaxSufficientSpeed = 1000;
+
+	/// <summary>
+	/// Speed (Mbps) at or above which connected network is never left for a faster one
+	/// </summary>
+	public int SufficientSpeed
+	{
+		get => _sufficientSpeed;
+		set => SetProperty(ref _sufficientSpeed, value, MinSufficientSpeed, MaxSufficientSpeed);
+	}
+	private int _sufficientSpeed = 50; // Default
+
+	private const int MinSpeedSignalThreshold = 20;
+	private const int MaxSpeedSignalThreshold = 50;
+
+	/// <summary>
+	/// Signal threshold for a network whose speed has been measured
+	/// </summary>
+	public int SpeedSignalThreshold
+	{
+		get => _speedSignalThreshold;
+		set => SetProperty(ref _speedSignalThreshold, value, MinSpeedSignalThreshold, MaxSpeedSignalThreshold);
+	}
+	private int _speedSignalThreshold = 30; // Default
+
+	private const int MinSwitchMaxDeferral = 0;
+	private const int MaxSwitchMaxDeferral = 120;
+
+	/// <summary>
+	/// Maximum time (min) to defer switching by speed while the link is in use (0 for no deferral)
+	/// </summary>
+	public int SwitchMaxDeferral
+	{
+		get => _switchMaxDeferral;
+		set => SetProperty(ref _switchMaxDeferral, value, MinSwitchMaxDeferral, MaxSwitchMaxDeferral);
+	}
+	private int _switchMaxDeferral = 15; // Default
+
 	#endregion
 
 	internal void Initiate()

@@ -89,6 +89,10 @@ internal partial class AppController : DisposableBase
 		EngagesPriority
 			.Subscribe(_ => SetNotifyIconText())
 			.AddTo(this.Subscription);
+		Settings.Current
+			.ObserveProperty(x => x.EngagesSpeed)
+			.Subscribe(_ => SetNotifyIconText())
+			.AddTo(this.Subscription);
 
 		#region Update
 
@@ -133,7 +137,9 @@ internal partial class AppController : DisposableBase
 		Observable.Merge(
 			Settings.Current.ObserveProperty(x => x.SampleInterval).Select(_ => Unit.Default),
 			Settings.Current.ObserveProperty(x => x.RecordsHistory).Select(_ => Unit.Default),
-			Settings.Current.ObserveProperty(x => x.MeasuresSpeed).Select(_ => Unit.Default))
+			Settings.Current.ObserveProperty(x => x.MeasuresSpeed).Select(_ => Unit.Default),
+			Settings.Current.ObserveProperty(x => x.EngagesSpeed).Select(_ => Unit.Default),
+			Settings.Current.ObserveProperty(x => x.EngagesPriority).Select(_ => Unit.Default))
 			.Subscribe(_ => UpdateSampleTimer())
 			.AddTo(this.Subscription);
 
@@ -209,7 +215,7 @@ internal partial class AppController : DisposableBase
 		Profiles
 			.ObserveElementProperty(x => x.IsConnected)
 			.Throttle(TimeSpan.FromMilliseconds(100))
-			.Subscribe(_ => NotifyIconContainer.Text = Profiles.Where(x => x.IsConnected).Aggregate(ProductInfo.Title, (w, n) => $"{w}{Environment.NewLine}{n.Name}"))
+			.Subscribe(_ => SetNotifyIconText())
 			.AddTo(this.Subscription);
 
 		await LoadProfilesAsync();
@@ -287,11 +293,27 @@ internal partial class AppController : DisposableBase
 		window.Show();
 	}
 
+	/// <summary>
+	/// Sets the text of the notify icon which consists of the title, the modes and the names
+	/// of connected profiles.
+	/// </summary>
 	private void SetNotifyIconText()
 	{
-		NotifyIconContainer.Text = ProductInfo.Title
-			+ (RushesRescan.Value ? $"{Environment.NewLine}Rush {Settings.Current.RescanInterval}" : string.Empty)
-			+ (EngagesPriority.Value ? $"{Environment.NewLine}Engage {Settings.Current.SignalThreshold}" : string.Empty);
+		try
+		{
+			var text = ProductInfo.Title
+				+ (RushesRescan.Value ? $"{Environment.NewLine}Rush {Settings.Current.RescanInterval}" : string.Empty)
+				+ (EngagesPriority.Value ? $"{Environment.NewLine}Engage {Settings.Current.SignalThreshold}{(Settings.Current.EngagesSpeed ? " Speed" : string.Empty)}" : string.Empty);
+
+			NotifyIconContainer.Text = GetProfiles()
+				.Where(x => x.IsConnected)
+				.Aggregate(text, (w, n) => $"{w}{Environment.NewLine}{n.Name}");
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to set the text of the notify icon." + Environment.NewLine
+				+ ex);
+		}
 	}
 
 	#region Update
@@ -371,6 +393,7 @@ internal partial class AppController : DisposableBase
 		}
 
 		RecordSignals();
+		EvaluateDryRun();
 
 		Debug.WriteLine(Profiles.Any()
 			? Profiles
@@ -378,30 +401,18 @@ internal partial class AppController : DisposableBase
 				.Aggregate((w, n) => $"{w}{Environment.NewLine}{n}")
 			: "No Profile");
 
-		if (EngagesPriority.Value)
+		if (EngagesPriority.Value && !_isProbing)
 		{
-			var targetProfiles = Profiles
+			// The target of each interface is selected by the switching policy from the profiles
+			// allowed to be connected to. Unless speed is engaged, it is the first one in
+			// priority order whose signal is at or above the threshold.
+			var targetProfiles = (await Task.WhenAll(Profiles
 				.GroupBy(x => x.InterfaceId)
-				.Select(subProfiles =>
-					(subProfiles.FirstOrDefault(x => x.IsConnected) switch
-					{
-						// If no profile is connected, select profiles that are automatic connection enabled.
-						null => subProfiles.Where(x => x.IsAutoConnectEnabled),
-
-						// If a profile is connected and it is automatic switch enabled, select profiles
-						// that are automatic switch enabled including connected one.
-						{ IsAutoSwitchEnabled: true } => subProfiles.Where(x => x.IsAutoSwitchEnabled),
-
-						// If a profile is connected but it is not automatic switch enabled, leave as it is.
-						_ => Enumerable.Empty<ProfileItem>()
-					})
-					.Where(x => !x.IsAvoided)
-					.Where(x => Settings.Current.SignalThreshold <= x.Signal)
-					// This interval is for the case where disconnection from wireless LAN is not immediately
-					// reflected and take 2 to 3 minutes.
-					.OrderBy(x => (x.LastFailureTime.Add(_failureInterval) > DateTime.Now))
-					.ThenBy(x => x.Position)
-					.FirstOrDefault())
+				.Select(subProfiles => SelectTargetAsync(
+					subProfiles.Key,
+					GetCandidates(subProfiles).Where(x => !x.IsAvoided).ToArray(),
+					subProfiles.FirstOrDefault(x => x.IsConnected)))
+				.ToArray()))
 				.Where(x => x is { IsConnected: false })
 				.ToArray();
 
@@ -411,6 +422,7 @@ internal partial class AppController : DisposableBase
 				{
 					var result = await ConnectNetworkAsync(x, false);
 					x.LastFailureTime = result ? default : DateTime.Now;
+					RecordSwitchResult(x, result);
 				}));
 			}
 		}
@@ -463,7 +475,9 @@ internal partial class AppController : DisposableBase
 	/// Whether the sample timer is required to run
 	/// </summary>
 	/// <remarks>If this is false, no periodic work other than that of the original is done.</remarks>
-	private bool RequiresSampleTimer => Settings.Current.RecordsHistory || Settings.Current.MeasuresSpeed;
+	private bool RequiresSampleTimer => Settings.Current.RecordsHistory
+		|| Settings.Current.MeasuresSpeed
+		|| (Settings.Current.EngagesSpeed && Settings.Current.EngagesPriority);
 
 	private void UpdateSampleTimer()
 	{
@@ -518,6 +532,8 @@ internal partial class AppController : DisposableBase
 				await LoadProfilesAsync();
 			}
 
+			// The measurements requested by switching decisions are started after the update.
+			await MeasureRequestedAsync();
 			await MeasureIfDueAsync();
 		}
 		catch (Exception ex)
@@ -851,7 +867,10 @@ internal partial class AppController : DisposableBase
 		Debug.WriteLine("Connect start!");
 
 		if (isManual)
+		{
 			EngagesPriority.Value = false;
+			ClearPendingSwitch(targetProfile.InterfaceId);
+		}
 
 		return WorkAsync(targetProfile, x => _worker.ConnectNetworkAsync(x, _connectTimeout));
 	}
@@ -861,7 +880,10 @@ internal partial class AppController : DisposableBase
 		Debug.WriteLine("Disconnect start!");
 
 		if (isManual)
+		{
 			EngagesPriority.Value = false;
+			ClearPendingSwitch(targetProfile.InterfaceId);
+		}
 
 		return WorkAsync(targetProfile, x => _worker.DisconnectNetworkAsync(x, _connectTimeout));
 	}

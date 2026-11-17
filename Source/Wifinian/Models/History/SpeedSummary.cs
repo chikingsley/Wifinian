@@ -70,6 +70,12 @@ internal class SpeedSummary
 	public bool IsDead { get; private set; }
 
 	/// <summary>
+	/// Whether the two newest valid samples found no internet access regardless of their age
+	/// </summary>
+	/// <remarks>This stays true until a later valid sample finds internet access.</remarks>
+	public bool IsOffline { get; private set; }
+
+	/// <summary>
 	/// Whether at least one Ok sample exists
 	/// </summary>
 	public bool HasData => (Count >= 1);
@@ -107,11 +113,11 @@ internal class SpeedSummary
 			LastDownMbps = newest.DownMbps,
 			LastUpMbps = newest.UpMbps,
 			LastLatencyMs = newest.LatencyMs,
-			IsDead = (kept.Length >= 2)
+			IsOffline = (kept.Length >= 2)
 				&& IsNoInternet(kept[0])
 				&& IsNoInternet(kept[1])
-				&& (nowUtc - newest.Time <= DeadPeriod)
 		};
+		summary.IsDead = summary.IsOffline && (nowUtc - newest.Time <= DeadPeriod);
 
 		var oks = kept
 			.Where(x => x.Result is SpeedResult.Ok)

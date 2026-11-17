@@ -89,7 +89,13 @@ internal partial class AppController
 			h => SystemEvents.PowerModeChanged += h,
 			h => SystemEvents.PowerModeChanged -= h)
 			.Where(x => x.EventArgs.Mode == PowerModes.Resume)
-			.Subscribe(_ => Interlocked.Exchange(ref _resumeTicks, DateTime.UtcNow.Ticks))
+			.Subscribe(_ =>
+			{
+				Interlocked.Exchange(ref _resumeTicks, DateTime.UtcNow.Ticks);
+
+				// The connection is regarded as new after resume.
+				ResetDwell();
+			})
 			.AddTo(this.Subscription);
 	}
 
@@ -187,14 +193,15 @@ internal partial class AppController
 	/// </summary>
 	/// <param name="trigger">Trigger</param>
 	/// <param name="interfaceId">Interface ID (any interface if null)</param>
+	/// <param name="isRecheck">Whether this is to check again a network found without internet access</param>
 	/// <returns>Speed sample if measured, null otherwise</returns>
 	/// <remarks>This method never throws an exception.</remarks>
-	private Task<SpeedSample> MeasureConnectedAsync(SpeedTrigger trigger, Guid? interfaceId = null)
+	private Task<SpeedSample> MeasureConnectedAsync(SpeedTrigger trigger, Guid? interfaceId = null, bool isRecheck = false)
 	{
-		return Task.Run(() => MeasureConnectedBaseAsync(trigger, interfaceId));
+		return Task.Run(() => MeasureConnectedBaseAsync(trigger, interfaceId, isRecheck));
 	}
 
-	private async Task<SpeedSample> MeasureConnectedBaseAsync(SpeedTrigger trigger, Guid? interfaceId)
+	private async Task<SpeedSample> MeasureConnectedBaseAsync(SpeedTrigger trigger, Guid? interfaceId, bool isRecheck)
 	{
 		try
 		{
@@ -226,6 +233,14 @@ internal partial class AppController
 					return PutOff();
 			}
 
+			// The measurements for switching by speed are neither subject to the daily budget
+			// nor put off by traffic in progress.
+			if ((trigger is SpeedTrigger.Verify or SpeedTrigger.PostSwitch) && !isRecheck)
+			{
+				if (!Settings.Current.EngagesSpeed)
+					return null;
+			}
+
 			ProfileItem profile;
 			lock (_profilesLock)
 			{
@@ -246,6 +261,10 @@ internal partial class AppController
 				switch (trigger)
 				{
 					case SpeedTrigger.AfterConnect:
+						// The measurement after an automatic switch takes the place of this one.
+						if (HasLanding(targetId))
+							return PutOff();
+
 						var summary = History.GetSummary(key);
 						if ((summary is not null) && (now - summary.LastTime < _afterConnectValidity))
 							return null;
@@ -258,6 +277,18 @@ internal partial class AppController
 				}
 
 				if (History.GetBytesToday() >= Settings.Current.SpeedTestDailyBudget * 1_000_000L)
+					return null;
+			}
+
+			if ((trigger is SpeedTrigger.Verify) && !isRecheck)
+			{
+				// The measurement requested by switching decision is limited in frequency.
+				DateTime lastVerifyTime;
+				lock (_switchLock)
+				{
+					_lastVerifyTimes.TryGetValue(key, out lastVerifyTime);
+				}
+				if (now - lastVerifyTime < _verifyInterval)
 					return null;
 			}
 
@@ -291,11 +322,21 @@ internal partial class AppController
 				return PutOff();
 
 			SpeedSample sample;
+			var isRecorded = true;
 			CancellationTokenSource cancellation = null;
 			try
 			{
 				IsMeasuring.TurnOn();
 				profile.IsMeasuring = true;
+
+				// The limit of frequency counts only the measurements actually started.
+				if ((trigger is SpeedTrigger.Verify) && !isRecheck)
+				{
+					lock (_switchLock)
+					{
+						_lastVerifyTimes[key] = DateTime.UtcNow;
+					}
+				}
 
 				lock (_measureLock)
 				{
@@ -359,8 +400,29 @@ internal partial class AppController
 					}
 				}
 
-				History.AppendSpeed(sample);
-				ApplySummary(profile);
+				var isOffline = sample.Result is SpeedResult.NoInternet or SpeedResult.CaptivePortal;
+				if (isOffline)
+				{
+					lock (_switchLock)
+					{
+						_lastOfflineTimes[key] = DateTime.UtcNow;
+					}
+				}
+
+				// A recheck is repeated at every sample tick and so only what it newly finds is recorded.
+				if (isRecheck)
+				{
+					isRecorded = sample.Valid
+						&& !(isOffline
+							&& (History.GetSummary(key) is { IsOffline: true } recorded)
+							&& (DateTime.UtcNow - recorded.LastTime < _recheckRecordInterval));
+				}
+
+				if (isRecorded)
+				{
+					History.AppendSpeed(sample);
+					ApplySummary(profile);
+				}
 			}
 			finally
 			{
@@ -376,9 +438,21 @@ internal partial class AppController
 				_measureSemaphore.Release();
 			}
 
+			if (!isRecorded)
+				return sample;
+
+			// If this network was switched to just before and is worse than the previous one,
+			// the previous one is switched back to.
+			await CheckLandingAsync(sample).ConfigureAwait(false);
+
 			// Reload so that the profiles are evaluated with the new result.
 			if (!_disposed)
+			{
 				await LoadProfilesAsync().ConfigureAwait(false);
+
+				// The decision made in the reload may have requested another measurement.
+				_ = Task.Run(() => MeasureRequestedAsync());
+			}
 
 			return sample;
 		}
@@ -467,11 +541,24 @@ internal partial class AppController
 	/// </remarks>
 	private async Task MeasureIfDueAsync()
 	{
-		if (!Settings.Current.MeasuresSpeed)
+		var measuresSpeed = Settings.Current.MeasuresSpeed;
+		if (!measuresSpeed && !Settings.Current.EngagesSpeed)
 			return;
 
 		foreach (var interfaceId in GetConnectedInterfaceIds())
 		{
+			// While connected network has no internet access, it is checked again at every
+			// sample tick so that recovery is noticed soon. The measurement ends at the check
+			// of internet access as long as it fails and so uses little data.
+			if (IsConnectedOffline(interfaceId))
+			{
+				await MeasureConnectedAsync(SpeedTrigger.Verify, interfaceId, isRecheck: true);
+				continue;
+			}
+
+			if (!measuresSpeed)
+				continue;
+
 			if (IsAfterConnectPending(interfaceId))
 			{
 				var sample = await MeasureConnectedAsync(SpeedTrigger.AfterConnect, interfaceId);
