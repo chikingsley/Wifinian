@@ -43,4 +43,15 @@
 	<SolidColorBrush x:Key="Menu.Item.Background.Normal" Color="Transparent"/>
 	<SolidColorBrush x:Key="Menu.Item.Background.MouseOver" Color="#FF5F5F5F"/>
 
+	<SolidColorBrush x:Key="Chart.Series1" Color="#FF7FC5FF"/>
+	<SolidColorBrush x:Key="Chart.Series2" Color="#FFFFB74D"/>
+	<SolidColorBrush x:Key="Chart.Series3" Color="#FF81C784"/>
+	<SolidColorBrush x:Key="Chart.Series4" Color="#FFE57373"/>
+	<SolidColorBrush x:Key="Chart.Series5" Color="#FFBA68C8"/>
+	<SolidColorBrush x:Key="Chart.Series6" Color="#FFFFF176"/>
+	<SolidColorBrush x:Key="Chart.Series7" Color="#FF4DD0E1"/>
+	<SolidColorBrush x:Key="Chart.Series8" Color="#FFA1887F"/>
+	<SolidColorBrush x:Key="Chart.Grid" Color="#33FFFFFF"/>
+	<SolidColorBrush x:Key="Chart.Axis" Color="#FFAAAAAA"/>
+
 </ResourceDictionary>

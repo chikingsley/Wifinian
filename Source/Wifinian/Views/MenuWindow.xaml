@@ -106,6 +106,14 @@
 			<Button Padding="8,4"
 					Style="{StaticResource MenuButtonItemStyle}"
 					FontSize="13"
+					Content="{x:Static models:LanguageService.History}"
+					Command="{Binding HistoryCommand, Mode=OneTime}"/>
+		</ContentControl>
+
+		<ContentControl Style="{StaticResource MenuItemStyle}">
+			<Button Padding="8,4"
+					Style="{StaticResource MenuButtonItemStyle}"
+					FontSize="13"
 					Content="{x:Static models:LanguageService.TestSpeed}"
 					Command="{Binding MeasureCommand, Mode=OneTime}"/>
 		</ContentControl>

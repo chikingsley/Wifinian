@@ -1,0 +1,219 @@
+﻿<Window x:Class="Wifinian.Views.HistoryWindow"
+		xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+		xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+		xmlns:controls="clr-namespace:Wifinian.Views.Controls"
+		Title="Wifinian History"
+		Width="960" Height="680"
+		MinWidth="640" MinHeight="420"
+		WindowStyle="SingleBorderWindow" ResizeMode="CanResize"
+		ShowInTaskbar="True"
+		Background="{StaticResource App.Background.Plain}"
+		Foreground="{StaticResource App.Foreground}"
+		TextElement.Foreground="{StaticResource App.Foreground}">
+	<Window.Resources>
+		<SolidColorBrush x:Key="Grid.Header.Background" Color="#FF2B2B2B"/>
+
+		<Style x:Key="GridHeaderStyle" TargetType="{x:Type DataGridColumnHeader}">
+			<Setter Property="Background" Value="{StaticResource Grid.Header.Background}"/>
+			<Setter Property="Foreground" Value="{StaticResource App.Foreground.Shadow}"/>
+			<Setter Property="BorderThickness" Value="0"/>
+			<Setter Property="Padding" Value="6,3"/>
+			<Setter Property="HorizontalContentAlignment" Value="Left"/>
+		</Style>
+
+		<Style x:Key="GridCellStyle" TargetType="{x:Type DataGridCell}">
+			<Setter Property="BorderThickness" Value="0"/>
+			<Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+		</Style>
+
+		<Style x:Key="GridTextStyle" TargetType="{x:Type TextBlock}">
+			<Setter Property="Margin" Value="6,2"/>
+			<Setter Property="VerticalAlignment" Value="Center"/>
+		</Style>
+
+		<Style x:Key="GridStyle" TargetType="{x:Type DataGrid}">
+			<Setter Property="AutoGenerateColumns" Value="False"/>
+			<Setter Property="CanUserAddRows" Value="False"/>
+			<Setter Property="CanUserDeleteRows" Value="False"/>
+			<Setter Property="CanUserReorderColumns" Value="False"/>
+			<Setter Property="CanUserSortColumns" Value="False"/>
+			<Setter Property="CanUserResizeRows" Value="False"/>
+			<Setter Property="SelectionMode" Value="Single"/>
+			<Setter Property="HeadersVisibility" Value="Column"/>
+			<Setter Property="GridLinesVisibility" Value="None"/>
+			<Setter Property="Background" Value="Transparent"/>
+			<Setter Property="RowBackground" Value="Transparent"/>
+			<Setter Property="AlternatingRowBackground" Value="Transparent"/>
+			<Setter Property="Foreground" Value="{StaticResource App.Foreground}"/>
+			<Setter Property="BorderThickness" Value="0"/>
+			<Setter Property="ColumnHeaderStyle" Value="{StaticResource GridHeaderStyle}"/>
+			<Setter Property="CellStyle" Value="{StaticResource GridCellStyle}"/>
+		</Style>
+
+		<Style x:Key="RangeButtonStyle" TargetType="{x:Type RadioButton}">
+			<Setter Property="Margin" Value="0,0,12,0"/>
+			<Setter Property="VerticalAlignment" Value="Center"/>
+			<Setter Property="Foreground" Value="{StaticResource App.Foreground}"/>
+			<Setter Property="FontSize" Value="13"/>
+		</Style>
+
+		<Style x:Key="BarButtonStyle" TargetType="{x:Type Button}" BasedOn="{StaticResource NormalButtonStyle}">
+			<Setter Property="Margin" Value="4,0,4,0"/>
+			<Setter Property="Padding" Value="10,3"/>
+			<Setter Property="HorizontalContentAlignment" Value="Center"/>
+			<Setter Property="VerticalContentAlignment" Value="Center"/>
+		</Style>
+
+		<Style x:Key="CaptionStyle" TargetType="{x:Type TextBlock}">
+			<Setter Property="Margin" Value="0,6,0,0"/>
+			<Setter Property="Foreground" Value="{StaticResource App.Foreground.Shadow}"/>
+		</Style>
+	</Window.Resources>
+
+	<Grid Margin="8">
+		<Grid.RowDefinitions>
+			<RowDefinition Height="Auto"/>
+			<!-- The summary and the rows give way to the charts when the window is small. -->
+			<RowDefinition Height="4*" MaxHeight="160"/>
+			<RowDefinition Height="3*" MinHeight="85"/>
+			<RowDefinition Height="3*" MinHeight="85"/>
+			<RowDefinition Height="5*" MaxHeight="200"/>
+		</Grid.RowDefinitions>
+
+		<!-- Range and commands -->
+		<StackPanel Grid.Row="0"
+					Margin="0,0,0,8"
+					Orientation="Horizontal">
+			<RadioButton Style="{StaticResource RangeButtonStyle}"
+						 GroupName="Range"
+						 Content="24 h" Tag="24"
+						 IsChecked="True"
+						 Click="OnRangeClick"/>
+			<RadioButton Style="{StaticResource RangeButtonStyle}"
+						 GroupName="Range"
+						 Content="7 d" Tag="168"
+						 Click="OnRangeClick"/>
+			<RadioButton Style="{StaticResource RangeButtonStyle}"
+						 GroupName="Range"
+						 Content="30 d" Tag="720"
+						 Click="OnRangeClick"/>
+			<Button Style="{StaticResource BarButtonStyle}"
+					Content="Refresh"
+					Command="{Binding RefreshCommand, Mode=OneTime}"/>
+			<Button Style="{StaticResource BarButtonStyle}"
+					Content="Open data folder"
+					Command="{Binding OpenFolderCommand, Mode=OneTime}"/>
+			<TextBlock Margin="8,0,0,0" VerticalAlignment="Center"
+					   Foreground="{StaticResource App.Foreground.Shadow}"
+					   Text="Loading..."
+					   Visibility="{Binding IsLoading.Value, Mode=OneWay, Converter={StaticResource BooleanToVisibilityConverterKey}}"/>
+		</StackPanel>
+
+		<!-- Summary -->
+		<DataGrid Grid.Row="1"
+				  Style="{StaticResource GridStyle}"
+				  ItemsSource="{Binding Networks, Mode=OneTime}">
+			<DataGrid.Columns>
+				<DataGridTemplateColumn IsReadOnly="True" CanUserResize="False">
+					<DataGridTemplateColumn.CellTemplate>
+						<DataTemplate>
+							<Rectangle Width="12" Height="12" Margin="6,2"
+									   Fill="{Binding Brush, Mode=OneTime}"/>
+						</DataTemplate>
+					</DataGridTemplateColumn.CellTemplate>
+				</DataGridTemplateColumn>
+				<DataGridTemplateColumn Header="Show" CanUserResize="False">
+					<DataGridTemplateColumn.CellTemplate>
+						<DataTemplate>
+							<CheckBox HorizontalAlignment="Center" VerticalAlignment="Center"
+									  IsChecked="{Binding IsShown.Value, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+						</DataTemplate>
+					</DataGridTemplateColumn.CellTemplate>
+				</DataGridTemplateColumn>
+				<DataGridTextColumn Header="Network" IsReadOnly="True" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Name, Mode=OneTime}"/>
+				<DataGridTextColumn Header="Signal now" IsReadOnly="True" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding SignalNow, Mode=OneTime}"/>
+				<DataGridTextColumn Header="Avg signal" IsReadOnly="True" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding AverageSignal, Mode=OneTime}"/>
+				<DataGridTextColumn Header="Down (Mbps)" IsReadOnly="True" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding TypicalDown, Mode=OneTime}"/>
+				<DataGridTextColumn Header="Up (Mbps)" IsReadOnly="True" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding TypicalUp, Mode=OneTime}"/>
+				<DataGridTextColumn Header="Latency (ms)" IsReadOnly="True" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Latency, Mode=OneTime}"/>
+				<DataGridTextColumn Header="Tests" IsReadOnly="True" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Tests, Mode=OneTime}"/>
+				<DataGridTextColumn Header="Last tested" IsReadOnly="True" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding LastTested, Mode=OneTime}"/>
+				<DataGridTextColumn Header="Avoid" IsReadOnly="True" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding IsAvoided, Mode=OneTime}"/>
+			</DataGrid.Columns>
+		</DataGrid>
+
+		<!-- Signal -->
+		<Grid Grid.Row="2">
+			<Grid.RowDefinitions>
+				<RowDefinition Height="Auto"/>
+				<RowDefinition Height="*"/>
+			</Grid.RowDefinitions>
+			<TextBlock Grid.Row="0"
+					   Style="{StaticResource CaptionStyle}"
+					   Text="Signal (%)"/>
+			<!-- Breaks of lines are given by the points. -->
+			<controls:HistoryChart Grid.Row="1"
+								   Series="{Binding SignalSeries.Value, Mode=OneWay}"
+								   From="{Binding From.Value, Mode=OneWay}"
+								   To="{Binding To.Value, Mode=OneWay}"
+								   Maximum="100"
+								   Unit="%"
+								   GapMinutes="0"/>
+		</Grid>
+
+		<!-- Download -->
+		<Grid Grid.Row="3">
+			<Grid.RowDefinitions>
+				<RowDefinition Height="Auto"/>
+				<RowDefinition Height="*"/>
+			</Grid.RowDefinitions>
+			<TextBlock Grid.Row="0"
+					   Style="{StaticResource CaptionStyle}"
+					   Text="Download (Mbps)"/>
+			<controls:HistoryChart Grid.Row="1"
+								   Series="{Binding SpeedSeries.Value, Mode=OneWay}"
+								   From="{Binding From.Value, Mode=OneWay}"
+								   To="{Binding To.Value, Mode=OneWay}"
+								   Unit="Mbps"
+								   GapMinutes="0"/>
+		</Grid>
+
+		<!-- Rows -->
+		<TabControl Grid.Row="4"
+					Margin="0,8,0,0" Padding="0"
+					Background="Transparent"
+					BorderBrush="{StaticResource Menu.Separator}">
+			<TabItem Header="Measurements">
+				<DataGrid Style="{StaticResource GridStyle}"
+						  IsReadOnly="True"
+						  ItemsSource="{Binding Measurements, Mode=OneTime}">
+					<DataGrid.Columns>
+						<DataGridTextColumn Header="Time" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Time, Mode=OneTime}"/>
+						<DataGridTextColumn Header="Network" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Network, Mode=OneTime}"/>
+						<DataGridTextColumn Header="BSSID" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Bssid, Mode=OneTime}"/>
+						<DataGridTextColumn Header="Signal" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Signal, Mode=OneTime}"/>
+						<DataGridTextColumn Header="Link rate" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding LinkRate, Mode=OneTime}"/>
+						<DataGridTextColumn Header="Latency" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Latency, Mode=OneTime}"/>
+						<DataGridTextColumn Header="Down" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Down, Mode=OneTime}"/>
+						<DataGridTextColumn Header="Up" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Up, Mode=OneTime}"/>
+						<DataGridTextColumn Header="Trigger" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Trigger, Mode=OneTime}"/>
+						<DataGridTextColumn Header="Result" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Result, Mode=OneTime}"/>
+					</DataGrid.Columns>
+				</DataGrid>
+			</TabItem>
+			<TabItem Header="Decisions">
+				<DataGrid Style="{StaticResource GridStyle}"
+						  IsReadOnly="True"
+						  ItemsSource="{Binding Decisions, Mode=OneTime}">
+					<DataGrid.Columns>
+						<DataGridTextColumn Header="Time" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Time, Mode=OneTime}"/>
+						<DataGridTextColumn Header="Kind" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Kind, Mode=OneTime}"/>
+						<DataGridTextColumn Header="From" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding From, Mode=OneTime}"/>
+						<DataGridTextColumn Header="To" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding To, Mode=OneTime}"/>
+						<DataGridTextColumn Header="Reason" Width="*" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Reason, Mode=OneTime}"/>
+					</DataGrid.Columns>
+				</DataGrid>
+			</TabItem>
+		</TabControl>
+	</Grid>
+</Window>

@@ -52,6 +52,7 @@ internal partial class AppController : DisposableBase
 	private ReactiveTimer SampleTimer { get; }
 
 	public ReactiveCommand RescanCommand { get; }
+	public ReactiveCommand HistoryCommand { get; }
 	public ReactiveCommand CloseCommand { get; }
 
 	public AppController(AppKeeper keeper) : this(keeper,
@@ -177,6 +178,16 @@ internal partial class AppController : DisposableBase
 
 		#endregion
 
+		#region History
+
+		HistoryCommand = new ReactiveProperty<bool>(true)
+			.ToReactiveCommand();
+		HistoryCommand
+			.Subscribe(_ => ShowHistoryWindow())
+			.AddTo(this.Subscription);
+
+		#endregion
+
 		#region Close
 
 		CloseCommand = new ReactiveProperty<bool>(true)
@@ -292,6 +303,38 @@ internal partial class AppController : DisposableBase
 	{
 		var window = new MenuWindow(this, pivot);
 		window.Show();
+	}
+
+	private HistoryWindow _historyWindow;
+
+	/// <summary>
+	/// Shows the history window or activates it if it is already open. This method must be
+	/// called on the UI thread.
+	/// </summary>
+	private void ShowHistoryWindow()
+	{
+		try
+		{
+			if (_historyWindow is not null)
+			{
+				if (_historyWindow.WindowState == WindowState.Minimized)
+					_historyWindow.WindowState = WindowState.Normal;
+
+				_historyWindow.Activate();
+				return;
+			}
+
+			var window = new HistoryWindow(this);
+			window.Closed += (_, _) => _historyWindow = null;
+			_historyWindow = window;
+			window.Show();
+			window.Activate();
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to show the history window." + Environment.NewLine
+				+ ex);
+		}
 	}
 
 	/// <summary>
@@ -742,7 +785,7 @@ internal partial class AppController : DisposableBase
 			profile.IsAvoided = avoided.Contains(profile.Name, StringComparer.Ordinal);
 	}
 
-	private ProfileItem[] GetProfiles()
+	internal ProfileItem[] GetProfiles()
 	{
 		lock (_profilesLock)
 		{

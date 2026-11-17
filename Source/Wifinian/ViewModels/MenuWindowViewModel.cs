@@ -12,6 +12,7 @@ public class MenuWindowViewModel : DisposableBase
 {
 	private readonly AppController _controller;
 
+	public ReactiveCommand HistoryCommand => _controller?.HistoryCommand;
 	public ReactiveCommand MeasureCommand => _controller?.MeasureCommand;
 	public ReactiveCommand ProbeCommand => _controller?.ProbeCommand;
 	public ReactiveCommand CloseCommand => _controller?.CloseCommand;

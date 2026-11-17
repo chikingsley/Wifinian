@@ -24,6 +24,7 @@ RecordHistory=Record history
 MeasureSpeed=Measure speed automatically
 EngageSpeed=Engage by measured speed
 ProbeIdle=Test other networks when idle
+History=History...
 TestSpeed=Test speed now
 TestAll=Test all networks
 CancelTest=Cancel test
