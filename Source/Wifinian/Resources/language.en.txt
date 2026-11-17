@@ -9,6 +9,10 @@ AutoConnect=Auto connect
 AutoSwitch=Auto switch
 OK=OK
 Cancel=Cancel
+Avoid=Avoid
+Testing=Testing...
+NoInternet=No internet
+SignInRequired=Sign-in required
 
 [Link]
 ProjectSite=https://github.com/emoacht/Wifinian/blob/master/README.md

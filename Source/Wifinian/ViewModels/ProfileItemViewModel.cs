@@ -1,10 +1,15 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
+using System.Reactive;
 using System.Reactive.Linq;
 using Reactive.Bindings;
 using Reactive.Bindings.Extensions;
 
 using Wifinian.Common;
+using Wifinian.Models;
+using Wifinian.Models.History;
 using Wifinian.Models.Wlan;
 
 namespace Wifinian.ViewModels;
@@ -47,6 +52,11 @@ public class ProfileItemViewModel : DisposableBase
 	public ReadOnlyReactivePropertySlim<int> Channel { get; }
 
 	public ReadOnlyReactivePropertySlim<bool> IsAvailable { get; }
+
+	public ReactiveProperty<bool> IsAvoided { get; }
+
+	public ReadOnlyReactivePropertySlim<string> SpeedText { get; }
+	public ReadOnlyReactivePropertySlim<string> SpeedToolTip { get; }
 
 	public ReactiveProperty<bool> IsSelected { get; }
 
@@ -128,6 +138,40 @@ public class ProfileItemViewModel : DisposableBase
 			.ToReadOnlyReactivePropertySlim()
 			.AddTo(this.Subscription);
 
+		// This option is kept in the settings of this app and so must not trigger change of
+		// the wireless profile.
+		IsAvoided = profileItem
+			.ToReactivePropertyAsSynchronized(x => x.IsAvoided, ReactivePropertyMode.DistinctUntilChanged)
+			.AddTo(this.Subscription);
+		IsAvoided
+			.Subscribe(_ => _controller.ChangeProfileAvoided(profileItem))
+			.AddTo(this.Subscription);
+
+		var speedChanged = Observable.Merge(
+			profileItem.ObserveProperty(x => x.LastMeasuredTime).Select(_ => Unit.Default),
+			profileItem.ObserveProperty(x => x.LastSpeedResult, false).Select(_ => Unit.Default),
+			profileItem.ObserveProperty(x => x.LastDownMbps, false).Select(_ => Unit.Default),
+			profileItem.ObserveProperty(x => x.LastUpMbps, false).Select(_ => Unit.Default),
+			profileItem.ObserveProperty(x => x.LastLatencyMs, false).Select(_ => Unit.Default),
+			profileItem.ObserveProperty(x => x.TypicalDownMbps, false).Select(_ => Unit.Default),
+			profileItem.ObserveProperty(x => x.SpeedSampleCount, false).Select(_ => Unit.Default),
+			profileItem.ObserveProperty(x => x.Bssid, false).Select(_ => Unit.Default),
+			profileItem.ObserveProperty(x => x.IsMeasuring, false).Select(_ => Unit.Default),
+			Observable.Interval(TimeSpan.FromMinutes(1)).Select(_ => Unit.Default)) // For age
+			.Publish();
+
+		SpeedText = speedChanged
+			.Select(_ => BuildSpeedText(profileItem, DateTime.UtcNow))
+			.ToReadOnlyReactivePropertySlim(string.Empty)
+			.AddTo(this.Subscription);
+
+		SpeedToolTip = speedChanged
+			.Select(_ => BuildSpeedToolTip(profileItem, DateTime.UtcNow))
+			.ToReadOnlyReactivePropertySlim()
+			.AddTo(this.Subscription);
+
+		speedChanged.Connect().AddTo(this.Subscription);
+
 		IsSelected = ReactiveProperty.FromObject(profileItem, x => x.IsTarget)
 			.AddTo(this.Subscription);
 
@@ -158,4 +202,84 @@ public class ProfileItemViewModel : DisposableBase
 
 		#endregion
 	}
+
+	#region Speed
+
+	private static readonly TimeSpan _speedPeriod = TimeSpan.FromDays(14);
+
+	private static bool HasSpeed(ProfileItem profileItem, DateTime now) =>
+		(profileItem.LastMeasuredTime != default) && (now - profileItem.LastMeasuredTime <= _speedPeriod);
+
+	internal static string BuildSpeedText(ProfileItem profileItem, DateTime now)
+	{
+		if (profileItem.IsMeasuring)
+			return LanguageService.Testing;
+
+		if (!HasSpeed(profileItem, now))
+			return string.Empty;
+
+		var elapsed = now - profileItem.LastMeasuredTime;
+		var age = BuildAge(elapsed);
+
+		switch (profileItem.LastSpeedResult)
+		{
+			case SpeedResult.NoInternet:
+				return $"{LanguageService.NoInternet}  {age}";
+			case SpeedResult.CaptivePortal:
+				return $"{LanguageService.SignInRequired}  {age}";
+		}
+
+		if (profileItem.LastDownMbps is not { } down)
+			return string.Empty;
+
+		var text = ((elapsed > TimeSpan.FromHours(24)) ? "~" : string.Empty) + FormatNumber(down);
+
+		if (profileItem.LastUpMbps is { } up)
+			text += " / " + FormatNumber(up);
+
+		text += " Mbps";
+
+		if (profileItem.LastLatencyMs is { } latency)
+			text += "  " + FormatNumber(latency) + " ms";
+
+		return $"{text}  {age}";
+	}
+
+	internal static string BuildSpeedToolTip(ProfileItem profileItem, DateTime now)
+	{
+		if (!HasSpeed(profileItem, now))
+			return null;
+
+		var lines = new List<string>();
+
+		if (profileItem.TypicalDownMbps is { } typical)
+		{
+			lines.Add(string.Format(CultureInfo.InvariantCulture, "Typical {0:0.#} Mbps over {1} {2}",
+				typical, profileItem.SpeedSampleCount, (profileItem.SpeedSampleCount == 1) ? "test" : "tests"));
+		}
+
+		lines.Add($"Last tested {profileItem.LastMeasuredTime.ToLocalTime():g}");
+
+		if (!string.IsNullOrEmpty(profileItem.Bssid))
+			lines.Add($"BSSID {profileItem.Bssid}");
+
+		return string.Join(Environment.NewLine, lines);
+	}
+
+	private static string BuildAge(TimeSpan elapsed)
+	{
+		if (elapsed < TimeSpan.FromMinutes(1))
+			return "now";
+		if (elapsed < TimeSpan.FromMinutes(60))
+			return $"{(int)elapsed.TotalMinutes}m";
+		if (elapsed < TimeSpan.FromHours(48))
+			return $"{(int)elapsed.TotalHours}h";
+
+		return $"{(int)elapsed.TotalDays}d";
+	}
+
+	private static string FormatNumber(double value) =>
+		value.ToString((value < 10D) ? "0.#" : "0", CultureInfo.InvariantCulture);
+
+	#endregion
 }

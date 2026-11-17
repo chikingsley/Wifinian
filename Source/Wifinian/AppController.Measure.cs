@@ -240,7 +240,7 @@ internal partial class AppController
 
 			if (isAutomatic)
 			{
-				if (!profile.IsAutoSwitchEnabled)
+				if (!profile.IsAutoSwitchEnabled || profile.IsAvoided)
 					return null;
 
 				switch (trigger)

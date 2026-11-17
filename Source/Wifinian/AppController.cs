@@ -190,6 +190,9 @@ internal partial class AppController : DisposableBase
 
 		Settings.Current.Initiate();
 
+		// Profiles may have been loaded before the settings.
+		ApplyAvoided(GetProfiles());
+
 		_ = PurgeHistoryAsync();
 
 		NotifyIconContainer.ShowIcon(WindowPainter.GetIconPath(), ProductInfo.Title);
@@ -335,6 +338,7 @@ internal partial class AppController : DisposableBase
 		}
 
 		newProfiles.ForEach(ApplySummary);
+		ApplyAvoided(newProfiles);
 
 		if ((oldProfileIndices.Count > 0) || (newProfiles.Count > 0))
 		{
@@ -383,6 +387,7 @@ internal partial class AppController : DisposableBase
 						// If a profile is connected but it is not automatic switch enabled, leave as it is.
 						_ => Enumerable.Empty<ProfileItem>()
 					})
+					.Where(x => !x.IsAvoided)
 					.Where(x => Settings.Current.SignalThreshold <= x.Signal)
 					// This interval is for the case where disconnection from wireless LAN is not immediately
 					// reflected and take 2 to 3 minutes.
@@ -651,6 +656,70 @@ internal partial class AppController : DisposableBase
 		return WorkAsync(targetProfile, x => _worker.SetProfileOptionAsync(x));
 	}
 
+	/// <summary>
+	/// Reflects avoided state of a profile to the settings and the profiles of the same name.
+	/// </summary>
+	/// <param name="targetProfile">Profile whose avoided state has been changed</param>
+	/// <remarks>This method does not change the wireless profile itself.</remarks>
+	public void ChangeProfileAvoided(ProfileItem targetProfile)
+	{
+		if (targetProfile is null)
+			return;
+
+		try
+		{
+			var name = targetProfile.Name;
+			var value = targetProfile.IsAvoided;
+
+			lock (_avoidedLock)
+			{
+				var existing = Settings.Current.AvoidedProfiles;
+				if (existing.Contains(name, StringComparer.Ordinal) != value)
+				{
+					Settings.Current.AvoidedProfiles = value
+						? existing.Concat(new[] { name }).ToArray()
+						: existing.Where(x => !string.Equals(x, name, StringComparison.Ordinal)).ToArray();
+				}
+			}
+
+			// Avoided profiles are identified by name and so the profiles of the same name
+			// in other interfaces follow.
+			foreach (var profile in GetProfiles())
+			{
+				if (!ReferenceEquals(profile, targetProfile) &&
+					string.Equals(profile.Name, name, StringComparison.Ordinal))
+				{
+					profile.IsAvoided = value;
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to change avoided profiles." + Environment.NewLine
+				+ ex);
+		}
+	}
+	private readonly object _avoidedLock = new();
+
+	private static void ApplyAvoided(IReadOnlyCollection<ProfileItem> profiles)
+	{
+		if (profiles.Count == 0)
+			return;
+
+		var avoided = Settings.Current.AvoidedProfiles;
+
+		foreach (var profile in profiles)
+			profile.IsAvoided = avoided.Contains(profile.Name, StringComparer.Ordinal);
+	}
+
+	private ProfileItem[] GetProfiles()
+	{
+		lock (_profilesLock)
+		{
+			return Profiles.ToArray();
+		}
+	}
+
 	public Task<bool> MoveUpProfileAsync()
 	{
 		Debug.WriteLine("MoveUp start!");
@@ -701,6 +770,8 @@ internal partial class AppController : DisposableBase
 		var result = await WorkAsync(targetProfile, x => _worker.RenameProfileAsync(x, profileName));
 		if (result)
 		{
+			RenameAvoided(oldName, profileName, interfaceId);
+
 			History.Rename(
 				HistoryService.GetKey(oldName, interfaceId),
 				HistoryService.GetKey(profileName, interfaceId));
@@ -715,6 +786,41 @@ internal partial class AppController : DisposableBase
 			ApplySummary(renamedProfile);
 		}
 		return result;
+	}
+
+	private void RenameAvoided(string oldName, string newName, Guid interfaceId)
+	{
+		try
+		{
+			var profiles = GetProfiles();
+
+			lock (_avoidedLock)
+			{
+				var existing = Settings.Current.AvoidedProfiles;
+				if (!existing.Contains(oldName, StringComparer.Ordinal))
+					return;
+
+				// The old name stays if a profile of that name remains in another interface.
+				var remains = profiles.Any(x => (x.InterfaceId != interfaceId)
+					&& string.Equals(x.Name, oldName, StringComparison.Ordinal));
+
+				Settings.Current.AvoidedProfiles = existing
+					.Where(x => remains || !string.Equals(x, oldName, StringComparison.Ordinal))
+					.Concat(new[] { newName })
+					.Distinct(StringComparer.Ordinal)
+					.ToArray();
+			}
+
+			// The renamed profile may have been loaded before the settings are changed.
+			ApplyAvoided(profiles
+				.Where(x => string.Equals(x.Name, newName, StringComparison.Ordinal))
+				.ToArray());
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to rename avoided profile." + Environment.NewLine
+				+ ex);
+		}
 	}
 
 	public Task<bool> DeleteProfileAsync()

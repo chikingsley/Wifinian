@@ -266,6 +266,16 @@ public class ProfileItem : BindableBase
 	private bool _isMeasuring;
 
 	/// <summary>
+	/// Whether this profile is avoided in automatic connection by this app
+	/// </summary>
+	public bool IsAvoided
+	{
+		get => _isAvoided;
+		set => SetProperty(ref _isAvoided, value);
+	}
+	private bool _isAvoided;
+
+	/// <summary>
 	/// Whether this profile is set to be target
 	/// </summary>
 	public bool IsTarget { get; set; }

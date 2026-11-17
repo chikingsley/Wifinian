@@ -134,10 +134,26 @@
 								IsAvailable="{Binding IsAvailable.Value}"
 								IsConnected="{Binding IsConnected.Value}">
 								<StackPanel>
-									<StackPanel Height="30" Margin="10,2,0,0"
-												Orientation="Horizontal">
+									<StackPanel.Style>
+										<Style TargetType="{x:Type StackPanel}">
+											<Style.Triggers>
+												<DataTrigger Binding="{Binding IsAvoided.Value}" Value="True">
+													<Setter Property="Opacity" Value="0.6"/>
+												</DataTrigger>
+											</Style.Triggers>
+										</Style>
+									</StackPanel.Style>
+
+									<Grid Height="30" Margin="10,2,0,0">
+										<Grid.ColumnDefinitions>
+											<ColumnDefinition Width="Auto"/>
+											<ColumnDefinition Width="*"/>
+											<ColumnDefinition Width="Auto"/>
+										</Grid.ColumnDefinitions>
+
 										<!-- Signal -->
 										<controls:SignalProgressBar
+											Grid.Column="0"
 											Width="24" Margin="0,6,0,0" VerticalAlignment="Top"
 											Style="{StaticResource ArcStyle}"
 											Background="{StaticResource Signal.Background}"
@@ -147,13 +163,22 @@
 
 										<!-- Profile name -->
 										<controls:SwitchTextBox
-											Margin="4,0,0,0" VerticalAlignment="Center"
+											Grid.Column="1"
+											Margin="4,0,0,0" HorizontalAlignment="Left" VerticalAlignment="Center"
 											Style="{StaticResource NameTextBoxStyle}"
 											Foreground="{StaticResource App.Foreground}"
 											FontSize="14"
 											TextWrapping="Wrap" MaxLength="64"
 											Text="{Binding Name, Mode=TwoWay}"/>
-									</StackPanel>
+
+										<!-- Speed -->
+										<TextBlock Grid.Column="2"
+												   Margin="4,0,10,0" VerticalAlignment="Center"
+												   Foreground="{StaticResource App.Foreground.Shadow}"
+												   FontSize="12"
+												   Text="{Binding SpeedText.Value, Mode=OneWay}"
+												   ToolTip="{Binding SpeedToolTip.Value, Mode=OneWay}"/>
+									</Grid>
 
 									<Grid Height="64" Margin="10,2,10,10">
 										<Grid.ColumnDefinitions>
@@ -230,21 +255,29 @@
 
 										<StackPanel Grid.Column="1" Grid.Row="1"
 													Margin="8,4,0,0"
-													Orientation="Horizontal"
-													Visibility="{Binding CanSetOptions, Mode=OneTime, Converter={StaticResource BooleanToVisibilityConverterKey}}">
-											<!-- Auto Connect -->
-											<CheckBox x:Name="AutoConnectCheckBox"
-													  Height="22"
-													  Style="{StaticResource ItemCheckBoxStyle}"
-													  Content="{x:Static models:LanguageService.AutoConnect}"
-													  IsChecked="{Binding IsAutoConnectEnabled.Value, Mode=TwoWay}"/>
+													Orientation="Horizontal">
+											<StackPanel Orientation="Horizontal"
+														Visibility="{Binding CanSetOptions, Mode=OneTime, Converter={StaticResource BooleanToVisibilityConverterKey}}">
+												<!-- Auto Connect -->
+												<CheckBox x:Name="AutoConnectCheckBox"
+														  Height="22"
+														  Style="{StaticResource ItemCheckBoxStyle}"
+														  Content="{x:Static models:LanguageService.AutoConnect}"
+														  IsChecked="{Binding IsAutoConnectEnabled.Value, Mode=TwoWay}"/>
 
-											<!-- Auto Switch -->
+												<!-- Auto Switch -->
+												<CheckBox Height="22"
+														  Style="{StaticResource ItemCheckBoxStyle}"
+														  Content="{x:Static models:LanguageService.AutoSwitch}"
+														  Visibility="{Binding ElementName=AutoConnectCheckBox, Path=IsChecked, Mode=OneWay, Converter={StaticResource BooleanToVisibilityConverterKey}}"
+														  IsChecked="{Binding IsAutoSwitchEnabled.Value, Mode=TwoWay}"/>
+											</StackPanel>
+
+											<!-- Avoid -->
 											<CheckBox Height="22"
 													  Style="{StaticResource ItemCheckBoxStyle}"
-													  Content="{x:Static models:LanguageService.AutoSwitch}"
-													  Visibility="{Binding ElementName=AutoConnectCheckBox, Path=IsChecked, Mode=OneWay, Converter={StaticResource BooleanToVisibilityConverterKey}}"
-													  IsChecked="{Binding IsAutoSwitchEnabled.Value, Mode=TwoWay}"/>
+													  Content="{x:Static models:LanguageService.Avoid}"
+													  IsChecked="{Binding IsAvoided.Value, Mode=TwoWay}"/>
 										</StackPanel>
 									</Grid>
 

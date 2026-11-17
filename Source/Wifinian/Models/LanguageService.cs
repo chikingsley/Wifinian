@@ -26,6 +26,10 @@ internal static class LanguageService
 	public static string AutoSwitch => GetContentValue();
 	public static string OK => GetContentValue();
 	public static string Cancel => GetContentValue();
+	public static string Avoid => GetContentValue();
+	public static string Testing => GetContentValue();
+	public static string NoInternet => GetContentValue();
+	public static string SignInRequired => GetContentValue();
 
 	// Link
 	public static string ProjectSite => GetContentValue(fallback: Properties.Resources.ProjectSite);

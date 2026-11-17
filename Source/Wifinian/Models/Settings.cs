@@ -193,6 +193,17 @@ public class Settings : DisposableBase
 	}
 	private string _connectivityCheckUrl = DefaultConnectivityCheckUrl;
 
+	/// <summary>
+	/// Names of profiles avoided in automatic connection by this app
+	/// </summary>
+	/// <remarks>The array is never modified in place. A new array is always assigned.</remarks>
+	public string[] AvoidedProfiles
+	{
+		get => _avoidedProfiles;
+		set => SetProperty(ref _avoidedProfiles, value ?? Array.Empty<string>());
+	}
+	private string[] _avoidedProfiles = Array.Empty<string>();
+
 	#endregion
 
 	internal void Initiate()
