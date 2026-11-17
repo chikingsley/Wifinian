@@ -159,8 +159,10 @@ internal class HistoryService : IDisposable
 		if (last is null)
 			return true;
 
+		// BSSID of a network which is not connected is that of the strongest access point at
+		// the moment and so can alternate. It must not get around the minimum interval.
 		if ((last.Connected != sample.Connected) ||
-			!string.Equals(last.Bssid ?? string.Empty, sample.Bssid ?? string.Empty, StringComparison.OrdinalIgnoreCase))
+			(sample.Connected && !string.Equals(last.Bssid ?? string.Empty, sample.Bssid ?? string.Empty, StringComparison.OrdinalIgnoreCase)))
 			return true;
 
 		var elapsed = CsvLine.ToUtc(sample.Time) - CsvLine.ToUtc(last.Time);
@@ -649,7 +651,11 @@ internal class HistoryService : IDisposable
 				if (_lastSignals.TryGetValue(oldKey, out SignalSample last))
 				{
 					_lastSignals.Remove(oldKey);
-					_lastSignals[newKey] = last;
+
+					// A sample may have been written under the new key already. Keep the newer one.
+					if (!_lastSignals.TryGetValue(newKey, out SignalSample existing) ||
+						(CsvLine.ToUtc(existing.Time) < CsvLine.ToUtc(last.Time)))
+						_lastSignals[newKey] = last;
 				}
 			}
 		}

@@ -339,6 +339,44 @@ public class HistoryServiceTest
 		Assert.AreEqual(4, ReadAllSignals(history).Count);
 	}
 
+	[TestMethod]
+	public void TestShouldWriteBssidChange()
+	{
+		var last = CreateSignal(_start, "Office", 50);
+
+		// BSSID of a network which is not connected obeys the minimum interval.
+		Assert.IsFalse(HistoryService.ShouldWrite(last, CreateSignal(_start.AddSeconds(10), "Office", 50, bssid: "AA:BB:CC:00:00:02")));
+		Assert.IsFalse(HistoryService.ShouldWrite(last, CreateSignal(_start.AddSeconds(40), "Office", 50, bssid: "AA:BB:CC:00:00:02")));
+		Assert.IsTrue(HistoryService.ShouldWrite(last, CreateSignal(_start.AddSeconds(40), "Office", 53, bssid: "AA:BB:CC:00:00:02")));
+
+		// BSSID of a connected network is written immediately.
+		last = CreateSignal(_start, "Office", 50, connected: true);
+		Assert.IsFalse(HistoryService.ShouldWrite(last, CreateSignal(_start.AddSeconds(10), "Office", 50, connected: true, bssid: "aa:bb:cc:00:00:01")));
+		Assert.IsTrue(HistoryService.ShouldWrite(last, CreateSignal(_start.AddSeconds(10), "Office", 50, connected: true, bssid: "AA:BB:CC:00:00:02")));
+	}
+
+	[TestMethod]
+	public void TestRenameKeepsNewerLastSignal()
+	{
+		using var history = CreateHistory();
+
+		var oldKey = HistoryService.GetKey("Office", _interfaceId);
+		var newKey = HistoryService.GetKey("Office 2", _interfaceId);
+
+		history.AppendSignals(new[] { CreateSignal(_start, "Office", 50) }); // Written (first)
+		history.AppendSignals(new[] { CreateSignal(_start.AddMinutes(4), "Office 2", 50) }); // Written (first of new name)
+		history.Rename(oldKey, newKey);
+
+		history.AppendSignals(new[] { CreateSignal(_start.AddMinutes(6), "Office 2", 50) }); // Same value within 5 minutes from the newer
+		Assert.AreEqual(2, ReadAllSignals(history).Count);
+
+		// The last sample of old name is taken over when the new name has none.
+		history.AppendSignals(new[] { CreateSignal(_start.AddMinutes(7), "Home", 50) }); // Written (first)
+		history.Rename(HistoryService.GetKey("Home", _interfaceId), HistoryService.GetKey("Home 2", _interfaceId));
+		history.AppendSignals(new[] { CreateSignal(_start.AddMinutes(8), "Home 2", 50) }); // Same value
+		Assert.AreEqual(3, ReadAllSignals(history).Count);
+	}
+
 	#endregion
 
 	#region File
