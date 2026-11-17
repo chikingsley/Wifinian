@@ -188,10 +188,15 @@ internal partial class AppController : DisposableBase
 	{
 		await LanguageService.InitializeAsync();
 
-		Settings.Current.Initiate();
+		// The lock makes loading the settings and applying them atomic to adding profiles
+		// so that no profile is added with avoided state older than the settings.
+		lock (_profilesLock)
+		{
+			Settings.Current.Initiate();
 
-		// Profiles may have been loaded before the settings.
-		ApplyAvoided(GetProfiles());
+			// Profiles may have been loaded before the settings.
+			ApplyAvoided(Profiles.ToArray());
+		}
 
 		_ = PurgeHistoryAsync();
 
@@ -338,7 +343,6 @@ internal partial class AppController : DisposableBase
 		}
 
 		newProfiles.ForEach(ApplySummary);
-		ApplyAvoided(newProfiles);
 
 		if ((oldProfileIndices.Count > 0) || (newProfiles.Count > 0))
 		{
@@ -346,6 +350,10 @@ internal partial class AppController : DisposableBase
 			{
 				oldProfileIndices.Reverse(); // Reverse indices to start removing from the tail.
 				oldProfileIndices.ForEach(x => Profiles.RemoveAt(x));
+
+				// Avoided state must be applied in the same lock as adding profiles so that
+				// no profile is added with avoided state older than the settings.
+				ApplyAvoided(newProfiles);
 				newProfiles.ForEach(x => Profiles.Add(x));
 			}
 
@@ -792,29 +800,34 @@ internal partial class AppController : DisposableBase
 	{
 		try
 		{
-			var profiles = GetProfiles();
-
-			lock (_avoidedLock)
+			// The outer lock makes changing the settings and applying them atomic to adding
+			// profiles. The order of locks is always the lock for profiles first.
+			lock (_profilesLock)
 			{
-				var existing = Settings.Current.AvoidedProfiles;
-				if (!existing.Contains(oldName, StringComparer.Ordinal))
-					return;
+				var profiles = Profiles.ToArray();
 
-				// The old name stays if a profile of that name remains in another interface.
-				var remains = profiles.Any(x => (x.InterfaceId != interfaceId)
-					&& string.Equals(x.Name, oldName, StringComparison.Ordinal));
+				lock (_avoidedLock)
+				{
+					var existing = Settings.Current.AvoidedProfiles;
+					if (!existing.Contains(oldName, StringComparer.Ordinal))
+						return;
 
-				Settings.Current.AvoidedProfiles = existing
-					.Where(x => remains || !string.Equals(x, oldName, StringComparison.Ordinal))
-					.Concat(new[] { newName })
-					.Distinct(StringComparer.Ordinal)
-					.ToArray();
+					// The old name stays if a profile of that name remains in another interface.
+					var remains = profiles.Any(x => (x.InterfaceId != interfaceId)
+						&& string.Equals(x.Name, oldName, StringComparison.Ordinal));
+
+					Settings.Current.AvoidedProfiles = existing
+						.Where(x => remains || !string.Equals(x, oldName, StringComparison.Ordinal))
+						.Concat(new[] { newName })
+						.Distinct(StringComparer.Ordinal)
+						.ToArray();
+				}
+
+				// The renamed profile may have been loaded before the settings are changed.
+				ApplyAvoided(profiles
+					.Where(x => string.Equals(x.Name, newName, StringComparison.Ordinal))
+					.ToArray());
 			}
-
-			// The renamed profile may have been loaded before the settings are changed.
-			ApplyAvoided(profiles
-				.Where(x => string.Equals(x.Name, newName, StringComparison.Ordinal))
-				.ToArray());
 		}
 		catch (Exception ex)
 		{
