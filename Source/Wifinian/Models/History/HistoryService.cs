@@ -70,16 +70,8 @@ internal class HistoryService : IDisposable
 		this._folderPath = folderPath;
 		this._utcNow = utcNow ?? (() => DateTime.UtcNow);
 
-		try
-		{
-			Directory.CreateDirectory(_folderPath);
-		}
-		catch (Exception ex)
-		{
-			Trace.WriteLine("Failed to create history folder." + Environment.NewLine
-				+ ex);
-		}
-
+		// The folder is created when the first row is written so that nothing is left on disk
+		// as long as nothing is recorded.
 		try
 		{
 			var now = GetNow();

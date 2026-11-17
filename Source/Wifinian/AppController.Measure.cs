@@ -97,8 +97,16 @@ internal partial class AppController
 			{
 				Interlocked.Exchange(ref _resumeTicks, DateTime.UtcNow.Ticks);
 
-				// The connection is regarded as new after resume.
-				ResetDwell();
+				try
+				{
+					// The connection is regarded as new after resume.
+					ResetDwell();
+				}
+				catch (Exception ex)
+				{
+					Trace.WriteLine("Failed to handle resume." + Environment.NewLine
+						+ ex);
+				}
 			})
 			.AddTo(this.Subscription);
 

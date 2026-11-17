@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Windows;
@@ -323,6 +324,20 @@ public class HistoryChart : FrameworkElement
 	{
 		base.OnRender(dc);
 
+		// An exception thrown while rendering would otherwise bring down the app.
+		try
+		{
+			Draw(dc);
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to draw the chart." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	private void Draw(DrawingContext dc)
+	{
 		var plot = new Rect(
 			MarginLeft,
 			MarginTop,

@@ -710,6 +710,23 @@ public class HistoryServiceTest
 	}
 
 	[TestMethod]
+	public void TestFolderIsCreatedOnlyWhenWritten()
+	{
+		using var history = CreateHistory();
+
+		// Reading, summarizing and purging leave nothing on disk.
+		Assert.AreEqual(0, history.ReadSignals(_start, _start).Count);
+		Assert.IsNull(history.GetSummary(HistoryService.GetKey("Office", _interfaceId)));
+		Assert.AreEqual(0L, history.GetBytesToday());
+		history.Purge(7);
+		Assert.IsFalse(Directory.Exists(_folderPath));
+
+		history.AppendEvent(CreateEvent(_start, "event"));
+		Assert.IsTrue(Directory.Exists(_folderPath));
+		Assert.AreEqual(1, history.ReadEvents(_start, _start).Count);
+	}
+
+	[TestMethod]
 	public void TestNothingThrowsWithUnusableFolder()
 	{
 		// A file occupies the path of the folder.
