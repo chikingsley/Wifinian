@@ -102,10 +102,14 @@ internal class NativeWifiWorker : IWlanWorker
 
 	#region Get profiles
 
+	public bool IncludesRadioDetails { get; set; } = true;
+
 	public async Task<IEnumerable<ProfileItem>> GetProfilesAsync()
 	{
 		if (!IsWorkable)
 			return Array.Empty<NativeWifiProfileItem>();
+
+		var includesRadioDetails = IncludesRadioDetails;
 
 		return await Task.Run(() =>
 		{
@@ -125,7 +129,8 @@ internal class NativeWifiWorker : IWlanWorker
 				band: x.Band,
 				channel: x.Channel)).ToArray();
 
-			FillRadioDetails(items);
+			if (includesRadioDetails)
+				FillRadioDetails(items);
 
 			return items;
 		}).ConfigureAwait(false);

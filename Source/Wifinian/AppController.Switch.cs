@@ -293,7 +293,10 @@ internal partial class AppController
 				var state = GetSwitchState(_switchStates, interfaceId);
 				fromName = state.ConnectedName;
 
-				SwitchPolicy.RecordAttempt(state, target.Name, result, now, setsCooldown: engagesSpeed);
+				// A successful connection made while no network was connected (at start or after
+				// a drop) is not a switch and so does not use up the number of switches in an hour.
+				SwitchPolicy.RecordAttempt(state, target.Name, result, now, setsCooldown: engagesSpeed,
+					countsBudget: !result || (fromName is not null));
 
 				_landings.Remove(interfaceId);
 			}

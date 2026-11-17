@@ -52,7 +52,10 @@ internal class MockWorker : IWlanWorker
 		});
 	}
 
+	public bool IncludesRadioDetails { get; set; }
+
 	public Task<IEnumerable<ProfileItem>> GetProfilesAsync()
+
 	{
 		_sourceProfiles ??= PopulateProfiles().ToList();
 

@@ -530,6 +530,59 @@ public class SwitchPolicyTest
 	}
 
 	[TestMethod]
+	public void TestCooldownLastResort()
+	{
+		var a = Profile("A", 70, 0, isConnected: true);
+		var b = Profile("B", 70, 1);
+		AddSample("A", TimeSpan.FromMinutes(2), SpeedResult.NoInternet, 0, 70);
+		AddSample("A", TimeSpan.FromMinutes(1), SpeedResult.NoInternet, 0, 70);
+		AddSample("B", TimeSpan.FromMinutes(30), SpeedResult.Ok, 20, 70);
+
+		// The connected network has no internet and the only alternative was switched back
+		// from for speed. It is still better than a network which does not work.
+		var state = CreateState("A", TimeSpan.FromMinutes(15));
+		state.CooldownUntil["B"] = _now + TimeSpan.FromHours(1);
+
+		var decision = SwitchPolicy.Decide([a, b], a, CreateContext(), state);
+		Assert.AreSame(b, decision.Target);
+		StringAssert.Contains(decision.Reason, "A has no internet - switching to B");
+
+		// A network not put off comes before it.
+		var c = Profile("C", 60, 2);
+		decision = SwitchPolicy.Decide([a, b, c], a, CreateContext(), state);
+		Assert.AreSame(c, decision.Target);
+
+		// Not connected and the only network in range failed to connect before.
+		var d = Profile("B", 70, 1);
+		state = new SwitchState();
+		SwitchPolicy.RecordAttempt(state, "B", false, _now - TimeSpan.FromMinutes(5), true);
+		Assert.IsTrue(state.CooldownUntil["B"] > _now);
+
+		decision = SwitchPolicy.Decide([d], null, CreateContext(), state);
+		Assert.AreSame(d, decision.Target);
+
+		// It is not tried shortly after the failed attempt.
+		d.LastFailureTime = _now - TimeSpan.FromMinutes(1);
+		decision = SwitchPolicy.Decide([d], null, CreateContext(), state);
+		Assert.IsNull(decision.Target);
+
+		d.LastFailureTime = _now - TimeSpan.FromMinutes(4);
+		decision = SwitchPolicy.Decide([d], null, CreateContext(), state);
+		Assert.AreSame(d, decision.Target);
+
+		// The exclusion stays for leaving a working network.
+		var (ext2, office, ext) = CreateOwnerProfiles("EXT2");
+		state = CreateState("EXT2", TimeSpan.FromMinutes(15));
+		state.CooldownUntil["EXT"] = _now + TimeSpan.FromMinutes(30);
+		state.CooldownUntil["Office"] = _now + TimeSpan.FromMinutes(30);
+
+		SwitchPolicy.Decide([ext, ext2, office], ext2, CreateContext(), state);
+		decision = SwitchPolicy.Decide([ext, ext2, office], ext2, CreateContext(elapsed: TimeSpan.FromSeconds(61)), state);
+		Assert.IsNull(decision.Target);
+		Assert.IsNull(state.PendingTarget);
+	}
+
+	[TestMethod]
 	public void TestSignalEligibility()
 	{
 		// A measured network at 44 % is eligible although the signal threshold is 50.
@@ -644,7 +697,19 @@ public class SwitchPolicyTest
 			StringAssert.Contains(decision.Reason, "waiting for a pause in traffic");
 		}
 
+		// While deferred, the code stays the same when traffic is to be checked again.
+		var busyCode = decision.Code;
+		context = CreateContext(elapsed: TimeSpan.FromMinutes(15) + TimeSpan.FromSeconds(30), ignoresFreshness: true);
+		context.IsLinkBusy = null;
+		decision = SwitchPolicy.Decide(candidates, ext2, context, state);
+		Assert.IsNull(decision.Target);
+		Assert.IsTrue(decision.RequestsLinkCheck);
+		Assert.AreEqual(busyCode, decision.Code);
+		StringAssert.StartsWith(decision.Code, "lull|");
+		StringAssert.Contains(decision.Reason, "waiting for a pause in traffic");
+
 		// It switches anyway after the maximum deferral.
+
 		context = CreateContext(elapsed: TimeSpan.FromMinutes(16) + TimeSpan.FromSeconds(2), ignoresFreshness: true);
 		context.IsLinkBusy = true;
 		Assert.AreSame(ext, SwitchPolicy.Decide(candidates, ext2, context, state).Target);
@@ -886,6 +951,33 @@ public class SwitchPolicyTest
 		SwitchPolicy.RecordAttempt(state, "EXT", false, time, true);
 		Assert.AreEqual(time + TimeSpan.FromMinutes(10), state.CooldownUntil["EXT"]);
 		Assert.AreEqual(2, state.SwitchTimes.Count);
+
+		// A connection by any means starts it over and ends the exclusion.
+		state = new SwitchState();
+		SwitchPolicy.RecordAttempt(state, "EXT", false, _now, true);
+		SwitchPolicy.RecordAttempt(state, "EXT", false, _now + TimeSpan.FromHours(3), true);
+		Assert.AreEqual(2, state.FailureCounts["EXT"]);
+
+		SwitchPolicy.Track(state, "EXT", _now + TimeSpan.FromHours(3) + TimeSpan.FromMinutes(1));
+		Assert.IsFalse(state.FailureCounts.ContainsKey("EXT"));
+		Assert.IsFalse(state.CooldownUntil.ContainsKey("EXT"));
+
+		SwitchPolicy.Track(state, null, _now + TimeSpan.FromHours(4));
+		SwitchPolicy.RecordAttempt(state, "EXT", false, _now + TimeSpan.FromHours(6), true);
+		Assert.AreEqual(_now + TimeSpan.FromHours(6) + TimeSpan.FromMinutes(10), state.CooldownUntil["EXT"]);
+
+		// The exclusion made by switching back for speed is kept.
+		state = new SwitchState();
+		state.CooldownUntil["EXT"] = _now + TimeSpan.FromHours(2);
+		SwitchPolicy.Track(state, "EXT", _now);
+		Assert.IsTrue(state.CooldownUntil.ContainsKey("EXT"));
+
+		// A successful connection from no connection does not count in the budget.
+		state = new SwitchState();
+		SwitchPolicy.RecordAttempt(state, "EXT", true, _now, true, countsBudget: false);
+		Assert.AreEqual(0, state.SwitchTimes.Count);
+		SwitchPolicy.RecordAttempt(state, "EXT", true, _now, true);
+		Assert.AreEqual(1, state.SwitchTimes.Count);
 
 		// Failed attempts count in the budget.
 		state = CreateState("EXT2", TimeSpan.FromMinutes(15));

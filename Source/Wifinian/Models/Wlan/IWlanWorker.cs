@@ -18,7 +18,15 @@ internal interface IWlanWorker : IDisposable
 
 	Task ScanNetworkAsync(TimeSpan timeout);
 
+	/// <summary>
+	/// Whether supplementary values of radio (BSSID, RSSI, link rate) are filled when profiles
+	/// are got
+	/// </summary>
+	/// <remarks>If this is false, getting profiles makes no call other than those of the original.</remarks>
+	bool IncludesRadioDetails { get; set; }
+
 	Task<IEnumerable<ProfileItem>> GetProfilesAsync();
+
 
 	Task<bool> SetProfileOptionAsync(ProfileItem profileItem);
 	Task<bool> SetProfilePositionAsync(ProfileItem profileItem, int position);

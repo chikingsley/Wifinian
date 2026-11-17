@@ -257,6 +257,8 @@ internal partial class AppController : DisposableBase
 
 		if (disposing)
 		{
+			// The test of networks is given time to restore the originally connected network.
+			CloseProbe();
 			CancelProbe(true);
 			CancelMeasure();
 			_worker?.Dispose();
@@ -389,6 +391,14 @@ internal partial class AppController : DisposableBase
 		var oldProfileIndices = Enumerable.Range(0, Profiles.Count).ToList();
 		var newProfiles = new List<ProfileItem>();
 
+		// Unless a function which uses them is on, the supplementary values are not got so that
+		// loading profiles makes no call other than those of the original.
+		_worker.IncludesRadioDetails = Settings.Current.RecordsHistory
+			|| Settings.Current.MeasuresSpeed
+			|| Settings.Current.EngagesSpeed
+			|| IsMeasuring.Value
+			|| _isProbing;
+
 		foreach (var newProfile in await _worker.GetProfilesAsync())
 		{
 			var isExisting = false;
@@ -474,17 +484,57 @@ internal partial class AppController : DisposableBase
 
 	private readonly SemaphoreSlim _updateSemaphore = new(1);
 
-	private async Task UpdateAsync(Func<Task> perform)
+	/// <summary>
+	/// Loads profiles and confirms that the load has been performed by this call.
+	/// </summary>
+	/// <param name="timeout">Timeout duration</param>
+	/// <returns>True if the profiles reflect the state after this method is called</returns>
+	/// <remarks>
+	/// <see cref="LoadProfilesAsync"/> does nothing if another update is running and such update
+	/// may have got the state before this method is called. This method never throws an exception.
+	/// </remarks>
+	private async Task<bool> LoadProfilesFreshAsync(TimeSpan timeout)
+	{
+		try
+		{
+			var stopwatch = Stopwatch.StartNew();
+
+			while (true)
+			{
+				// A load by another update does not count because it may have got the state already.
+				if (await UpdateAsync(() => Task.Run(() => LoadProfilesBaseAsync())).ConfigureAwait(false))
+					return true;
+
+				if (stopwatch.Elapsed >= timeout)
+					return false;
+
+				await Task.Delay(TimeSpan.FromMilliseconds(100)).ConfigureAwait(false);
+			}
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to load profiles afresh." + Environment.NewLine
+				+ ex);
+			return false;
+		}
+	}
+
+	/// <summary>
+	/// Performs an update unless another update is running.
+	/// </summary>
+	/// <returns>True if performed, false if skipped</returns>
+	private async Task<bool> UpdateAsync(Func<Task> perform)
 	{
 		bool isEntered = false;
 		try
 		{
 			if (!(isEntered = _updateSemaphore.Wait(TimeSpan.Zero)))
-				return;
+				return false;
 
 			IsUpdating.TurnOn();
 
 			await perform.Invoke();
+			return true;
 		}
 		finally
 		{

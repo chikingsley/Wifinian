@@ -53,7 +53,10 @@ internal class NetshWorker : IWlanWorker
 
 	#region Get profiles
 
+	public bool IncludesRadioDetails { get; set; }
+
 	public async Task<IEnumerable<ProfileItem>> GetProfilesAsync()
+
 	{
 		var interfacePacks = (await Netsh.GetInterfacesAsync().ConfigureAwait(false))
 			.ToArray(); // ToArray method is necessary.

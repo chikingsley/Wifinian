@@ -311,6 +311,12 @@ internal static class SwitchPolicy
 
 			if (!isReturned)
 				state.ConnectedSince = now;
+
+			// Failures of automatic connection are no longer consecutive once the network is
+			// connected by any means and so the period of exclusion made by them ends. The period
+			// made by switching back for speed has no count of failures and is kept.
+			if (state.FailureCounts.Remove(connectedName))
+				state.CooldownUntil.Remove(connectedName);
 		}
 
 		state.ConnectedName = connectedName;
@@ -326,10 +332,16 @@ internal static class SwitchPolicy
 	/// <param name="result">True if connected</param>
 	/// <param name="now">Current time (local)</param>
 	/// <param name="setsCooldown">Whether to exclude a failed profile for a while</param>
-	public static void RecordAttempt(SwitchState state, string targetName, bool result, DateTime now, bool setsCooldown)
+	/// <param name="countsBudget">
+	/// Whether to count this attempt in the number of switches in an hour (a successful connection
+	/// made while no network was connected is not a switch)
+	/// </param>
+	public static void RecordAttempt(SwitchState state, string targetName, bool result, DateTime now, bool setsCooldown, bool countsBudget = true)
 	{
 		state.SwitchTimes.RemoveAll(x => !IsWithin(now, x, BudgetPeriod));
-		state.SwitchTimes.Add(now);
+
+		if (countsBudget)
+			state.SwitchTimes.Add(now);
 
 		if (result)
 		{
@@ -559,10 +571,23 @@ internal static class SwitchPolicy
 				state.RetryCounts.Remove(candidate.Name);
 		}
 
+		bool IsCooling(ProfileItem p) => state.CooldownUntil.TryGetValue(p.Name, out DateTime until) && (until > now);
+
 		var others = candidates
 			.Where(x => !ReferenceEquals(x, connected))
-			.Where(x => !(state.CooldownUntil.TryGetValue(x.Name, out DateTime until) && (until > now)))
+			.Where(x => !IsCooling(x))
 			.ToArray();
+
+		// When there is nothing else to connect to, a network being put off is better than no
+		// network or a network which does not work. It is not tried shortly after a failed attempt.
+		List<ProfileItem> RankLastResort(bool includesAllDead = false)
+		{
+			var ranked = Rank(others, includesAllDead);
+			if (ranked.Count > 0)
+				return ranked;
+
+			return Rank(candidates.Where(x => !ReferenceEquals(x, connected) && IsCooling(x) && !RecentlyFailed(x)), includesAllDead);
+		}
 
 		static string F0(double value) => value.ToString("0", CultureInfo.InvariantCulture);
 		static string F1(double value) => value.ToString("0.#", CultureInfo.InvariantCulture);
@@ -570,7 +595,7 @@ internal static class SwitchPolicy
 		// (1) Not connected
 		if (connected is null)
 		{
-			var ranked = Rank(others, includesAllDead: true);
+			var ranked = RankLastResort(includesAllDead: true);
 			var first = ranked.FirstOrDefault();
 			if (first is null)
 				return new SwitchDecision { Kind = SwitchKind.Stay };
@@ -694,7 +719,7 @@ internal static class SwitchPolicy
 				: $"{name} signal too weak ({connected.Signal}%)";
 			var code = isOffline ? "offline" : WeakCode;
 
-			var target = Rank(others).FirstOrDefault();
+			var target = RankLastResort().FirstOrDefault();
 			if (target is null)
 				return Stay($"{code}|{name}", $"{why} - no other network in range");
 
@@ -754,7 +779,13 @@ internal static class SwitchPolicy
 			if (context.MaxDeferral > TimeSpan.Zero)
 			{
 				if (!context.IsLinkBusy.HasValue)
-					return Stay($"confirm|{name}|{target.Name}", $"{waiting} - confirming", requestsLinkCheck: true);
+				{
+					// While the switch is deferred, the code is kept so that the same decision is
+					// not recorded again every time traffic is checked.
+					return (state.DeferredSince != default)
+						? Stay($"lull|{name}|{target.Name}", $"{waiting} - waiting for a pause in traffic", requestsLinkCheck: true)
+						: Stay($"confirm|{name}|{target.Name}", $"{waiting} - confirming", requestsLinkCheck: true);
+				}
 
 				if (context.IsLinkBusy.Value)
 				{

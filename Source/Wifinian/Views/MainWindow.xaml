@@ -168,7 +168,7 @@
 											Style="{StaticResource NameTextBoxStyle}"
 											Foreground="{StaticResource App.Foreground}"
 											FontSize="14"
-											TextWrapping="Wrap" MaxLength="64"
+											TextWrapping="NoWrap" MaxLength="64"
 											Text="{Binding Name, Mode=TwoWay}"/>
 
 										<!-- Speed -->

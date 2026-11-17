@@ -86,7 +86,10 @@ internal sealed class SpeedTester
 	{
 		try
 		{
-			ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+			// The default value (SystemDefault) follows the operating system, which includes
+			// TLS 1.2 and later, and so must be left as it is.
+			if (ServicePointManager.SecurityProtocol != SecurityProtocolType.SystemDefault)
+				ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
 		}
 		catch (Exception ex)
 		{

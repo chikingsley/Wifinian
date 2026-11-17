@@ -22,6 +22,8 @@ internal partial class AppController
 	private static readonly TimeSpan _probeQuietTimeout = TimeSpan.FromSeconds(20);
 	private static readonly TimeSpan _probeSettleDelay = TimeSpan.FromSeconds(3);
 	private static readonly TimeSpan _probeLoadTimeout = TimeSpan.FromSeconds(5);
+	private static readonly TimeSpan _probeFreshTimeout = TimeSpan.FromSeconds(8);
+	private static readonly TimeSpan _probeCloseTimeout = TimeSpan.FromSeconds(15);
 	private static readonly TimeSpan _probeMeasureWait = TimeSpan.FromSeconds(10);
 	private static readonly TimeSpan _probeRetryDelay = TimeSpan.FromSeconds(3);
 	private static readonly TimeSpan _probePollInterval = TimeSpan.FromMilliseconds(500);
@@ -47,6 +49,7 @@ internal partial class AppController
 
 	private CancellationTokenSource _probeCancellation;
 	private volatile bool _isProbeInterrupted;
+	private volatile bool _isClosing;
 	private int _probeCount = 0;
 	private DateTime? _lastIdleProbeTime; // UTC
 	private readonly Dictionary<string, DateTime> _lastProbeTimes = new(); // UTC
@@ -109,6 +112,39 @@ internal partial class AppController
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to cancel the test of networks." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Ends the running test of networks when this app is closed and waits, for a limited time,
+	/// for the originally connected network to be restored.
+	/// </summary>
+	/// <remarks>
+	/// Without this wait, closing this app during the test would leave the machine on the network
+	/// being tested. The test runs on thread pool threads and so the calling thread can wait.
+	/// This method never throws an exception.
+	/// </remarks>
+	private void CloseProbe()
+	{
+		try
+		{
+			_isClosing = true;
+
+			if (Volatile.Read(ref _probeCount) == 0)
+				return;
+
+			CancelProbe(false);
+
+			// The measurement of the network being tested is of no use any longer.
+			CancelMeasure();
+
+			if (!SpinWait.SpinUntil(() => Volatile.Read(ref _probeCount) == 0, _probeCloseTimeout))
+				Trace.WriteLine("The test of networks did not end in time on closing.");
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to end the test of networks on closing." + Environment.NewLine
 				+ ex);
 		}
 	}
@@ -190,7 +226,7 @@ internal partial class AppController
 	/// </remarks>
 	private async Task ProbeAsync(IReadOnlyList<Guid> interfaceIds, IReadOnlyList<ProfileItem> targets, SpeedTrigger trigger)
 	{
-		if (_disposed)
+		if (_disposed || _isClosing)
 			return;
 
 		// Only one test runs at a time.
@@ -200,6 +236,10 @@ internal partial class AppController
 		CancellationTokenSource cancellation = null;
 		try
 		{
+			// Closing this app may have started in the meantime.
+			if (_isClosing)
+				return;
+
 			cancellation = new CancellationTokenSource();
 
 			lock (_probeLock)
@@ -262,7 +302,7 @@ internal partial class AppController
 
 			try
 			{
-				if (!_disposed)
+				if (!_disposed && !_isClosing)
 					await LoadProfilesAsync().ConfigureAwait(false);
 			}
 			catch (Exception ex)
@@ -299,6 +339,17 @@ internal partial class AppController
 		var isChanged = false;
 		try
 		{
+			// The connected profile to be restored and the profiles which require connection are
+			// determined from the profiles and so the profiles must not be older than this point.
+			if (!await LoadProfilesFreshAsync(_probeFreshTimeout).ConfigureAwait(false))
+			{
+				Trace.WriteLine("Failed to load profiles before the test of networks.");
+				return;
+			}
+
+			if (cancellationToken.IsCancellationRequested || _disposed)
+				return;
+
 			var subProfiles = GetProfiles()
 				.Where(x => x.InterfaceId == interfaceId)
 				.ToArray();
@@ -423,13 +474,19 @@ internal partial class AppController
 			if ((original is null) || _disposed || _isProbeInterrupted)
 				return;
 
-			await LoadProfilesAsync().ConfigureAwait(false);
+			// The connection is left as it is only when the original profile is confirmed to be
+			// connected by a load performed after the test. A load skipped because of another
+			// update would leave the profiles as they were before the test connected to others.
+			var isLoaded = await LoadProfilesFreshAsync(_probeFreshTimeout).ConfigureAwait(false);
 
-			if (original.IsConnected)
+			if (_disposed || _isProbeInterrupted)
+				return;
+
+			if (isLoaded && original.IsConnected)
 				return;
 
 			var result = await ConnectNetworkAsync(original, false).ConfigureAwait(false);
-			if (!result && !_disposed && !_isProbeInterrupted)
+			if (!result && !_disposed && !_isProbeInterrupted && !_isClosing)
 			{
 				await Task.Delay(_probeRetryDelay).ConfigureAwait(false);
 
