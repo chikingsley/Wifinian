@@ -49,9 +49,14 @@ public class HistoryServiceTest
 		Assert.AreEqual("abc", CsvLine.Escape("abc"));
 		Assert.AreEqual("\"a,b\"", CsvLine.Escape("a,b"));
 		Assert.AreEqual("\"a\"\"b\"", CsvLine.Escape("a\"b"));
-		Assert.AreEqual("\"a\r\nb\"", CsvLine.Escape("a\r\nb"));
 
-		var fields = new[] { "plain", "", "a,b", "say \"hi\"", "line\r\nbreak", " spaced ", TrickyName };
+		// Line breaks are replaced because a row must not span multiple lines.
+		Assert.AreEqual("a b", CsvLine.Escape("a\r\nb"));
+		Assert.AreEqual("a b c", CsvLine.Escape("a\rb\nc"));
+		Assert.AreEqual("\"a, b\"", CsvLine.Escape("a,\nb"));
+		Assert.AreEqual("x,a b", CsvLine.Join("x", "a\r\nb"));
+
+		var fields = new[] { "plain", "", "a,b", "say \"hi\"", " spaced ", TrickyName };
 		var line = CsvLine.Join(fields);
 		CollectionAssert.AreEqual(fields, CsvLine.Split(line));
 
@@ -405,6 +410,24 @@ public class HistoryServiceTest
 	}
 
 	[TestMethod]
+	public void TestLineBreakThroughFile()
+	{
+		using var history = CreateHistory();
+
+		history.AppendEvent(new SwitchEvent { Time = _start, InterfaceId = _interfaceId, Kind = SwitchKind.Switch, From = "Off\nice", To = "EXT", Reason = "a\r\nb" });
+		history.AppendEvent(CreateEvent(_start.AddMinutes(1), "next"));
+
+		// Header and two rows, each in a single line
+		Assert.AreEqual(3, File.ReadAllLines(Path.Combine(_folderPath, "events-20261117.csv")).Length);
+
+		var switchEvents = history.ReadEvents(_start, _start.AddHours(1));
+		Assert.AreEqual(2, switchEvents.Count);
+		Assert.AreEqual("Off ice", switchEvents[0].From);
+		Assert.AreEqual("a b", switchEvents[0].Reason);
+		Assert.AreEqual("next", switchEvents[1].Reason);
+	}
+
+	[TestMethod]
 	public void TestReadSpeedsToleratesMalformedFile()
 	{
 		Directory.CreateDirectory(_folderPath);
@@ -473,6 +496,47 @@ public class HistoryServiceTest
 		CollectionAssert.AreEqual(new[] { "first", "second", "third", "fourth" },
 			history.ReadEvents(_start, _start.AddHours(1)).Select(x => x.Reason).ToArray());
 		Assert.AreEqual(5, File.ReadAllLines(filePath).Length);
+	}
+
+	[TestMethod]
+	public void TestLockedFileDoesNotBlockOtherFiles()
+	{
+		using var history = CreateHistory();
+
+		history.AppendSpeed(CreateSpeed(_start, "Office", SpeedResult.Ok, 70));
+
+		var changedKinds = new List<HistoryKind>();
+		history.Changed += (_, kind) => changedKinds.Add(kind);
+
+		var speedPath = Path.Combine(_folderPath, "speed-20261117.csv");
+		using (new FileStream(speedPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+		{
+			history.AppendSpeed(CreateSpeed(_start.AddMinutes(1), "Office", SpeedResult.Ok, 71));
+			history.AppendEvent(CreateEvent(_start.AddMinutes(2), "event"));
+			history.AppendSignals(new[] { CreateSignal(_start.AddMinutes(3), "Office", 50) });
+			history.AppendSpeed(CreateSpeed(_start.AddMinutes(4), "Office", SpeedResult.Ok, 72));
+
+			// The rows of other files are written while the speed file is locked.
+			Assert.AreEqual("event", history.ReadEvents(_start, _start.AddHours(1)).Single().Reason);
+			Assert.AreEqual(50, history.ReadSignals(_start, _start.AddHours(1)).Single().Signal);
+			CollectionAssert.AreEqual(new[] { HistoryKind.Speed, HistoryKind.Event, HistoryKind.Signal, HistoryKind.Speed }, changedKinds);
+		}
+
+		Assert.AreEqual(1, history.ReadSpeeds(_start, _start.AddHours(1)).Count);
+
+		// The held rows are written in order by the next append of any kind, only once.
+		history.AppendEvent(CreateEvent(_start.AddMinutes(5), "later"));
+
+		CollectionAssert.AreEqual(new double?[] { 70, 71, 72 },
+			history.ReadSpeeds(_start, _start.AddHours(1)).Select(x => x.DownMbps).ToArray());
+		Assert.AreEqual(4, File.ReadAllLines(speedPath).Length);
+
+		history.AppendEvent(CreateEvent(_start.AddMinutes(6), "last"));
+
+		Assert.AreEqual(4, File.ReadAllLines(speedPath).Length);
+		Assert.AreEqual(3, history.ReadEvents(_start, _start.AddHours(1)).Count);
+		Assert.AreEqual(4, File.ReadAllLines(Path.Combine(_folderPath, "events-20261117.csv")).Length);
+		Assert.AreEqual(2, File.ReadAllLines(Path.Combine(_folderPath, "signal-20261117.csv")).Length);
 	}
 
 	[TestMethod]

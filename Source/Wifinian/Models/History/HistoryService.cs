@@ -275,9 +275,6 @@ internal class HistoryService : IDisposable
 			this.Date = CsvLine.ToUtc(time).Date;
 			this.Line = line;
 		}
-
-		public bool IsSameFile(Row other) =>
-			(Prefix == other.Prefix) && (Date == other.Date);
 	}
 
 	private string GetFilePath(string prefix, DateTime date) =>
@@ -287,47 +284,72 @@ internal class HistoryService : IDisposable
 	/// Writes rows to files following the rows which could not be written before.
 	/// </summary>
 	/// <param name="rows">Rows</param>
-	/// <returns>True if all rows are written, false if rows are kept in memory for the next attempt</returns>
-	/// <remarks>This method must be called inside the lock.</remarks>
+	/// <returns>True if any of the rows is written, false if all of the rows are kept in memory for the next attempt</returns>
+	/// <remarks>
+	/// A file which cannot be written holds back only its own rows. The rows of other files are written.
+	/// This method must be called inside the lock.
+	/// </remarks>
 	private bool WriteRows(List<Row> rows)
 	{
 		var buffer = (_pending.Count > 0)
 			? _pending.Concat(rows).ToList()
 			: rows;
 
-		int index = 0;
+		if (buffer.Count == 0)
+			return false;
+
+		// File paths which could not be written, null if the folder is not usable
+		HashSet<string> failedPaths = null;
 
 		try
 		{
 			Directory.CreateDirectory(_folderPath);
 
-			while (index < buffer.Count)
-			{
-				int end = index + 1;
-				while ((end < buffer.Count) && buffer[end].IsSameFile(buffer[index]))
-					end++;
-
-				WriteFile(GetFilePath(buffer[index].Prefix, buffer[index].Date), buffer[index].Header, buffer.Skip(index).Take(end - index).Select(x => x.Line));
-				index = end;
-			}
-
-			_pending.Clear();
-			return true;
+			failedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 		}
 		catch (Exception ex)
 		{
-			Trace.WriteLine("Failed to write history file." + Environment.NewLine
+			Trace.WriteLine("Failed to create history folder." + Environment.NewLine
 				+ ex);
-
-			// Keep the rows which have not been written, oldest dropped, for the next attempt.
-			var remaining = buffer.Skip(Math.Max(index, buffer.Count - MaxPendingCount)).ToArray();
-
-			_pending.Clear();
-			foreach (var row in remaining)
-				_pending.Enqueue(row);
-
-			return false;
 		}
+
+		if (failedPaths is not null)
+		{
+			// GroupBy method keeps the order of rows in each file.
+			foreach (var group in buffer.GroupBy(x => GetFilePath(x.Prefix, x.Date), StringComparer.OrdinalIgnoreCase))
+			{
+				try
+				{
+					WriteFile(group.Key, group.First().Header, group.Select(x => x.Line));
+				}
+				catch (Exception ex)
+				{
+					Trace.WriteLine("Failed to write history file." + Environment.NewLine
+						+ ex);
+
+					failedPaths.Add(group.Key);
+				}
+			}
+
+			if (failedPaths.Count == 0)
+			{
+				_pending.Clear();
+				return true;
+			}
+		}
+
+		bool IsFailed(Row row) =>
+			(failedPaths is null) || failedPaths.Contains(GetFilePath(row.Prefix, row.Date));
+
+		// Keep the rows which have not been written, oldest dropped, for the next attempt.
+		var remaining = buffer.Where(x => IsFailed(x)).ToArray();
+		bool isWritten = rows.Any(x => !IsFailed(x));
+
+		_pending.Clear();
+		foreach (var row in remaining.Skip(Math.Max(0, remaining.Length - MaxPendingCount)))
+			_pending.Enqueue(row);
+
+		return isWritten;
 	}
 
 	private static void WriteFile(string filePath, string header, IEnumerable<string> lines)

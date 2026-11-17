@@ -11,14 +11,27 @@ namespace Wifinian.Models.History;
 /// </summary>
 internal static class CsvLine
 {
-	private static readonly char[] _specialChars = { ',', '"', '\r', '\n' };
+	private static readonly char[] _specialChars = { ',', '"' };
+	private static readonly char[] _lineBreakChars = { '\r', '\n' };
 
 	#region Line
 
+	/// <summary>
+	/// Escapes a field.
+	/// </summary>
+	/// <param name="field">Field</param>
+	/// <returns>Escaped field</returns>
+	/// <remarks>
+	/// Line breaks are replaced with a space because the files are read line by line and so a row
+	/// must not span multiple lines.
+	/// </remarks>
 	public static string Escape(string field)
 	{
 		if (string.IsNullOrEmpty(field))
 			return string.Empty;
+
+		if (field.IndexOfAny(_lineBreakChars) >= 0)
+			field = field.Replace("\r\n", " ").Replace('\r', ' ').Replace('\n', ' ');
 
 		if (field.IndexOfAny(_specialChars) < 0)
 			return field;
