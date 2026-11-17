@@ -356,7 +356,7 @@ internal partial class AppController
 					continue;
 				}
 
-				var (sample, _) = await MeasureProfileAsync(target, trigger, SpeedTestSize.Quick, false, _probeMeasureWait).ConfigureAwait(false);
+				var (sample, _) = await MeasureProfileAsync(target, trigger, SpeedTestSize.Quick, false, _probeMeasureWait, isProbe: true).ConfigureAwait(false);
 				if (sample is null)
 					AppendProbeEvent(interfaceId, SwitchKind.Probe, original?.Name, target.Name, $"Could not test {target.Name}");
 			}

@@ -325,13 +325,17 @@ internal partial class AppController
 					return PutOff();
 			}
 
+			// The test of networks may have started in the meantime.
+			if (_isProbing)
+				return PutOff();
+
 			var (sample, isRecorded) = await MeasureProfileAsync(
 				profile,
 				trigger,
 				(trigger is SpeedTrigger.Manual) ? SpeedTestSize.Full : SpeedTestSize.Quick,
 				isRecheck).ConfigureAwait(false);
 
-			// Another measurement is running.
+			// Another measurement or the test of networks is running.
 			if (sample is null)
 				return PutOff();
 
@@ -369,15 +373,17 @@ internal partial class AppController
 	/// <param name="size">Size of measurement</param>
 	/// <param name="isRecheck">Whether this is to check again a network found without internet access</param>
 	/// <param name="waitTime">Time to wait for a running measurement to end</param>
+	/// <param name="isProbe">Whether this is a measurement by the test of networks</param>
 	/// <returns>
 	/// Speed sample and whether it is recorded in history. The sample is null if not measured
-	/// because another measurement is running.
+	/// because another measurement is running or because the test of networks is running and
+	/// this is not a measurement by it.
 	/// </returns>
 	/// <remarks>
 	/// No condition for the trigger is checked by this method. If the connection has changed
 	/// during the measurement, the result is recorded as aborted.
 	/// </remarks>
-	private async Task<(SpeedSample sample, bool isRecorded)> MeasureProfileAsync(ProfileItem profile, SpeedTrigger trigger, SpeedTestSize size, bool isRecheck = false, TimeSpan waitTime = default)
+	private async Task<(SpeedSample sample, bool isRecorded)> MeasureProfileAsync(ProfileItem profile, SpeedTrigger trigger, SpeedTestSize size, bool isRecheck = false, TimeSpan waitTime = default, bool isProbe = false)
 	{
 		var targetId = profile.InterfaceId;
 		var key = HistoryService.GetKey(profile.Name, targetId);
@@ -391,6 +397,13 @@ internal partial class AppController
 		try
 		{
 			IsMeasuring.TurnOn();
+
+			// While networks are being tested one after another, no other measurement is to run
+			// across the changes of connection. This is checked after the indication is turned on
+			// so that either this measurement finds the test or the test finds this measurement.
+			if (_isProbing && !isProbe)
+				return (null, false);
+
 			profile.IsMeasuring = true;
 
 			// The limit of frequency counts only the measurements actually started.
