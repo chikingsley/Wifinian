@@ -35,6 +35,8 @@ internal static class LanguageService
 	public static string StartSignIn => GetContentValue();
 	public static string ShowAvailable => GetContentValue();
 	public static string RecordHistory => GetContentValue();
+	public static string MeasureSpeed => GetContentValue();
+	public static string TestSpeed => GetContentValue();
 	public static string Close => GetContentValue();
 
 	// Message

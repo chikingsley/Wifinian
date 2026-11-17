@@ -3,6 +3,7 @@ using static System.Math;
 using ManagedNativeWifi;
 
 using Wifinian.Common;
+using Wifinian.Models.History;
 
 namespace Wifinian.Models.Wlan;
 
@@ -183,6 +184,86 @@ public class ProfileItem : BindableBase
 		set => SetProperty(ref _linkRate, value);
 	}
 	private int _linkRate;
+
+	/// <summary>
+	/// Download speed (Mbps) of the last valid speed measurement (null if unknown)
+	/// </summary>
+	public double? LastDownMbps
+	{
+		get => _lastDownMbps;
+		set => SetProperty(ref _lastDownMbps, value);
+	}
+	private double? _lastDownMbps;
+
+	/// <summary>
+	/// Upload speed (Mbps) of the last valid speed measurement (null if unknown)
+	/// </summary>
+	public double? LastUpMbps
+	{
+		get => _lastUpMbps;
+		set => SetProperty(ref _lastUpMbps, value);
+	}
+	private double? _lastUpMbps;
+
+	/// <summary>
+	/// Latency (ms) of the last valid speed measurement (null if unknown)
+	/// </summary>
+	public double? LastLatencyMs
+	{
+		get => _lastLatencyMs;
+		set => SetProperty(ref _lastLatencyMs, value);
+	}
+	private double? _lastLatencyMs;
+
+	/// <summary>
+	/// Time (UTC) of the last valid speed measurement (default if none)
+	/// </summary>
+	public DateTime LastMeasuredTime
+	{
+		get => _lastMeasuredTime;
+		set => SetProperty(ref _lastMeasuredTime, value);
+	}
+	private DateTime _lastMeasuredTime;
+
+	/// <summary>
+	/// Result of the last valid speed measurement (None if none)
+	/// </summary>
+	public SpeedResult LastSpeedResult
+	{
+		get => _lastSpeedResult;
+		set => SetProperty(ref _lastSpeedResult, value);
+	}
+	private SpeedResult _lastSpeedResult;
+
+	/// <summary>
+	/// Typical download speed (Mbps) of recent speed measurements (null if unknown)
+	/// </summary>
+	public double? TypicalDownMbps
+	{
+		get => _typicalDownMbps;
+		set => SetProperty(ref _typicalDownMbps, value);
+	}
+	private double? _typicalDownMbps;
+
+	/// <summary>
+	/// Number of recent speed measurements used for typical speed
+	/// </summary>
+	public int SpeedSampleCount
+	{
+		get => _speedSampleCount;
+		set => SetProperty(ref _speedSampleCount, value);
+	}
+	private int _speedSampleCount;
+
+	/// <summary>
+	/// Whether speed of this profile is being measured
+	/// </summary>
+	public bool IsMeasuring
+	{
+		get => _isMeasuring;
+		set => SetProperty(ref _isMeasuring, value);
+	}
+	private bool _isMeasuring;
 
 	/// <summary>
 	/// Whether this profile is set to be target

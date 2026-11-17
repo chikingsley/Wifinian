@@ -132,7 +132,8 @@ internal partial class AppController : DisposableBase
 		// values so that the timer follows them.
 		Observable.Merge(
 			Settings.Current.ObserveProperty(x => x.SampleInterval).Select(_ => Unit.Default),
-			Settings.Current.ObserveProperty(x => x.RecordsHistory).Select(_ => Unit.Default))
+			Settings.Current.ObserveProperty(x => x.RecordsHistory).Select(_ => Unit.Default),
+			Settings.Current.ObserveProperty(x => x.MeasuresSpeed).Select(_ => Unit.Default))
 			.Subscribe(_ => UpdateSampleTimer())
 			.AddTo(this.Subscription);
 
@@ -179,6 +180,8 @@ internal partial class AppController : DisposableBase
 			.AddTo(this.Subscription);
 
 		#endregion
+
+		InitiateMeasure();
 	}
 
 	public async Task InitiateAsync()
@@ -229,6 +232,7 @@ internal partial class AppController : DisposableBase
 
 		if (disposing)
 		{
+			CancelMeasure();
 			_worker?.Dispose();
 			NotifyIconContainer.Dispose();
 			WindowPainter.Dispose();
@@ -289,6 +293,10 @@ internal partial class AppController : DisposableBase
 
 	private Task ScanNetworkAsync()
 	{
+		// A scan takes the radio off the channel and so would distort a running speed measurement.
+		if (IsMeasuring.Value)
+			return LoadProfilesAsync();
+
 		Debug.WriteLine("Scan start!");
 
 		return UpdateAsync(() => _worker.ScanNetworkAsync(_scanTimeout));
@@ -325,6 +333,8 @@ internal partial class AppController : DisposableBase
 			if (!isExisting)
 				newProfiles.Add(newProfile);
 		}
+
+		newProfiles.ForEach(ApplySummary);
 
 		if ((oldProfileIndices.Count > 0) || (newProfiles.Count > 0))
 		{
@@ -430,9 +440,9 @@ internal partial class AppController : DisposableBase
 
 	#region Sample
 
-	private const int SampleScanCycle = 5; // Number of sample ticks per scan
+	private static readonly TimeSpan _sampleScanTolerance = TimeSpan.FromSeconds(5);
 
-	private int _sampleTickCount = 0;
+	private DateTime _lastSampleScanTime = DateTime.UtcNow;
 	private DateTime _lastPurgeDate; // UTC
 	private readonly object _sampleLock = new();
 
@@ -440,7 +450,7 @@ internal partial class AppController : DisposableBase
 	/// Whether the sample timer is required to run
 	/// </summary>
 	/// <remarks>If this is false, no periodic work other than that of the original is done.</remarks>
-	private bool RequiresSampleTimer => Settings.Current.RecordsHistory;
+	private bool RequiresSampleTimer => Settings.Current.RecordsHistory || Settings.Current.MeasuresSpeed;
 
 	private void UpdateSampleTimer()
 	{
@@ -479,22 +489,49 @@ internal partial class AppController : DisposableBase
 	{
 		try
 		{
-			var count = Interlocked.Increment(ref _sampleTickCount);
+			// The connection is not settled yet just after resume from sleep.
+			if (IsResumed)
+				return;
 
 			await PurgeHistoryAsync();
 
-			// Scan periodically so that signal qualities of networks other than connected one are
-			// refreshed. When rescan is rushed, the scan is already repeated.
-			if ((count % SampleScanCycle == 0) && !RushesRescan.Value)
+			if (await RequiresSampleScanAsync())
+			{
+				_lastSampleScanTime = DateTime.UtcNow;
 				await ScanNetworkAsync();
+			}
 			else
+			{
 				await LoadProfilesAsync();
+			}
+
+			await MeasureIfDueAsync();
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to handle a sample tick." + Environment.NewLine
 				+ ex);
 		}
+	}
+
+	/// <summary>
+	/// Determines whether a scan is to be performed in this sample tick.
+	/// </summary>
+	/// <remarks>
+	/// A scan is performed periodically so that signal qualities of networks other than connected
+	/// one are refreshed. When rescan is rushed, the scan is already repeated. A scan is put off
+	/// while a speed measurement is running or the link is in use.
+	/// </remarks>
+	private async Task<bool> RequiresSampleScanAsync()
+	{
+		var scanInterval = Settings.Current.ScanInterval;
+		if ((scanInterval <= 0) || RushesRescan.Value || IsMeasuring.Value)
+			return false;
+
+		if (DateTime.UtcNow - _lastSampleScanTime < TimeSpan.FromMinutes(scanInterval) - _sampleScanTolerance)
+			return false;
+
+		return !await IsLinkBusyForScanAsync();
 	}
 
 	/// <summary>
@@ -667,6 +704,15 @@ internal partial class AppController : DisposableBase
 			History.Rename(
 				HistoryService.GetKey(oldName, interfaceId),
 				HistoryService.GetKey(profileName, interfaceId));
+
+			// The renamed profile may have been loaded before the history is renamed.
+			ProfileItem renamedProfile;
+			lock (_profilesLock)
+			{
+				renamedProfile = Profiles.FirstOrDefault(x => (x.InterfaceId == interfaceId)
+					&& string.Equals(x.Name, profileName, StringComparison.Ordinal));
+			}
+			ApplySummary(renamedProfile);
 		}
 		return result;
 	}

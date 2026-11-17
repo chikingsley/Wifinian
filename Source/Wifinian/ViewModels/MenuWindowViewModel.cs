@@ -9,6 +9,7 @@ public class MenuWindowViewModel : DisposableBase
 {
 	private readonly AppController _controller;
 
+	public ReactiveCommand MeasureCommand => _controller?.MeasureCommand;
 	public ReactiveCommand CloseCommand => _controller?.CloseCommand;
 
 	internal MenuWindowViewModel(AppController controller)

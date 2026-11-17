@@ -17,6 +17,8 @@ ProjectSite=https://github.com/emoacht/Wifinian/blob/master/README.md
 StartSignIn=Start on sign in
 ShowAvailable=Show available networks only
 RecordHistory=Record history
+MeasureSpeed=Measure speed automatically
+TestSpeed=Test speed now
 Close=Close
 
 [Message]

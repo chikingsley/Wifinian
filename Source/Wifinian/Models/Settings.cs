@@ -110,6 +110,89 @@ public class Settings : DisposableBase
 	}
 	private int _historyRetentionDays = 90; // Default
 
+	private const int MinScanInterval = 0;
+	private const int MaxScanInterval = 1440;
+
+	/// <summary>
+	/// Interval (min) of background scan by the sample timer (0 for never)
+	/// </summary>
+	public int ScanInterval
+	{
+		get => _scanInterval;
+		set => SetProperty(ref _scanInterval, value, MinScanInterval, MaxScanInterval);
+	}
+	private int _scanInterval = 5; // Default
+
+	/// <summary>
+	/// Whether to measure speed of connected network automatically
+	/// </summary>
+	public bool MeasuresSpeed
+	{
+		get => _measuresSpeed;
+		set => SetProperty(ref _measuresSpeed, value);
+	}
+	private bool _measuresSpeed = true; // Default
+
+	private const int MinSpeedTestInterval = 15;
+	private const int MaxSpeedTestInterval = 240;
+
+	/// <summary>
+	/// Interval (min) of periodic speed measurement
+	/// </summary>
+	public int SpeedTestInterval
+	{
+		get => _speedTestInterval;
+		set => SetProperty(ref _speedTestInterval, value, MinSpeedTestInterval, MaxSpeedTestInterval);
+	}
+	private int _speedTestInterval = 60; // Default
+
+	private const int MinSpeedTestDailyBudget = 50;
+	private const int MaxSpeedTestDailyBudget = 5000;
+
+	/// <summary>
+	/// Daily budget (MB) of data used by automatic speed measurements
+	/// </summary>
+	public int SpeedTestDailyBudget
+	{
+		get => _speedTestDailyBudget;
+		set => SetProperty(ref _speedTestDailyBudget, value, MinSpeedTestDailyBudget, MaxSpeedTestDailyBudget);
+	}
+	private int _speedTestDailyBudget = 500; // Default
+
+	internal const string DefaultSpeedTestDownloadUrl = "https://speed.cloudflare.com/__down?bytes=25000000";
+	internal const string DefaultSpeedTestUploadUrl = "https://speed.cloudflare.com/__up";
+	internal const string DefaultConnectivityCheckUrl = "http://www.msftconnecttest.com/connecttest.txt";
+
+	/// <summary>
+	/// URL to download from in speed measurement
+	/// </summary>
+	public string SpeedTestDownloadUrl
+	{
+		get => _speedTestDownloadUrl;
+		set => SetProperty(ref _speedTestDownloadUrl, string.IsNullOrWhiteSpace(value) ? DefaultSpeedTestDownloadUrl : value.Trim());
+	}
+	private string _speedTestDownloadUrl = DefaultSpeedTestDownloadUrl;
+
+	/// <summary>
+	/// URL to upload to in speed measurement
+	/// </summary>
+	public string SpeedTestUploadUrl
+	{
+		get => _speedTestUploadUrl;
+		set => SetProperty(ref _speedTestUploadUrl, string.IsNullOrWhiteSpace(value) ? DefaultSpeedTestUploadUrl : value.Trim());
+	}
+	private string _speedTestUploadUrl = DefaultSpeedTestUploadUrl;
+
+	/// <summary>
+	/// URL to check internet access
+	/// </summary>
+	public string ConnectivityCheckUrl
+	{
+		get => _connectivityCheckUrl;
+		set => SetProperty(ref _connectivityCheckUrl, string.IsNullOrWhiteSpace(value) ? DefaultConnectivityCheckUrl : value.Trim());
+	}
+	private string _connectivityCheckUrl = DefaultConnectivityCheckUrl;
+
 	#endregion
 
 	internal void Initiate()

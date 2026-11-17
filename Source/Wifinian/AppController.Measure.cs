@@ -1,0 +1,414 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Reactive.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using ManagedNativeWifi;
+using Microsoft.Win32;
+using Reactive.Bindings;
+using Reactive.Bindings.Extensions;
+using Reactive.Bindings.Notifiers;
+
+using Wifinian.Models;
+using Wifinian.Models.History;
+using Wifinian.Models.Measure;
+using Wifinian.Models.Wlan;
+
+namespace Wifinian;
+
+internal partial class AppController
+{
+	#region Measure
+
+	private static readonly TimeSpan _afterConnectDelay = TimeSpan.FromSeconds(20);
+	private static readonly TimeSpan _afterConnectValidity = TimeSpan.FromMinutes(30);
+	private static readonly TimeSpan _addressTimeout = TimeSpan.FromSeconds(15);
+	private static readonly TimeSpan _resumeHoldoff = TimeSpan.FromSeconds(30);
+
+	private static readonly TimeSpan _busyWindow = TimeSpan.FromSeconds(2);
+	private const double BusyRate = 1.0; // Mbps
+
+	private static readonly TimeSpan _scanBusyWindow = TimeSpan.FromSeconds(1);
+	private const double ScanBusyRate = 0.2; // Mbps
+
+	private readonly SpeedTester _tester = new();
+	private readonly SemaphoreSlim _measureSemaphore = new(1);
+	private CancellationTokenSource _measureCancellation;
+	private Guid _measureInterfaceId;
+	private readonly Dictionary<string, DateTime> _lastAttemptTimes = new(); // UTC
+	private readonly object _measureLock = new();
+	private long _resumeTicks; // UTC
+
+	public BooleanNotifier IsMeasuring { get; } = new();
+
+	public ReactiveCommand MeasureCommand { get; private set; }
+
+	private void InitiateMeasure()
+	{
+		MeasureCommand = IsMeasuring
+			.Inverse()
+			.ObserveOnUIDispatcher() // This is for thread access by ReactiveCommand.
+			.ToReactiveCommand();
+		MeasureCommand
+			.Subscribe(async _ => await MeasureConnectedAsync(SpeedTrigger.Manual))
+			.AddTo(this.Subscription);
+
+		var connectionChanged = Observable.FromEventPattern<ConnectionChangedEventArgs>(
+			h => _worker.ConnectionChanged += h,
+			h => _worker.ConnectionChanged -= h)
+			.Select(x => x.EventArgs)
+			.Where(x => x is not null);
+
+		connectionChanged
+			.Where(x => x.ChangedState == ConnectionChangedState.Completed)
+			.GroupBy(x => x.InterfaceId)
+			.SelectMany(x => x.Throttle(_afterConnectDelay))
+			.Subscribe(async x => await MeasureConnectedAsync(SpeedTrigger.AfterConnect, x.InterfaceId))
+			.AddTo(this.Subscription);
+
+		// A measurement is no longer of the network when the connection of the interface changes.
+		connectionChanged
+			.Where(x => x.ChangedState is ConnectionChangedState.Started
+				or ConnectionChangedState.Failed
+				or ConnectionChangedState.Disconnecting
+				or ConnectionChangedState.Disconnected)
+			.Subscribe(x => CancelMeasure(x.InterfaceId))
+			.AddTo(this.Subscription);
+
+		Observable.FromEventPattern<PowerModeChangedEventHandler, PowerModeChangedEventArgs>(
+			h => SystemEvents.PowerModeChanged += h,
+			h => SystemEvents.PowerModeChanged -= h)
+			.Where(x => x.EventArgs.Mode == PowerModes.Resume)
+			.Subscribe(_ => Interlocked.Exchange(ref _resumeTicks, DateTime.UtcNow.Ticks))
+			.AddTo(this.Subscription);
+	}
+
+	/// <summary>
+	/// Whether the system has resumed from sleep just now
+	/// </summary>
+	/// <remarks>Sample ticks and automatic measurements are held off for a while after resume.</remarks>
+	private bool IsResumed
+	{
+		get
+		{
+			var elapsedTicks = DateTime.UtcNow.Ticks - Interlocked.Read(ref _resumeTicks);
+			return (0L <= elapsedTicks) && (elapsedTicks < _resumeHoldoff.Ticks);
+		}
+	}
+
+	/// <summary>
+	/// Cancels the running measurement.
+	/// </summary>
+	/// <param name="interfaceId">Interface ID (any interface if null)</param>
+	private void CancelMeasure(Guid? interfaceId = null)
+	{
+		try
+		{
+			CancellationTokenSource cancellation;
+
+			lock (_measureLock)
+			{
+				if (interfaceId.HasValue && (interfaceId.Value != _measureInterfaceId))
+					return;
+
+				cancellation = _measureCancellation;
+			}
+
+			cancellation?.Cancel();
+		}
+		catch (ObjectDisposedException)
+		{
+			// The measurement has just ended.
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to cancel speed measurement." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Measures speed of connected network if conditions for the trigger are met.
+	/// </summary>
+	/// <param name="trigger">Trigger</param>
+	/// <param name="interfaceId">Interface ID (any interface if null)</param>
+	/// <returns>Speed sample if measured, null otherwise</returns>
+	/// <remarks>This method never throws an exception.</remarks>
+	private Task<SpeedSample> MeasureConnectedAsync(SpeedTrigger trigger, Guid? interfaceId = null)
+	{
+		return Task.Run(() => MeasureConnectedBaseAsync(trigger, interfaceId));
+	}
+
+	private async Task<SpeedSample> MeasureConnectedBaseAsync(SpeedTrigger trigger, Guid? interfaceId)
+	{
+		try
+		{
+			if (_disposed)
+				return null;
+
+			// Automatic measurements are for the networks between which this app can switch.
+			var isAutomatic = trigger is SpeedTrigger.AfterConnect or SpeedTrigger.Periodic;
+			if (isAutomatic && (!Settings.Current.MeasuresSpeed || IsResumed))
+				return null;
+
+			ProfileItem profile;
+			lock (_profilesLock)
+			{
+				profile = Profiles.FirstOrDefault(x => x.IsConnected && ((interfaceId is null) || (x.InterfaceId == interfaceId)));
+			}
+			if (profile is null)
+				return null;
+
+			var targetId = profile.InterfaceId;
+			var key = HistoryService.GetKey(profile.Name, targetId);
+			var now = DateTime.UtcNow;
+
+			if (isAutomatic)
+			{
+				if (!profile.IsAutoSwitchEnabled)
+					return null;
+
+				switch (trigger)
+				{
+					case SpeedTrigger.AfterConnect:
+						var summary = History.GetSummary(key);
+						if ((summary is not null) && (now - summary.LastTime < _afterConnectValidity))
+							return null;
+						break;
+
+					case SpeedTrigger.Periodic:
+						if (now - GetLastAttemptTime(key) < TimeSpan.FromMinutes(Settings.Current.SpeedTestInterval))
+							return null;
+						break;
+				}
+
+				if (History.GetBytesToday() >= Settings.Current.SpeedTestDailyBudget * 1_000_000L)
+					return null;
+			}
+
+			if (trigger is not SpeedTrigger.Manual)
+			{
+				if (IsWorking.Value || IsUpdating.Value)
+					return null;
+			}
+
+			if (isAutomatic)
+			{
+				// Traffic in progress would both distort the result and be disturbed by the measurement.
+				if (await LinkInspector.GetRateMbpsAsync(targetId, _busyWindow).ConfigureAwait(false) > BusyRate)
+					return null;
+			}
+
+			if (!_measureSemaphore.Wait(TimeSpan.Zero))
+				return null;
+
+			SpeedSample sample;
+			CancellationTokenSource cancellation = null;
+			try
+			{
+				IsMeasuring.TurnOn();
+				profile.IsMeasuring = true;
+
+				lock (_measureLock)
+				{
+					_lastAttemptTimes[key] = DateTime.UtcNow;
+
+					cancellation = new CancellationTokenSource();
+					_measureCancellation = cancellation;
+					_measureInterfaceId = targetId;
+				}
+				var token = cancellation.Token;
+
+				try
+				{
+					if (!LinkInspector.IsReady(targetId))
+						await LinkInspector.WaitForAddressAsync(targetId, _addressTimeout, token).ConfigureAwait(false);
+				}
+				catch (OperationCanceledException)
+				{
+					// The measurement will record this as aborted.
+				}
+
+				var linkRate = profile.LinkRate;
+
+				sample = new SpeedSample
+				{
+					Time = DateTime.UtcNow,
+					InterfaceId = targetId,
+					Profile = profile.Name,
+					Bssid = profile.Bssid ?? string.Empty,
+					Band = profile.Band,
+					Channel = profile.Channel,
+					Signal = profile.Signal,
+					LinkRate = (linkRate > 0) ? linkRate : null,
+					Trigger = trigger
+				};
+
+				await _tester.MeasureAsync(
+					sample,
+					(trigger is SpeedTrigger.Manual) ? SpeedTestSize.Full : SpeedTestSize.Quick,
+					token).ConfigureAwait(false);
+
+				// If the connection has changed during the measurement, the result is not of the network.
+				ProfileItem currentProfile;
+				lock (_profilesLock)
+				{
+					currentProfile = Profiles.FirstOrDefault(x => x.IsConnected && (x.InterfaceId == targetId));
+				}
+
+				if (!ReferenceEquals(currentProfile, profile))
+				{
+					sample.Result = SpeedResult.Aborted;
+				}
+				else
+				{
+					var currentBssid = currentProfile.Bssid;
+					if (!string.IsNullOrEmpty(currentBssid)
+						&& !string.IsNullOrEmpty(sample.Bssid)
+						&& !string.Equals(currentBssid, sample.Bssid, StringComparison.OrdinalIgnoreCase))
+					{
+						sample.Result = SpeedResult.Aborted;
+					}
+				}
+
+				History.AppendSpeed(sample);
+				ApplySummary(profile);
+			}
+			finally
+			{
+				profile.IsMeasuring = false;
+
+				lock (_measureLock)
+				{
+					_measureCancellation = null;
+				}
+				cancellation?.Dispose();
+
+				IsMeasuring.TurnOff();
+				_measureSemaphore.Release();
+			}
+
+			// Reload so that the profiles are evaluated with the new result.
+			if (!_disposed)
+				await LoadProfilesAsync().ConfigureAwait(false);
+
+			return sample;
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to measure speed of connected network." + Environment.NewLine
+				+ ex);
+			return null;
+		}
+	}
+
+	/// <summary>
+	/// Gets the last time (UTC) when measurement of a profile was attempted.
+	/// </summary>
+	/// <remarks>
+	/// The time is seeded from history so that measurement is not repeated at every start of
+	/// this app.
+	/// </remarks>
+	private DateTime GetLastAttemptTime(string key)
+	{
+		lock (_measureLock)
+		{
+			if (_lastAttemptTimes.TryGetValue(key, out DateTime time))
+				return time;
+		}
+
+		var samples = History.GetSpeedSamples(key);
+		var lastTime = (samples.Count > 0) ? samples.Max(x => x.Time) : default;
+
+		lock (_measureLock)
+		{
+			if (_lastAttemptTimes.TryGetValue(key, out DateTime time))
+				return time;
+
+			_lastAttemptTimes[key] = lastTime;
+			return lastTime;
+		}
+	}
+
+	/// <summary>
+	/// Applies summary of speed samples in history to a profile.
+	/// </summary>
+	/// <remarks>This method only reads samples in memory.</remarks>
+	private void ApplySummary(ProfileItem profile)
+	{
+		try
+		{
+			if (profile is null)
+				return;
+
+			var summary = History.GetSummary(HistoryService.GetKey(profile.Name, profile.InterfaceId));
+			if (summary is null)
+			{
+				profile.LastDownMbps = null;
+				profile.LastUpMbps = null;
+				profile.LastLatencyMs = null;
+				profile.LastMeasuredTime = default;
+				profile.LastSpeedResult = SpeedResult.None;
+				profile.TypicalDownMbps = null;
+				profile.SpeedSampleCount = 0;
+			}
+			else
+			{
+				profile.LastDownMbps = summary.LastDownMbps;
+				profile.LastUpMbps = summary.LastUpMbps;
+				profile.LastLatencyMs = summary.LastLatencyMs;
+				profile.LastMeasuredTime = summary.LastTime;
+				profile.LastSpeedResult = summary.LastResult;
+				profile.TypicalDownMbps = summary.HasData ? summary.DownMbps : null;
+				profile.SpeedSampleCount = summary.Count;
+			}
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to apply speed summary." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Measures speed of connected network of each interface if periodic measurement is due.
+	/// </summary>
+	private async Task MeasureIfDueAsync()
+	{
+		if (!Settings.Current.MeasuresSpeed)
+			return;
+
+		foreach (var interfaceId in GetConnectedInterfaceIds())
+			await MeasureConnectedAsync(SpeedTrigger.Periodic, interfaceId);
+	}
+
+	private Guid[] GetConnectedInterfaceIds()
+	{
+		lock (_profilesLock)
+		{
+			return Profiles
+				.Where(x => x.IsConnected)
+				.Select(x => x.InterfaceId)
+				.Distinct()
+				.ToArray();
+		}
+	}
+
+	/// <summary>
+	/// Determines whether traffic of any connected interface is above the rate at which a scan,
+	/// which takes the radio off the channel, should be avoided.
+	/// </summary>
+	private async Task<bool> IsLinkBusyForScanAsync()
+	{
+		var interfaceIds = GetConnectedInterfaceIds();
+		if (interfaceIds.Length == 0)
+			return false;
+
+		var rates = await Task.WhenAll(interfaceIds.Select(x => LinkInspector.GetRateMbpsAsync(x, _scanBusyWindow)));
+		return rates.Any(x => x > ScanBusyRate);
+	}
+
+	#endregion
+}
