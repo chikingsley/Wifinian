@@ -25,6 +25,8 @@ internal static class AppDataService
 	}
 	private static string _folderPath;
 
+	public static string HistoryFolderPath => Path.Combine(FolderPath, "history");
+
 	public static string EnsureFolderPath()
 	{
 		if (!Directory.Exists(FolderPath))
