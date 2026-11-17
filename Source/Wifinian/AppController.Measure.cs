@@ -33,11 +33,15 @@ internal partial class AppController
 	private static readonly TimeSpan _scanBusyWindow = TimeSpan.FromSeconds(1);
 	private const double ScanBusyRate = 0.2; // Mbps
 
+	private static readonly TimeSpan _idleWaitTimeout = TimeSpan.FromSeconds(10);
+	private static readonly TimeSpan _idleWaitInterval = TimeSpan.FromMilliseconds(500);
+
 	private readonly SpeedTester _tester = new();
 	private readonly SemaphoreSlim _measureSemaphore = new(1);
 	private CancellationTokenSource _measureCancellation;
 	private Guid _measureInterfaceId;
 	private readonly Dictionary<string, DateTime> _lastAttemptTimes = new(); // UTC
+	private readonly HashSet<Guid> _afterConnectPendings = new(); // Interface IDs
 	private readonly object _measureLock = new();
 	private long _resumeTicks; // UTC
 
@@ -74,7 +78,11 @@ internal partial class AppController
 				or ConnectionChangedState.Failed
 				or ConnectionChangedState.Disconnecting
 				or ConnectionChangedState.Disconnected)
-			.Subscribe(x => CancelMeasure(x.InterfaceId))
+			.Subscribe(x =>
+			{
+				SetAfterConnectPending(x.InterfaceId, false);
+				CancelMeasure(x.InterfaceId);
+			})
 			.AddTo(this.Subscription);
 
 		Observable.FromEventPattern<PowerModeChangedEventHandler, PowerModeChangedEventArgs>(
@@ -96,6 +104,51 @@ internal partial class AppController
 			var elapsedTicks = DateTime.UtcNow.Ticks - Interlocked.Read(ref _resumeTicks);
 			return (0L <= elapsedTicks) && (elapsedTicks < _resumeHoldoff.Ticks);
 		}
+	}
+
+	/// <summary>
+	/// Sets whether the measurement after connection of an interface is pending.
+	/// </summary>
+	/// <remarks>
+	/// The measurement after connection is triggered only once. If it is put off because of
+	/// temporary conditions, it is tried again at sample ticks until performed or no longer
+	/// necessary.
+	/// </remarks>
+	private void SetAfterConnectPending(Guid interfaceId, bool isPending)
+	{
+		lock (_measureLock)
+		{
+			if (isPending)
+				_afterConnectPendings.Add(interfaceId);
+			else
+				_afterConnectPendings.Remove(interfaceId);
+		}
+	}
+
+	private bool IsAfterConnectPending(Guid interfaceId)
+	{
+		lock (_measureLock)
+		{
+			return _afterConnectPendings.Contains(interfaceId);
+		}
+	}
+
+	/// <summary>
+	/// Waits for rescan and connection/disconnection in progress to end.
+	/// </summary>
+	/// <returns>True if none of them is in progress</returns>
+	private async Task<bool> WaitForIdleAsync()
+	{
+		var stopwatch = Stopwatch.StartNew();
+
+		while (IsWorking.Value || IsUpdating.Value)
+		{
+			if (_disposed || (stopwatch.Elapsed >= _idleWaitTimeout))
+				return false;
+
+			await Task.Delay(_idleWaitInterval).ConfigureAwait(false);
+		}
+		return !_disposed;
 	}
 
 	/// <summary>
@@ -150,8 +203,28 @@ internal partial class AppController
 
 			// Automatic measurements are for the networks between which this app can switch.
 			var isAutomatic = trigger is SpeedTrigger.AfterConnect or SpeedTrigger.Periodic;
-			if (isAutomatic && (!Settings.Current.MeasuresSpeed || IsResumed))
+
+			// The measurement after connection put off by temporary conditions is left pending.
+			var pendingId = (trigger is SpeedTrigger.AfterConnect) ? interfaceId : null;
+			if (pendingId.HasValue)
+				SetAfterConnectPending(pendingId.Value, false);
+
+			SpeedSample PutOff()
+			{
+				if (pendingId.HasValue && !_disposed)
+					SetAfterConnectPending(pendingId.Value, true);
+
 				return null;
+			}
+
+			if (isAutomatic)
+			{
+				if (!Settings.Current.MeasuresSpeed)
+					return null;
+
+				if (IsResumed)
+					return PutOff();
+			}
 
 			ProfileItem profile;
 			lock (_profilesLock)
@@ -190,19 +263,32 @@ internal partial class AppController
 
 			if (trigger is not SpeedTrigger.Manual)
 			{
+				// Rescan and reload of profiles are momentary and so are waited for.
 				if (IsWorking.Value || IsUpdating.Value)
-					return null;
+				{
+					if (!await WaitForIdleAsync().ConfigureAwait(false))
+						return PutOff();
+
+					// The connection may have changed in the meantime.
+					ProfileItem currentProfile;
+					lock (_profilesLock)
+					{
+						currentProfile = Profiles.FirstOrDefault(x => x.IsConnected && (x.InterfaceId == targetId));
+					}
+					if (!ReferenceEquals(currentProfile, profile))
+						return null;
+				}
 			}
 
 			if (isAutomatic)
 			{
 				// Traffic in progress would both distort the result and be disturbed by the measurement.
 				if (await LinkInspector.GetRateMbpsAsync(targetId, _busyWindow).ConfigureAwait(false) > BusyRate)
-					return null;
+					return PutOff();
 			}
 
 			if (!_measureSemaphore.Wait(TimeSpan.Zero))
-				return null;
+				return PutOff();
 
 			SpeedSample sample;
 			CancellationTokenSource cancellation = null;
@@ -375,13 +461,26 @@ internal partial class AppController
 	/// <summary>
 	/// Measures speed of connected network of each interface if periodic measurement is due.
 	/// </summary>
+	/// <remarks>
+	/// The measurement after connection which is pending takes precedence. It is not subject to
+	/// the interval of periodic measurement.
+	/// </remarks>
 	private async Task MeasureIfDueAsync()
 	{
 		if (!Settings.Current.MeasuresSpeed)
 			return;
 
 		foreach (var interfaceId in GetConnectedInterfaceIds())
+		{
+			if (IsAfterConnectPending(interfaceId))
+			{
+				var sample = await MeasureConnectedAsync(SpeedTrigger.AfterConnect, interfaceId);
+				if ((sample is not null) || IsAfterConnectPending(interfaceId))
+					continue;
+			}
+
 			await MeasureConnectedAsync(SpeedTrigger.Periodic, interfaceId);
+		}
 	}
 
 	private Guid[] GetConnectedInterfaceIds()

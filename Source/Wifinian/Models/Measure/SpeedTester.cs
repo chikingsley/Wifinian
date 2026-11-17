@@ -58,6 +58,16 @@ internal sealed class SpeedTester
 	/// </summary>
 	private const double RouteRatio = 0.8;
 
+	/// <summary>
+	/// Ratio of bytes sent by the interface to uploaded bytes below which the upload is regarded
+	/// as having gone through another interface
+	/// </summary>
+	/// <remarks>
+	/// This is lower than that of download because uploaded bytes are counted when written and
+	/// so include those which remained in the send buffers when the upload was stopped.
+	/// </remarks>
+	private const double UploadRouteRatio = 0.5;
+
 	private static (int capTime, long capBytes) GetDownloadCap(SpeedTestSize size) => size switch
 	{
 		SpeedTestSize.Full => (8000, 50_000_000L),
@@ -236,6 +246,7 @@ internal sealed class SpeedTester
 			// (6) Upload
 			var (uploadCapTime, uploadCapBytes) = GetUploadCap(size);
 			var uploadCounter = new Counter();
+			var oldSent = LinkInspector.GetBytes(networkInterface).sent;
 			try
 			{
 				var upMbps = await TransferAsync(
@@ -259,6 +270,19 @@ internal sealed class SpeedTester
 			finally
 			{
 				sample.UpBytes = uploadCounter.Value;
+			}
+
+			// The requests are not bound when the remote address is IPv6 and the interface has no
+			// global IPv6 address, or when binding failed. In such case, the upload may have gone
+			// through another interface.
+			if (sample.UpMbps.HasValue)
+			{
+				var sent = LinkInspector.GetBytes(networkInterface).sent - oldSent;
+				if (sent < UploadRouteRatio * sample.UpBytes)
+				{
+					Trace.WriteLine($"Upload of {sample.UpBytes} bytes was not sent through {networkInterface.Name}. It sent {sent} bytes.");
+					sample.UpMbps = null;
+				}
 			}
 
 			// (7) Result
