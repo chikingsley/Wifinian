@@ -1,0 +1,9 @@
+{
+  "solution": {
+    "path": "Wifinian.sln",
+    "projects": [
+      "Wifinian\\Wifinian.csproj",
+      "Wifinian.Test\\Wifinian.Test.csproj"
+    ]
+  }
+}
