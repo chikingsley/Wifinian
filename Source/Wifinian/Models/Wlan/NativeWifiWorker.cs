@@ -107,21 +107,114 @@ internal class NativeWifiWorker : IWlanWorker
 		if (!IsWorkable)
 			return Array.Empty<NativeWifiProfileItem>();
 
-		var profilePacks = await Task.Run(() => _player.EnumerateProfileRadios()).ConfigureAwait(false);
+		return await Task.Run(() =>
+		{
+			var profilePacks = _player.EnumerateProfileRadios().ToArray();
 
-		return profilePacks.Select(x => new NativeWifiProfileItem(
-			name: x.Name,
-			interfaceId: x.InterfaceInfo.Id,
-			interfaceDescription: x.InterfaceInfo.Description,
-			profileType: x.ProfileType,
-			document: x.Document,
-			position: x.Position,
-			isRadioOn: x.IsRadioOn,
-			isConnected: x.IsConnected,
-			protocol: x.PhyType.ToProtocolName(),
-			signal: ((x.SignalQuality is >= 0 and <= 100) ? x.SignalQuality : x.LinkQuality),
-			band: x.Band,
-			channel: x.Channel));
+			var items = profilePacks.Select(x => new NativeWifiProfileItem(
+				name: x.Name,
+				interfaceId: x.InterfaceInfo.Id,
+				interfaceDescription: x.InterfaceInfo.Description,
+				profileType: x.ProfileType,
+				document: x.Document,
+				position: x.Position,
+				isRadioOn: x.IsRadioOn,
+				isConnected: x.IsConnected,
+				protocol: x.PhyType.ToProtocolName(),
+				signal: ((x.SignalQuality is >= 0 and <= 100) ? x.SignalQuality : x.LinkQuality),
+				band: x.Band,
+				channel: x.Channel)).ToArray();
+
+			FillRadioDetails(items);
+
+			return items;
+		}).ConfigureAwait(false);
+	}
+
+	/// <summary>
+	/// Fills BSSID, RSSI and link rate of profiles as far as they are available.
+	/// </summary>
+	/// <remarks>
+	/// These values are supplementary. They may not be available (e.g. when access to location
+	/// information is not permitted) and so any failure must not prevent loading profiles.
+	/// </remarks>
+	private void FillRadioDetails(IReadOnlyCollection<NativeWifiProfileItem> items)
+	{
+		if (items.Count == 0)
+			return;
+
+		foreach (var item in items.Where(x => x.IsConnected))
+		{
+			try
+			{
+				var (result, info) = _player.GetCurrentConnection(item.InterfaceId);
+				if ((result == ActionResult.Success) && (info is not null) &&
+					string.Equals(info.ProfileName, item.Name, StringComparison.Ordinal))
+				{
+					item.Bssid = FormatBssid(info.Bssid);
+					item.LinkRate = info.RxRate / 1000;
+				}
+			}
+			catch (Exception ex)
+			{
+				Debug.WriteLine("Failed to get current connection." + Environment.NewLine
+					+ ex);
+			}
+
+			try
+			{
+				var (result, rssi) = _player.GetRssi(item.InterfaceId);
+				if (result == ActionResult.Success)
+					item.Rssi = rssi;
+			}
+			catch (Exception ex)
+			{
+				Debug.WriteLine("Failed to get RSSI." + Environment.NewLine
+					+ ex);
+			}
+		}
+
+		if (!items.Any(x => x is { IsConnected: false, Signal: > 0 }))
+			return;
+
+		try
+		{
+			var groups = _player.EnumerateAvailableNetworkGroups().ToArray();
+
+			foreach (var item in items.Where(x => x is { IsConnected: false, Signal: > 0 }))
+			{
+				var bssNetwork = groups
+					.Where(x => (x.InterfaceInfo.Id == item.InterfaceId)
+						&& string.Equals(x.ProfileName, item.Name, StringComparison.Ordinal))
+					.SelectMany(x => x.BssNetworks)
+					.OrderByDescending(x => x.LinkQuality)
+					.FirstOrDefault();
+				if (bssNetwork is null)
+					continue;
+
+				item.Bssid = FormatBssid(bssNetwork.Bssid);
+				item.Rssi = bssNetwork.Rssi;
+			}
+		}
+		catch (Exception ex)
+		{
+			Debug.WriteLine("Failed to enumerate available network groups." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Formats BSSID in colon-delimited hexadecimal string (e.g. 00:1A:2B:3C:4D:5E).
+	/// </summary>
+	/// <param name="id">BSSID</param>
+	/// <returns>Formatted string if successfully formatted, null otherwise</returns>
+	internal static string FormatBssid(NetworkIdentifier id)
+	{
+		var bytes = id?.ToBytes();
+		if (bytes is not { Length: > 0 })
+			return null;
+
+		return BitConverter.ToString(bytes).Replace('-', ':');
 	}
 
 	#endregion

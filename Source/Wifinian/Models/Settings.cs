@@ -74,6 +74,42 @@ public class Settings : DisposableBase
 	}
 	private Size _mainWindowSize;
 
+	/// <summary>
+	/// Whether to record history of signal
+	/// </summary>
+	public bool RecordsHistory
+	{
+		get => _recordsHistory;
+		set => SetProperty(ref _recordsHistory, value);
+	}
+	private bool _recordsHistory = true; // Default
+
+	private const int MinSampleInterval = 30;
+	private const int MaxSampleInterval = 300;
+
+	/// <summary>
+	/// Interval (sec) of sampling
+	/// </summary>
+	public int SampleInterval
+	{
+		get => _sampleInterval;
+		set => SetProperty(ref _sampleInterval, value, MinSampleInterval, MaxSampleInterval);
+	}
+	private int _sampleInterval = 60; // Default
+
+	private const int MinRetentionDays = 7;
+	private const int MaxRetentionDays = 365;
+
+	/// <summary>
+	/// Days to retain history
+	/// </summary>
+	public int HistoryRetentionDays
+	{
+		get => _historyRetentionDays;
+		set => SetProperty(ref _historyRetentionDays, value, MinRetentionDays, MaxRetentionDays);
+	}
+	private int _historyRetentionDays = 90; // Default
+
 	#endregion
 
 	internal void Initiate()

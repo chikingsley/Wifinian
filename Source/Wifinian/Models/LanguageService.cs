@@ -34,6 +34,7 @@ internal static class LanguageService
 	// Menu
 	public static string StartSignIn => GetContentValue();
 	public static string ShowAvailable => GetContentValue();
+	public static string RecordHistory => GetContentValue();
 	public static string Close => GetContentValue();
 
 	// Message

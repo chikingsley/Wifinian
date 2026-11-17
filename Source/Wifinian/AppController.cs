@@ -18,12 +18,13 @@ using ScreenFrame;
 using StartupAgency;
 using Wifinian.Common;
 using Wifinian.Models;
+using Wifinian.Models.History;
 using Wifinian.Models.Wlan;
 using Wifinian.Views;
 
 namespace Wifinian;
 
-internal class AppController : DisposableBase
+internal partial class AppController : DisposableBase
 {
 	private readonly Application _current = Application.Current;
 
@@ -39,6 +40,8 @@ internal class AppController : DisposableBase
 	private readonly IWlanWorker _worker;
 	public bool IsWorkable => _worker.IsWorkable;
 
+	internal HistoryService History { get; }
+
 	public BooleanNotifier IsUpdating { get; }
 	public BooleanNotifier IsWorking { get; }
 
@@ -46,6 +49,7 @@ internal class AppController : DisposableBase
 	public ReactiveProperty<bool> EngagesPriority { get; }
 
 	private ReactiveTimer RescanTimer { get; }
+	private ReactiveTimer SampleTimer { get; }
 
 	public ReactiveCommand RescanCommand { get; }
 	public ReactiveCommand CloseCommand { get; }
@@ -69,6 +73,7 @@ internal class AppController : DisposableBase
 		WindowPainter = new WindowPainter();
 
 		this._worker = worker;
+		History = new HistoryService(AppDataService.HistoryFolderPath);
 
 		IsUpdating = new BooleanNotifier();
 		IsWorking = new BooleanNotifier();
@@ -115,6 +120,20 @@ internal class AppController : DisposableBase
 
 				SetNotifyIconText();
 			})
+			.AddTo(this.Subscription);
+
+		SampleTimer = new ReactiveTimer(TimeSpan.FromSeconds(Settings.Current.SampleInterval))
+			.AddTo(this.Subscription);
+		SampleTimer
+			.Subscribe(async _ => await OnSampleTickAsync())
+			.AddTo(this.Subscription);
+
+		// The settings are loaded after this constructor and then these sequences emit the loaded
+		// values so that the timer follows them.
+		Observable.Merge(
+			Settings.Current.ObserveProperty(x => x.SampleInterval).Select(_ => Unit.Default),
+			Settings.Current.ObserveProperty(x => x.RecordsHistory).Select(_ => Unit.Default))
+			.Subscribe(_ => UpdateSampleTimer())
 			.AddTo(this.Subscription);
 
 		var networkRefreshed = Observable.FromEventPattern(
@@ -168,6 +187,8 @@ internal class AppController : DisposableBase
 
 		Settings.Current.Initiate();
 
+		_ = PurgeHistoryAsync();
+
 		NotifyIconContainer.ShowIcon(WindowPainter.GetIconPath(), ProductInfo.Title);
 		WindowPainter.ThemeChanged += (_, _) =>
 		{
@@ -211,6 +232,7 @@ internal class AppController : DisposableBase
 			_worker?.Dispose();
 			NotifyIconContainer.Dispose();
 			WindowPainter.Dispose();
+			History?.Dispose();
 			Settings.Current.Dispose();
 		}
 
@@ -326,6 +348,8 @@ internal class AppController : DisposableBase
 				});
 		}
 
+		RecordSignals();
+
 		Debug.WriteLine(Profiles.Any()
 			? Profiles
 				.Select(x => $"Profile {x.Name} -> AutoConnect: {x.IsAutoConnectEnabled}, AutoSwitch: {x.IsAutoSwitchEnabled}, Position: {x.Position}, IsRadioOn: {x.IsRadioOn}, Signal: {x.Signal}, IsConnected {x.IsConnected}")
@@ -397,8 +421,173 @@ internal class AppController : DisposableBase
 	{
 		var targetProfile = Profiles.FirstOrDefault(x => x.IsConnected && (args.InterfaceId == x.InterfaceId));
 		if (targetProfile is not null)
+		{
 			targetProfile.Signal = args.SignalQuality;
+
+			RecordSignals(targetProfile);
+		}
 	}
+
+	#region Sample
+
+	private const int SampleScanCycle = 5; // Number of sample ticks per scan
+
+	private int _sampleTickCount = 0;
+	private DateTime _lastPurgeDate; // UTC
+	private readonly object _sampleLock = new();
+
+	/// <summary>
+	/// Whether the sample timer is required to run
+	/// </summary>
+	/// <remarks>If this is false, no periodic work other than that of the original is done.</remarks>
+	private bool RequiresSampleTimer => Settings.Current.RecordsHistory;
+
+	private void UpdateSampleTimer()
+	{
+		try
+		{
+			lock (_sampleLock)
+			{
+				if (_disposed)
+					return;
+
+				if (RequiresSampleTimer)
+				{
+					var interval = TimeSpan.FromSeconds(Settings.Current.SampleInterval);
+
+					// The interval is applied only when the timer is started.
+					if (SampleTimer.IsEnabled && (SampleTimer.Interval == interval))
+						return;
+
+					SampleTimer.Interval = interval;
+					SampleTimer.Start(interval); // Wait for due time.
+				}
+				else
+				{
+					SampleTimer.Stop();
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to update the sample timer." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	private async Task OnSampleTickAsync()
+	{
+		try
+		{
+			var count = Interlocked.Increment(ref _sampleTickCount);
+
+			await PurgeHistoryAsync();
+
+			// Scan periodically so that signal qualities of networks other than connected one are
+			// refreshed. When rescan is rushed, the scan is already repeated.
+			if ((count % SampleScanCycle == 0) && !RushesRescan.Value)
+				await ScanNetworkAsync();
+			else
+				await LoadProfilesAsync();
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to handle a sample tick." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Purges old history files once a day.
+	/// </summary>
+	private async Task PurgeHistoryAsync()
+	{
+		try
+		{
+			var today = DateTime.UtcNow.Date;
+
+			lock (_sampleLock)
+			{
+				if (_lastPurgeDate == today)
+					return;
+
+				_lastPurgeDate = today;
+			}
+
+			var retentionDays = Settings.Current.HistoryRetentionDays;
+
+			await Task.Run(() => History.Purge(retentionDays));
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to purge history." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Records signals of profiles in range.
+	/// </summary>
+	/// <param name="targetProfile">Profile to be recorded (all profiles if null)</param>
+	private void RecordSignals(ProfileItem targetProfile = null)
+	{
+		if (!Settings.Current.RecordsHistory)
+			return;
+
+		try
+		{
+			ProfileItem[] profiles;
+			if (targetProfile is not null)
+			{
+				profiles = [targetProfile];
+			}
+			else
+			{
+				lock (_profilesLock)
+				{
+					profiles = Profiles.ToArray();
+				}
+			}
+
+			var now = DateTime.UtcNow;
+
+			var samples = profiles
+				.Where(x => x.Signal > 0)
+				.Select(x =>
+				{
+					var isConnected = x.IsConnected;
+					var rssi = x.Rssi;
+					var linkRate = x.LinkRate;
+
+					return new SignalSample
+					{
+						Time = now,
+						InterfaceId = x.InterfaceId,
+						Profile = x.Name,
+						Connected = isConnected,
+						Signal = x.Signal,
+						Rssi = (rssi == 0) ? null : rssi,
+						Band = x.Band,
+						Channel = x.Channel,
+						Protocol = x.Protocol,
+						Bssid = x.Bssid,
+						LinkRate = (isConnected && (linkRate > 0)) ? linkRate : null
+					};
+				})
+				.ToArray();
+			if (samples.Length == 0)
+				return;
+
+			History.AppendSignals(samples);
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to record signals." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	#endregion
 
 	[Conditional("DEBUG")]
 	private void ShowUpdatingTime()
@@ -465,11 +654,21 @@ internal class AppController : DisposableBase
 			.All(x => !string.Equals(profileName, x.Name, StringComparison.Ordinal));
 	}
 
-	public Task<bool> RenameProfileAsync(ProfileItem targetProfile, string profileName)
+	public async Task<bool> RenameProfileAsync(ProfileItem targetProfile, string profileName)
 	{
 		Debug.WriteLine("Rename start!");
 
-		return WorkAsync(targetProfile, x => _worker.RenameProfileAsync(x, profileName));
+		var oldName = targetProfile.Name;
+		var interfaceId = targetProfile.InterfaceId;
+
+		var result = await WorkAsync(targetProfile, x => _worker.RenameProfileAsync(x, profileName));
+		if (result)
+		{
+			History.Rename(
+				HistoryService.GetKey(oldName, interfaceId),
+				HistoryService.GetKey(profileName, interfaceId));
+		}
+		return result;
 	}
 
 	public Task<bool> DeleteProfileAsync()

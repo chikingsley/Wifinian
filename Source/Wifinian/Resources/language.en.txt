@@ -16,6 +16,7 @@ ProjectSite=https://github.com/emoacht/Wifinian/blob/master/README.md
 [Menu]
 StartSignIn=Start on sign in
 ShowAvailable=Show available networks only
+RecordHistory=Record history
 Close=Close
 
 [Message]

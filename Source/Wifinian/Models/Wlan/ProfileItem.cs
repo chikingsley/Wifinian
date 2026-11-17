@@ -155,6 +155,36 @@ public class ProfileItem : BindableBase
 	private int _channel;
 
 	/// <summary>
+	/// BSSID of associated wireless LAN (null if unknown)
+	/// </summary>
+	public string Bssid
+	{
+		get => _bssid;
+		set => SetProperty(ref _bssid, value);
+	}
+	private string _bssid;
+
+	/// <summary>
+	/// RSSI (dBm) of associated wireless LAN (0 if unknown)
+	/// </summary>
+	public int Rssi
+	{
+		get => _rssi;
+		set => SetProperty(ref _rssi, value);
+	}
+	private int _rssi;
+
+	/// <summary>
+	/// Link rate (Mbps) of connected wireless LAN (0 if unknown)
+	/// </summary>
+	public int LinkRate
+	{
+		get => _linkRate;
+		set => SetProperty(ref _linkRate, value);
+	}
+	private int _linkRate;
+
+	/// <summary>
 	/// Whether this profile is set to be target
 	/// </summary>
 	public bool IsTarget { get; set; }
@@ -228,5 +258,8 @@ public class ProfileItem : BindableBase
 		this.Signal = other.Signal;
 		this.Band = other.Band;
 		this.Channel = other.Channel;
+		this.Bssid = other.Bssid;
+		this.Rssi = other.Rssi;
+		this.LinkRate = other.LinkRate;
 	}
 }
