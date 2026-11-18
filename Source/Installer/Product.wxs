@@ -3,7 +3,7 @@
   <!-- This fork is installed for the current user only, without elevation, so that the application
        can install its own updates. It has its own UpgradeCode because a per-user package cannot
        upgrade the per-machine package of the original. -->
-  <Package Name="Wifinian" Manufacturer="chikingsley (fork of emoacht)" Version="3.9.0"
+  <Package Name="Wifinian" Manufacturer="chikingsley (fork of emoacht)" Version="3.9.1"
            Language="1033" Codepage="1252" Scope="perUser"
            UpgradeCode="{B3236D41-48D3-4642-9EBC-18E30BB7F56B}">
     <SummaryInformation Description="Installer for Wifinian"/>
