@@ -30,9 +30,10 @@ internal partial class AppController
 	/// </summary>
 	/// <remarks>
 	/// After this time the closing thread asks for that network by itself. Closing must not take
-	/// long: Windows ends a process which does not finish within several seconds at sign-out.
+	/// long: Windows may end a process which does not answer within about 5 seconds at sign-out.
+	/// This time and the grace after it are 4 seconds together so as to stay below that.
 	/// </remarks>
-	private static readonly TimeSpan _probeCloseTimeout = TimeSpan.FromSeconds(3);
+	private static readonly TimeSpan _probeCloseTimeout = TimeSpan.FromSeconds(2);
 
 	/// <summary>
 	/// Time given, when this app is closed, to the connection asked for to complete so that
@@ -41,7 +42,7 @@ internal partial class AppController
 	/// <remarks>
 	/// The request itself is carried out by Windows and so goes on after this app has ended.
 	/// </remarks>
-	private static readonly TimeSpan _probeCloseGrace = TimeSpan.FromSeconds(3);
+	private static readonly TimeSpan _probeCloseGrace = TimeSpan.FromSeconds(2);
 
 	private static readonly TimeSpan _probeCloseLoadTimeout = TimeSpan.FromSeconds(2);
 	private static readonly TimeSpan _probeMeasureWait = TimeSpan.FromSeconds(10);
@@ -297,8 +298,8 @@ internal partial class AppController
 							? $"Test ended by closing this app, returning to {pending.Original.Name} (asked for, not confirmed)"
 							: $"Test ended by closing this app, the connection was changed meanwhile and is left as it is";
 
-				AppendProbeEvent(pending.InterfaceId, pending.Kind, null, pending.Original?.Name, reason);
 				Logger.RecordOperation(reason + ".");
+				AppendProbeEvent(pending.InterfaceId, pending.Kind, null, pending.Original?.Name, reason);
 			}
 
 			Trace.WriteLine("The test of networks did not end in time on closing.");
@@ -308,6 +309,24 @@ internal partial class AppController
 			Trace.WriteLine("Failed to end the test of networks on closing." + Environment.NewLine
 				+ ex);
 		}
+	}
+
+	/// <summary>
+	/// Gets where the interface was left by a test of networks which never connected to another
+	/// network than the original one.
+	/// </summary>
+	/// <param name="hasOriginal">Whether a network was connected before the test</param>
+	/// <param name="isInterrupted">Whether the user connected or disconnected during the test</param>
+	/// <remarks>
+	/// The test did not change the connection but the user may have: the interface is then no
+	/// longer on the original network and so is not said to be.
+	/// </remarks>
+	internal static ProbeReturn GetUnchangedReturn(bool hasOriginal, bool isInterrupted)
+	{
+		if (!hasOriginal)
+			return ProbeReturn.NotConnectedBefore;
+
+		return isInterrupted ? ProbeReturn.LeftToUser : ProbeReturn.Unchanged;
 	}
 
 	/// <summary>
@@ -648,9 +667,10 @@ internal partial class AppController
 		}
 		finally
 		{
+			// Closing this app also interrupts the test but is not the user taking over the connection.
 			var result = isChanged
 				? await RestoreAsync(original).ConfigureAwait(false)
-				: (original is null) ? ProbeReturn.NotConnectedBefore : ProbeReturn.Unchanged;
+				: GetUnchangedReturn(original is not null, _isProbeInterrupted && !_isClosing);
 
 			Volatile.Write(ref _probeRestore, null);
 
@@ -925,8 +945,8 @@ internal partial class AppController
 			if (DateTime.UtcNow - GetLastIdleProbeTime() < TimeSpan.FromHours(Settings.Current.ProbeInterval))
 				return;
 
-			// This test is automatic and so is subject to the daily budget if the user set one.
-			if (Settings.IsBudgetUsedUp(Settings.Current.SpeedTestDailyBudget, History.GetBytesToday()))
+			// This test is automatic and so is subject to the daily limit if the user set one.
+			if (IsDailyLimitReached())
 				return;
 
 			var signalThreshold = Settings.Current.SpeedSignalThreshold + SwitchPolicy.EntryMargin;

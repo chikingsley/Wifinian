@@ -253,7 +253,7 @@ internal partial class AppController
 					return PutOff();
 			}
 
-			// The measurements for switching by speed are neither subject to the daily budget
+			// The measurements for switching by speed are neither subject to the daily limit
 			// nor put off by traffic in progress.
 			if ((trigger is SpeedTrigger.Verify or SpeedTrigger.PostSwitch) && !isRecheck)
 			{
@@ -296,8 +296,8 @@ internal partial class AppController
 						break;
 				}
 
-				// There is no daily budget unless the user set one.
-				if (Settings.IsBudgetUsedUp(Settings.Current.SpeedTestDailyBudget, History.GetBytesToday()))
+				// There is no daily limit unless the user set one.
+				if (IsDailyLimitReached())
 					return null;
 			}
 
@@ -550,6 +550,47 @@ internal partial class AppController
 				+ ex);
 		}
 	}
+
+	private DateTime _limitNoticeDate; // UTC
+
+	/// <summary>
+	/// Determines whether automatic speed measurements are stopped for the day by the daily
+	/// limit set by the user and, once a day, records that they are.
+	/// </summary>
+	private bool IsDailyLimitReached()
+	{
+		var limit = Settings.Current.SpeedTestDailyLimit;
+		if (limit <= 0)
+			return false;
+
+		var bytes = History.GetBytesToday();
+		if (!Settings.IsDailyLimitReached(limit, bytes))
+			return false;
+
+		try
+		{
+			var today = DateTime.UtcNow.Date;
+			bool isNoticed;
+			lock (_limitLock)
+			{
+				isNoticed = (_limitNoticeDate == today);
+				_limitNoticeDate = today;
+			}
+			if (!isNoticed)
+				Logger.RecordOperation(GetDailyLimitText(limit, bytes));
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to record that the daily limit is reached." + Environment.NewLine
+				+ ex);
+		}
+		return true;
+	}
+
+	private readonly object _limitLock = new();
+
+	internal static string GetDailyLimitText(int limit, long bytes) =>
+		$"Automatic speed tests are stopped until the end of the day (UTC): {bytes / 1_000_000L} MB used today and SpeedTestDailyLimit in settings.xml is {limit} MB (0 for no limit).";
 
 	/// <summary>
 	/// Gets the line of the operation log for a measurement.

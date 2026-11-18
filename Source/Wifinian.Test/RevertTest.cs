@@ -247,6 +247,40 @@ public class RevertTest
 
 		Assert.AreEqual("Test ended by closing this app after 0 of 1 network, still on EXT",
 			Get(1, null, null, "EXT", AppController.ProbeEnd.Closing, AppController.ProbeReturn.Unchanged));
+
+		// The user connected to another network before the test left the original one: the test
+		// did not change the connection but the interface is no longer on that network.
+		Assert.AreEqual(AppController.ProbeReturn.LeftToUser, AppController.GetUnchangedReturn(true, true));
+		Assert.AreEqual(AppController.ProbeReturn.Unchanged, AppController.GetUnchangedReturn(true, false));
+		Assert.AreEqual(AppController.ProbeReturn.NotConnectedBefore, AppController.GetUnchangedReturn(false, true));
+		Assert.AreEqual(AppController.ProbeReturn.NotConnectedBefore, AppController.GetUnchangedReturn(false, false));
+
+		Assert.AreEqual("Test interrupted after 0 of 3 networks, the connection was changed meanwhile and is left as it is",
+			Get(3, none, none, "EXT", AppController.ProbeEnd.Interrupted, AppController.GetUnchangedReturn(true, true)));
+	}
+
+	[TestMethod]
+	public void TestPendingTicket()
+	{
+		var tickets = new AppController.PendingTicket();
+		var first = Guid.NewGuid();
+		var second = Guid.NewGuid();
+
+		Assert.IsFalse(tickets.IsLatest(first, 0));
+
+		// The measurement which could not run schedules the next one (A) and then the measurement
+		// which found the network slow schedules another (B): only B is run.
+		var a = tickets.Take(first);
+		Assert.IsTrue(tickets.IsLatest(first, a));
+
+		var b = tickets.Take(first);
+		Assert.IsFalse(tickets.IsLatest(first, a));
+		Assert.IsTrue(tickets.IsLatest(first, b));
+
+		// Another interface is not affected.
+		var c = tickets.Take(second);
+		Assert.IsTrue(tickets.IsLatest(first, b));
+		Assert.IsTrue(tickets.IsLatest(second, c));
 	}
 
 	#endregion

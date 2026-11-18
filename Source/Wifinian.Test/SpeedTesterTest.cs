@@ -148,19 +148,46 @@ public class SpeedTesterTest
 	}
 
 	[TestMethod]
-	public void TestNoDailyBudgetByDefault()
+	public void TestNoDailyLimitByDefault()
 	{
-		Assert.AreEqual(0, Settings.DefaultSpeedTestDailyBudget);
+		Assert.AreEqual(0, Settings.DefaultSpeedTestDailyLimit);
 
-		// Nothing is ever blocked without a budget.
-		Assert.IsFalse(Settings.IsBudgetUsedUp(0, 0L));
-		Assert.IsFalse(Settings.IsBudgetUsedUp(0, long.MaxValue));
-		Assert.IsFalse(Settings.IsBudgetUsedUp(-1, long.MaxValue));
+		// Nothing is ever blocked without a limit.
+		Assert.IsFalse(Settings.IsDailyLimitReached(0, 0L));
+		Assert.IsFalse(Settings.IsDailyLimitReached(0, long.MaxValue));
+		Assert.IsFalse(Settings.IsDailyLimitReached(-1, long.MaxValue));
 
-		// A budget set by the user still limits.
-		Assert.IsFalse(Settings.IsBudgetUsedUp(1000, 999_999_999L));
-		Assert.IsTrue(Settings.IsBudgetUsedUp(1000, 1_000_000_000L));
-		Assert.IsTrue(Settings.IsBudgetUsedUp(50, 60_000_000L));
+		// A limit set by the user limits.
+		Assert.IsFalse(Settings.IsDailyLimitReached(1000, 999_999_999L));
+		Assert.IsTrue(Settings.IsDailyLimitReached(1000, 1_000_000_000L));
+		Assert.IsTrue(Settings.IsDailyLimitReached(50, 60_000_000L));
+
+		Assert.AreEqual(
+			"Automatic speed tests are stopped until the end of the day (UTC): 1234 MB used today and SpeedTestDailyLimit in settings.xml is 1000 MB (0 for no limit).",
+			AppController.GetDailyLimitText(1000, 1_234_567_890L));
+	}
+
+	[TestMethod]
+	public void TestOldDailyBudgetIsNotLoaded()
+	{
+		// A settings file saved by an earlier build has the default of that build, which the user
+		// never chose. It is read as the settings file is (AppDataService.Load).
+		const string xml = "<?xml version=\"1.0\"?><Settings>"
+			+ "<SpeedTestInterval>30</SpeedTestInterval>"
+			+ "<SpeedTestDailyBudget>1000</SpeedTestDailyBudget>"
+			+ "</Settings>";
+
+		using var reader = new System.IO.StringReader(xml);
+		var loaded = (Settings)new System.Xml.Serialization.XmlSerializer(typeof(Settings)).Deserialize(reader);
+
+		Assert.AreEqual(30, loaded.SpeedTestInterval);
+		Assert.AreEqual(0, loaded.SpeedTestDailyLimit);
+
+		// The limit under the current name is loaded.
+		using var newReader = new System.IO.StringReader(xml.Replace("SpeedTestDailyBudget", "SpeedTestDailyLimit"));
+		var newLoaded = (Settings)new System.Xml.Serialization.XmlSerializer(typeof(Settings)).Deserialize(newReader);
+
+		Assert.AreEqual(1000, newLoaded.SpeedTestDailyLimit);
 	}
 
 	#endregion
@@ -380,7 +407,7 @@ public class SpeedTesterTest
 
 		var measuresSpeed = settings.MeasuresSpeed;
 		var speedTestInterval = settings.SpeedTestInterval;
-		var speedTestDailyBudget = settings.SpeedTestDailyBudget;
+		var speedTestDailyLimit = settings.SpeedTestDailyLimit;
 		var scanInterval = settings.ScanInterval;
 		var speedTestDownloadUrl = settings.SpeedTestDownloadUrl;
 		var speedTestUploadUrl = settings.SpeedTestUploadUrl;
@@ -389,7 +416,7 @@ public class SpeedTesterTest
 		{
 			Assert.IsTrue(measuresSpeed);
 			Assert.AreEqual(60, speedTestInterval);
-			Assert.AreEqual(0, speedTestDailyBudget); // No limit
+			Assert.AreEqual(0, speedTestDailyLimit); // No limit
 			Assert.AreEqual(5, scanInterval);
 			Assert.AreEqual("https://speed.cloudflare.com/__down?bytes=25000000", speedTestDownloadUrl);
 			Assert.AreEqual("https://speed.cloudflare.com/__up", speedTestUploadUrl);
@@ -400,15 +427,14 @@ public class SpeedTesterTest
 			settings.SpeedTestInterval = 1000;
 			Assert.AreEqual(240, settings.SpeedTestInterval);
 
-			// The values saved by earlier builds are kept as they are.
-			settings.SpeedTestDailyBudget = 1000;
-			Assert.AreEqual(1000, settings.SpeedTestDailyBudget);
-			settings.SpeedTestDailyBudget = 500;
-			Assert.AreEqual(500, settings.SpeedTestDailyBudget);
-			settings.SpeedTestDailyBudget = -5;
-			Assert.AreEqual(0, settings.SpeedTestDailyBudget);
-			settings.SpeedTestDailyBudget = int.MaxValue;
-			Assert.AreEqual(100000, settings.SpeedTestDailyBudget);
+			settings.SpeedTestDailyLimit = 1000;
+			Assert.AreEqual(1000, settings.SpeedTestDailyLimit);
+			settings.SpeedTestDailyLimit = 500;
+			Assert.AreEqual(500, settings.SpeedTestDailyLimit);
+			settings.SpeedTestDailyLimit = -5;
+			Assert.AreEqual(0, settings.SpeedTestDailyLimit);
+			settings.SpeedTestDailyLimit = int.MaxValue;
+			Assert.AreEqual(100000, settings.SpeedTestDailyLimit);
 
 			settings.ScanInterval = -1;
 			Assert.AreEqual(0, settings.ScanInterval);
@@ -432,7 +458,7 @@ public class SpeedTesterTest
 		{
 			settings.MeasuresSpeed = measuresSpeed;
 			settings.SpeedTestInterval = speedTestInterval;
-			settings.SpeedTestDailyBudget = speedTestDailyBudget;
+			settings.SpeedTestDailyLimit = speedTestDailyLimit;
 			settings.ScanInterval = scanInterval;
 			settings.SpeedTestDownloadUrl = speedTestDownloadUrl;
 			settings.SpeedTestUploadUrl = speedTestUploadUrl;

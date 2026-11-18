@@ -146,33 +146,35 @@ public class Settings : DisposableBase
 	}
 	private int _speedTestInterval = 60; // Default
 
-	private const int MinSpeedTestDailyBudget = 0;
-	private const int MaxSpeedTestDailyBudget = 100000;
+	private const int MinSpeedTestDailyLimit = 0;
+	private const int MaxSpeedTestDailyLimit = 100000;
 
 	/// <summary>
-	/// Daily budget (MB) of data used by automatic speed measurements (0 for no limit)
+	/// Daily limit (MB) of data used by automatic speed measurements (0 for no limit)
 	/// </summary>
 	/// <remarks>
 	/// There is no limit by default. A positive value, which a user on a metered connection may
-	/// set, stops automatic measurements for the day (UTC) once that much has been used. A value
-	/// saved by an earlier build (1000 or 500) is loaded as it is and so still limits.
+	/// set, stops automatic measurements for the day (UTC) once that much has been used.
+	/// Earlier builds had this setting under the name SpeedTestDailyBudget with a default of
+	/// 1000 or 500 and wrote that default to the settings file although the user never chose it.
+	/// The name was changed so that such a leftover value is not loaded and no longer limits.
 	/// </remarks>
-	public int SpeedTestDailyBudget
+	public int SpeedTestDailyLimit
 	{
-		get => _speedTestDailyBudget;
-		set => SetProperty(ref _speedTestDailyBudget, value, MinSpeedTestDailyBudget, MaxSpeedTestDailyBudget);
+		get => _speedTestDailyLimit;
+		set => SetProperty(ref _speedTestDailyLimit, value, MinSpeedTestDailyLimit, MaxSpeedTestDailyLimit);
 	}
-	private int _speedTestDailyBudget = DefaultSpeedTestDailyBudget;
+	private int _speedTestDailyLimit = DefaultSpeedTestDailyLimit;
 
-	internal const int DefaultSpeedTestDailyBudget = 0;
+	internal const int DefaultSpeedTestDailyLimit = 0;
 
 	/// <summary>
-	/// Determines whether automatic speed measurements are stopped for the day by the daily budget.
+	/// Determines whether automatic speed measurements are stopped for the day by the daily limit.
 	/// </summary>
-	/// <param name="budget">Daily budget (MB), 0 or less for no limit</param>
+	/// <param name="limit">Daily limit (MB), 0 or less for no limit</param>
 	/// <param name="bytesToday">Bytes used by speed measurements today</param>
-	internal static bool IsBudgetUsedUp(int budget, long bytesToday) =>
-		(budget > 0) && (bytesToday >= budget * 1_000_000L);
+	internal static bool IsDailyLimitReached(int limit, long bytesToday) =>
+		(limit > 0) && (bytesToday >= limit * 1_000_000L);
 
 	internal const string DefaultSpeedTestDownloadUrl = "https://speed.cloudflare.com/__down?bytes=25000000";
 	internal const string DefaultSpeedTestUploadUrl = "https://speed.cloudflare.com/__up";

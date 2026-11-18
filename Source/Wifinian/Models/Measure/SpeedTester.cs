@@ -103,6 +103,22 @@ internal sealed class SpeedTester
 	internal const int RetryDelay = 3000;
 
 	/// <summary>
+	/// Time (ms) before the end of the content of a download at which the next request is made
+	/// on a new connection, so that the connection is ready when the content ends
+	/// </summary>
+	internal const int DownloadPrefetchLead = 1500;
+
+	/// <summary>
+	/// Time (ms) a connection of a download waits after a failed request before it requests again
+	/// </summary>
+	internal const int DownloadRetryDelay = 300;
+
+	/// <summary>
+	/// Number of failed requests in a row after which a connection of a download gives up
+	/// </summary>
+	internal const int DownloadMaxFailures = 3;
+
+	/// <summary>
 	/// Maximum length of the detail of a measurement
 	/// </summary>
 	internal const int MaxDetailLength = 300;
@@ -577,6 +593,7 @@ internal sealed class SpeedTester
 	/// <param name="getAdapterBytes">Function to get the counter of the network interface</param>
 	/// <param name="token">Cancellation token</param>
 	/// <param name="minWindow">Minimum time (ms) over which the rate must be measured unless the cap of bytes is reached</param>
+	/// <param name="clock">Clock to be started at the first byte so that the transfers know the time left</param>
 	/// <returns>Rate (Mbps) if any byte is transferred, null otherwise</returns>
 	private static async Task<double?> TransferAsync(
 		Func<CancellationToken, Task> work,
@@ -587,7 +604,8 @@ internal sealed class SpeedTester
 		long capBytes,
 		Func<long> getAdapterBytes,
 		CancellationToken token,
-		int minWindow = 0)
+		int minWindow = 0,
+		TransferClock clock = null)
 	{
 		using var stop = CancellationTokenSource.CreateLinkedTokenSource(token);
 		var stopToken = stop.Token;
@@ -608,6 +626,7 @@ internal sealed class SpeedTester
 			}
 
 			var stopwatch = Stopwatch.StartNew();
+			clock?.Start(capTime);
 			var points = new List<RatePoint> { new(0L, counter.Value, getAdapterBytes.Invoke()) };
 			bool isCapBytesReached = false;
 
@@ -750,6 +769,85 @@ internal sealed class SpeedTester
 	}
 
 	/// <summary>
+	/// Time left of a transfer, counted from its first byte
+	/// </summary>
+	internal sealed class TransferClock
+	{
+		private long _end; // Timestamp of Stopwatch (0 until started)
+
+		public void Start(int duration) =>
+			Interlocked.Exchange(ref _end, Math.Max(1L, Stopwatch.GetTimestamp() + duration * Stopwatch.Frequency / 1000L));
+
+		/// <summary>
+		/// Time (ms) left, long.MaxValue until started
+		/// </summary>
+		public long Remaining
+		{
+			get
+			{
+				var end = Interlocked.Read(ref _end);
+				return (end == 0L)
+					? long.MaxValue
+					: Math.Max(0L, (end - Stopwatch.GetTimestamp()) * 1000L / Stopwatch.Frequency);
+			}
+		}
+	}
+
+	/// <summary>
+	/// What happened to the parallel connections of a download
+	/// </summary>
+	internal sealed class DownloadWatch
+	{
+		private int _retries;
+		private int _lost;
+
+		/// <summary>
+		/// First reason why a request failed
+		/// </summary>
+		public FailureNote Note { get; } = new();
+
+		public TransferClock Clock { get; } = new();
+
+		/// <summary>
+		/// Number of requests made again after a failed one
+		/// </summary>
+		public int Retries => Volatile.Read(ref _retries);
+
+		/// <summary>
+		/// Number of connections which gave up
+		/// </summary>
+		public int Lost => Volatile.Read(ref _lost);
+
+		public void AddRetry() => Interlocked.Increment(ref _retries);
+		public void AddLost() => Interlocked.Increment(ref _lost);
+	}
+
+	/// <summary>
+	/// Determines whether the next request of a download is to be made now, ahead of the end of
+	/// the content being received.
+	/// </summary>
+	/// <param name="length">Length of the content being received (0 or less if unknown)</param>
+	/// <param name="received">Bytes of the content received so far</param>
+	/// <param name="elapsed">Time (ms) since the content began</param>
+	/// <param name="remaining">Time (ms) left of the download</param>
+	/// <remarks>
+	/// A connection takes a few round trips to be made (TCP, TLS) and starts slowly. If it were
+	/// made only when the content ended, that time would fall in the measured window and the
+	/// result would be lower than the link, the more so the faster the link. No request is made
+	/// if the content lasts until the download ends because a request not used still counts as
+	/// one for the server.
+	/// </remarks>
+	internal static bool ShouldPrefetch(long length, long received, long elapsed, long remaining)
+	{
+		if ((length <= 0L) || (received <= 0L) || (elapsed <= 0L) || (received >= length))
+			return false;
+
+		var timeToEnd = (double)(length - received) * elapsed / received;
+
+		return (timeToEnd <= DownloadPrefetchLead) && (timeToEnd < remaining);
+	}
+
+	/// <summary>
 	/// Describes an exception of a request in one line: the HTTP status if the server answered,
 	/// the status of the request and the innermost cause otherwise.
 	/// </summary>
@@ -766,7 +864,7 @@ internal sealed class SpeedTester
 		{
 			if (web.Response is HttpWebResponse response)
 			{
-				text = $"HTTP {(int)response.StatusCode} {response.StatusDescription}";
+				text = DescribeStatus(response);
 			}
 			else
 			{
@@ -787,6 +885,26 @@ internal sealed class SpeedTester
 		static string Name(Exception x) => (x is SocketException socket)
 			? $"SocketException {socket.SocketErrorCode}"
 			: x.GetType().Name;
+	}
+
+	/// <summary>
+	/// Describes the status of a response which is not a success, with the time the server
+	/// asks to wait if it gives one (a server which limits requests does, by 429 or 503).
+	/// </summary>
+	private static string DescribeStatus(HttpWebResponse response)
+	{
+		var text = $"HTTP {(int)response.StatusCode} {response.StatusDescription}";
+		try
+		{
+			var retryAfter = response.Headers?["Retry-After"];
+			if (!string.IsNullOrWhiteSpace(retryAfter))
+				text += $" (Retry-After {retryAfter.Trim()})";
+		}
+		catch (Exception ex)
+		{
+			Debug.WriteLine($"Failed to read a header. {ex.Message}");
+		}
+		return text;
 	}
 
 	private static string Trim(string text)
@@ -846,19 +964,20 @@ internal sealed class SpeedTester
 		for (int attempt = 0; ; attempt++)
 		{
 			var counter = new Counter();
-			var note = new FailureNote();
+			var watch = new DownloadWatch();
 			double? mbps;
 			try
 			{
 				mbps = await TransferAsync(
-					(stop) => DownloadAsync(uri, bind, counter, stop, note),
+					(stop) => DownloadAsync(uri, bind, counter, stop, watch),
 					DownloadCount,
 					counter,
 					DownloadWarmup,
 					capTime,
 					capBytes,
 					getAdapterBytes,
-					token).ConfigureAwait(false);
+					token,
+					clock: watch.Clock).ConfigureAwait(false);
 			}
 			finally
 			{
@@ -868,12 +987,14 @@ internal sealed class SpeedTester
 
 			if (counter.Value > 0L)
 			{
-				return (mbps, counter.Value, (firstFailure is not null)
-					? Trim($"Download worked at the second attempt; the first got no byte: {firstFailure}")
-					: null);
+				var detail = (firstFailure is not null)
+					? $"Download worked at the second attempt; the first got no byte: {firstFailure}"
+					: null;
+
+				return GetDownloadOutcome(mbps, counter.Value, watch.Lost, watch.Retries, watch.Note.Value, detail);
 			}
 
-			var failure = note.Value ?? $"no response within {RequestTimeout / 1000} s";
+			var failure = watch.Note.Value ?? $"no response within {RequestTimeout / 1000} s";
 
 			if (attempt >= 1)
 			{
@@ -890,74 +1011,236 @@ internal sealed class SpeedTester
 		}
 	}
 
-	private static async Task DownloadAsync(Uri uri, BindIPEndPoint bind, Counter counter, CancellationToken stop, FailureNote note = null)
+	/// <summary>
+	/// Gets the outcome of a download which received bytes.
+	/// </summary>
+	/// <param name="mbps">Rate (Mbps) measured</param>
+	/// <param name="bytes">Bytes received</param>
+	/// <param name="lost">Number of connections which gave up</param>
+	/// <param name="retries">Number of requests made again after a failed one</param>
+	/// <param name="failure">First reason why a request failed</param>
+	/// <param name="detail">Detail given so far</param>
+	/// <remarks>
+	/// A rate over a time in which some of the connections were gone for good is lower than
+	/// the link and so is not given. A request which failed and was made again is told in
+	/// the detail.
+	/// </remarks>
+	internal static (double? mbps, long bytes, string detail) GetDownloadOutcome(double? mbps, long bytes, int lost, int retries, string failure, string detail)
 	{
+		if (lost > 0)
+		{
+			return (null, bytes, Join(detail,
+				$"Download not measured: {lost} of {DownloadCount} connections failed and did not come back ({failure ?? "no reason known"})"));
+		}
+
+		if (retries > 0)
+		{
+			return (mbps, bytes, Join(detail,
+				$"Download went on after {retries} failed request{((retries == 1) ? string.Empty : "s")}: {failure ?? "no reason known"}"));
+		}
+
+		return (mbps, bytes, Trim(detail));
+	}
+
+	/// <summary>
+	/// Request of a download and its response
+	/// </summary>
+	private sealed class Fetch : IDisposable
+	{
+		public HttpWebRequest Request { get; set; }
+		public HttpWebResponse Response { get; set; }
+		public CancellationTokenRegistration Registration { get; set; }
+
+		/// <summary>
+		/// Why the request failed (null if it got a response of 200)
+		/// </summary>
+		public string Failure { get; set; }
+
+		public void Dispose()
+		{
+			try
+			{
+				Registration.Dispose();
+
+				// Abort before disposing so that the remaining content is not read.
+				Abort(Request);
+				Response?.Dispose();
+			}
+			catch (Exception ex)
+			{
+				Debug.WriteLine($"Failed to end a request. {ex.Message}");
+			}
+			CloseConnection(Request);
+		}
+	}
+
+	/// <summary>
+	/// Makes a request of a download on a new connection and waits for the response.
+	/// </summary>
+	/// <remarks>This method never throws an exception.</remarks>
+	private static async Task<Fetch> OpenAsync(Uri uri, BindIPEndPoint bind, CancellationToken stop)
+	{
+		var fetch = new Fetch();
+		try
+		{
+			var request = CreateRequest(uri, bind, RequestTimeout);
+			fetch.Request = request;
+			fetch.Registration = stop.Register(() => Abort(request));
+
+			using (new AbortScope(request, RequestTimeout, CancellationToken.None))
+			{
+				fetch.Response = (HttpWebResponse)await request.GetResponseAsync().ConfigureAwait(false);
+			}
+
+			if (fetch.Response.StatusCode != HttpStatusCode.OK)
+				fetch.Failure = DescribeStatus(fetch.Response);
+		}
+		catch (Exception ex)
+		{
+			// An aborted request comes here.
+			Debug.WriteLine($"Request of download ended. {ex.Message}");
+
+			fetch.Failure = Describe(ex) ?? "The request failed";
+
+			if (ex is WebException { Response: not null } web)
+				web.Response.Dispose();
+		}
+		return fetch;
+	}
+
+	/// <summary>
+	/// Receives the content of a URL on one connection after another until stopped.
+	/// </summary>
+	/// <remarks>
+	/// <para>If the content ends before the time is up, it is requested again. The next request
+	/// is made shortly before the end, on a connection of its own, so that its content follows
+	/// without a gap.</para>
+	/// <para>A failed request is made again after a short wait as long as bytes are coming
+	/// through any of the connections. After failures in a row the connection gives up, which
+	/// is counted. If no byte has come at all after the wait, it gives up at once: the download
+	/// as a whole is tried once more by the caller.</para>
+	/// <para>This method never throws an exception.</para>
+	/// </remarks>
+	private static async Task DownloadAsync(Uri uri, BindIPEndPoint bind, Counter counter, CancellationToken stop, DownloadWatch watch = null)
+	{
+		Task<Fetch> next = null;
 		try
 		{
 			var buffer = new byte[BufferSize];
+			int failures = 0;
 
-			// If the content ends before the time is up, it is requested again.
 			while (!stop.IsCancellationRequested)
 			{
-				long received = 0L;
+				string failure;
 
-				var request = CreateRequest(uri, bind, RequestTimeout);
-				try
+				var fetchTask = next ?? OpenAsync(uri, bind, stop);
+				next = null;
+
+				using (var fetch = await fetchTask.ConfigureAwait(false))
 				{
-					using var registration = stop.Register(() => Abort(request));
+					failure = fetch.Failure;
 
-					HttpWebResponse response;
-					using (new AbortScope(request, RequestTimeout, CancellationToken.None))
+					if (failure is null)
 					{
-						response = (HttpWebResponse)await request.GetResponseAsync().ConfigureAwait(false);
-					}
-
-					using (response)
-					using (var stream = response.GetResponseStream())
-					{
-						if (response.StatusCode != HttpStatusCode.OK)
+						try
 						{
-							note?.Set($"HTTP {(int)response.StatusCode} {response.StatusDescription}");
-							return;
+							long length = fetch.Response.ContentLength;
+							long received = 0L;
+							var stopwatch = Stopwatch.StartNew();
+
+							using var stream = fetch.Response.GetResponseStream();
+
+							int read;
+							while ((read = await stream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0)
+							{
+								counter.Add(read);
+								received += read;
+
+								if (stop.IsCancellationRequested)
+								{
+									// Abort before disposing so that the remaining content is not read.
+									Abort(fetch.Request);
+									return;
+								}
+
+								if ((next is null)
+									&& ShouldPrefetch(length, received, stopwatch.ElapsedMilliseconds, watch?.Clock.Remaining ?? long.MaxValue))
+								{
+									next = OpenAsync(uri, bind, stop);
+								}
+							}
+
+							if (received == 0L)
+								failure = "HTTP 200 with no content";
 						}
-
-						int read;
-						while ((read = await stream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0)
+						catch (Exception ex)
 						{
-							counter.Add(read);
-							received += read;
+							// An aborted request comes here. It is not a failure if aborted to stop the transfer.
+							Debug.WriteLine($"Download ended. {ex.Message}");
 
 							if (stop.IsCancellationRequested)
-							{
-								// Abort before disposing so that the remaining content is not read.
-								Abort(request);
 								return;
-							}
+
+							failure = Describe(ex) ?? "The connection failed";
 						}
 					}
 				}
-				finally
+
+				if (failure is null)
 				{
-					CloseConnection(request);
+					failures = 0;
+					continue;
 				}
 
-				if (received == 0L)
+				if (stop.IsCancellationRequested)
+					return;
+
+				watch?.Note.Set(failure);
+				failures++;
+
+				// A request made ahead, if any, is ready and so is not waited for.
+				if (next is null)
 				{
-					note?.Set("HTTP 200 with no content");
+					try
+					{
+						await Task.Delay(DownloadRetryDelay, stop).ConfigureAwait(false);
+					}
+					catch (OperationCanceledException)
+					{
+						return;
+					}
+				}
+
+				if ((counter.Value == 0L) || (failures >= DownloadMaxFailures))
+				{
+					watch?.AddLost();
 					return;
 				}
+
+				watch?.AddRetry();
 			}
 		}
 		catch (Exception ex)
 		{
-			// An aborted request comes here. It is not a failure if aborted to stop the transfer.
 			Debug.WriteLine($"Download ended. {ex.Message}");
 
 			if (!stop.IsCancellationRequested)
-				note?.Set(Describe(ex));
-
-			if (ex is WebException { Response: not null } web)
-				web.Response.Dispose();
+			{
+				watch?.Note.Set(Describe(ex));
+				watch?.AddLost();
+			}
+		}
+		finally
+		{
+			// A request made ahead and not used is ended.
+			if (next is not null)
+			{
+				_ = next.ContinueWith(
+					x => x.Result.Dispose(),
+					CancellationToken.None,
+					TaskContinuationOptions.OnlyOnRanToCompletion | TaskContinuationOptions.ExecuteSynchronously,
+					TaskScheduler.Default);
+			}
 		}
 	}
 

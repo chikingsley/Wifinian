@@ -27,14 +27,24 @@ public class DownloadTest
 
 	/// <summary>
 	/// HTTP server which answers each connection with a status decided by the order of
-	/// the connection and, if the status is 200, sends content at a fixed rate
+	/// the connection and, if the status is 200, sends content of a given length
 	/// </summary>
+	/// <remarks>
+	/// The rate is that of all connections together, as that of a link is: what one connection
+	/// does not use is left to the others and nothing is saved up while no connection sends.
+	/// </remarks>
 	private sealed class HttpServer : IDisposable
 	{
 		private readonly TcpListener _listener;
 		private readonly CancellationTokenSource _cancellation = new();
 		private readonly Func<int, int> _getStatus;
 		private readonly int _bytesPerSecond;
+		private readonly long _contentLength;
+		private readonly int _responseDelay;
+		private readonly Stopwatch _linkStopwatch = Stopwatch.StartNew();
+		private readonly object _linkLock = new();
+		private double _linkBudget;
+		private TimeSpan _linkTime;
 		private readonly List<TcpClient> _clients = new();
 		private readonly object _lock = new();
 		private int _connections;
@@ -53,10 +63,16 @@ public class DownloadTest
 
 		public int MaxRequestsPerConnection => Volatile.Read(ref _maxRequestsPerConnection);
 
-		public HttpServer(Func<int, int> getStatus, int bytesPerSecond = 500_000)
+		/// <param name="getStatus">Function to get the status from the order of the connection</param>
+		/// <param name="bytesPerSecond">Rate of all connections together divided by the number of parallel connections of a download</param>
+		/// <param name="contentLength">Length of the content of a response</param>
+		/// <param name="responseDelay">Time (ms) a request is left unanswered, as making a connection over a network takes</param>
+		public HttpServer(Func<int, int> getStatus, int bytesPerSecond = 500_000, long contentLength = 2_000_000_000L, int responseDelay = 0)
 		{
 			_getStatus = getStatus;
 			_bytesPerSecond = bytesPerSecond;
+			_contentLength = contentLength;
+			_responseDelay = responseDelay;
 
 			_listener = new TcpListener(IPAddress.Loopback, 0);
 			_listener.Start();
@@ -114,34 +130,39 @@ public class DownloadTest
 						if (header.IndexOf("Connection: close", StringComparison.OrdinalIgnoreCase) >= 0)
 							Interlocked.Increment(ref _closeRequests);
 
+						if (_responseDelay > 0)
+							await Task.Delay(_responseDelay);
+
 						int status = _getStatus(index);
 						if (status != 200)
 						{
+							// 503 comes with the time to wait, as a server which limits requests gives.
 							var response = Encoding.ASCII.GetBytes(
-								$"HTTP/1.1 {status} {GetReason(status)}\r\nContent-Length: 0\r\n\r\n");
+								$"HTTP/1.1 {status} {GetReason(status)}\r\n{((status == 503) ? "Retry-After: 120\r\n" : string.Empty)}Content-Length: 0\r\n\r\n");
 							await stream.WriteAsync(response, 0, response.Length);
 							continue;
 						}
 
 						var head = Encoding.ASCII.GetBytes(
-							"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 2000000000\r\n\r\n");
+							$"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {_contentLength}\r\n\r\n");
 						await stream.WriteAsync(head, 0, head.Length);
 
 						var buffer = new byte[4 * 1024];
-						var stopwatch = Stopwatch.StartNew();
 						long sent = 0L;
 
-						while (!_cancellation.IsCancellationRequested)
+						while (!_cancellation.IsCancellationRequested && (sent < _contentLength))
 						{
-							// Send only as much as the rate allows up to now.
-							if (sent >= stopwatch.Elapsed.TotalSeconds * _bytesPerSecond)
+							int count = (int)Math.Min(buffer.Length, _contentLength - sent);
+
+							// Send only as much as the rate allows.
+							if (!TakeFromLink(count))
 							{
 								await Task.Delay(5);
 								continue;
 							}
 
-							await stream.WriteAsync(buffer, 0, buffer.Length);
-							sent += buffer.Length;
+							await stream.WriteAsync(buffer, 0, count);
+							sent += count;
 						}
 					}
 				}
@@ -149,6 +170,24 @@ public class DownloadTest
 			catch (Exception)
 			{
 				// The connection has been closed by the client.
+			}
+		}
+
+		private const int LinkBurst = 48 * 1024;
+
+		private bool TakeFromLink(int count)
+		{
+			lock (_linkLock)
+			{
+				var now = _linkStopwatch.Elapsed;
+				_linkBudget = Math.Min(LinkBurst, _linkBudget + (now - _linkTime).TotalSeconds * _bytesPerSecond * SpeedTester.DownloadCount);
+				_linkTime = now;
+
+				if (_linkBudget < count)
+					return false;
+
+				_linkBudget -= count;
+				return true;
 			}
 		}
 
@@ -251,6 +290,126 @@ public class DownloadTest
 	}
 
 	[TestMethod]
+	public async Task TestDownloadHasNoGapWhenContentEnds()
+	{
+		// The content of a response lasts about 0.8 seconds and a request is answered only after
+		// 0.4 seconds. If the next request were made when the content ended, a third of the time
+		// would pass with nothing received and the rate would be a third lower.
+		const int bytesPerSecond = 500_000;
+		var expected = SpeedTester.DownloadCount * bytesPerSecond * 8D / 1e6;
+
+		using var server = new HttpServer(_ => 200, bytesPerSecond, contentLength: 400_000L, responseDelay: 400);
+
+		var (mbps, bytes, detail) = await MeasureAsync(server.Uri, capTime: SpeedTester.DownloadWarmup + 3000);
+
+		Assert.IsNotNull(mbps);
+		Assert.IsTrue(Math.Abs(mbps.Value - expected) <= expected * 0.2, $"Measured {mbps.Value:f2} Mbps, expected {expected:f2} Mbps");
+		Assert.IsNull(detail);
+
+		// The content was requested again, each time on a connection of its own.
+		Assert.IsTrue(server.Connections >= 3 * SpeedTester.DownloadCount, $"{server.Connections} connections");
+		Assert.AreEqual(1, server.MaxRequestsPerConnection);
+		Assert.AreEqual(server.Requests, server.CloseRequests);
+	}
+
+	[TestMethod]
+	public void TestShouldPrefetch()
+	{
+		const long length = 25_000_000L;
+
+		// 20 MB in 4 seconds: the remaining 5 MB take 1 second.
+		Assert.IsTrue(SpeedTester.ShouldPrefetch(length, 20_000_000L, 4000L, long.MaxValue));
+		Assert.IsTrue(SpeedTester.ShouldPrefetch(length, 20_000_000L, 4000L, 1001L));
+
+		// The content lasts until the download ends and so no request is spent.
+		Assert.IsFalse(SpeedTester.ShouldPrefetch(length, 20_000_000L, 4000L, 1000L));
+		Assert.IsFalse(SpeedTester.ShouldPrefetch(length, 20_000_000L, 4000L, 0L));
+
+		// 5 MB in 4 seconds: the end is 16 seconds ahead.
+		Assert.IsFalse(SpeedTester.ShouldPrefetch(length, 5_000_000L, 4000L, long.MaxValue));
+
+		// Just within and just outside the lead
+		Assert.IsTrue(SpeedTester.ShouldPrefetch(2500L, 1000L, 1000L, long.MaxValue));
+		Assert.IsFalse(SpeedTester.ShouldPrefetch(2501L, 1000L, 1000L, long.MaxValue));
+
+		// Unknown length, nothing received yet, no time passed, all received
+		Assert.IsFalse(SpeedTester.ShouldPrefetch(-1L, 1000L, 1000L, long.MaxValue));
+		Assert.IsFalse(SpeedTester.ShouldPrefetch(length, 0L, 1000L, long.MaxValue));
+		Assert.IsFalse(SpeedTester.ShouldPrefetch(length, 1000L, 0L, long.MaxValue));
+		Assert.IsFalse(SpeedTester.ShouldPrefetch(length, length, 1000L, long.MaxValue));
+	}
+
+	[TestMethod]
+	public async Task TestDownloadRequestRefusedAtStartIsMadeAgain()
+	{
+		// Two of the first four connections are refused, the others and all later ones served.
+		using var server = new HttpServer(index => (index is 1 or 2) ? 429 : 200);
+
+		var (mbps, bytes, detail) = await MeasureAsync(server.Uri);
+
+		Assert.IsNotNull(mbps);
+		Assert.IsTrue(bytes > 0L);
+
+		// Each refused request was made again once and what happened is told.
+		Assert.AreEqual(SpeedTester.DownloadCount + 2, server.Connections);
+		Assert.AreEqual("Download went on after 2 failed requests: HTTP 429 Too Many Requests", detail);
+	}
+
+	[TestMethod]
+	public async Task TestDownloadWithLostConnectionsIsNotMeasured()
+	{
+		// Only the first connection is served.
+		using var server = new HttpServer(index => (index == 0) ? 200 : 403);
+
+		var (mbps, bytes, detail) = await MeasureAsync(server.Uri);
+
+		// A rate through one connection of four is not that of the link.
+		Assert.IsNull(mbps);
+		Assert.IsTrue(bytes > 0L);
+		Assert.AreEqual("Download not measured: 3 of 4 connections failed and did not come back (HTTP 403 Forbidden)", detail);
+
+		// Each of the other connections requested as often as allowed and then gave up.
+		Assert.AreEqual(1 + (SpeedTester.DownloadCount - 1) * SpeedTester.DownloadMaxFailures, server.Connections);
+	}
+
+	[TestMethod]
+	public async Task TestDownloadGoesOnAfterConnectionsAreReset()
+	{
+		using var server = new HttpServer(_ => 200);
+
+		var task = MeasureAsync(server.Uri, capTime: SpeedTester.DownloadWarmup + 2500);
+
+		await Task.Delay(1200);
+		Assert.AreEqual(SpeedTester.DownloadCount, server.Connections);
+		server.DropConnections();
+
+		var (mbps, bytes, detail) = await task;
+
+		// Every connection was made again and the download went on to its end.
+		Assert.IsNotNull(mbps);
+		Assert.IsTrue(bytes > 0L);
+		Assert.AreEqual(2 * SpeedTester.DownloadCount, server.Connections);
+		Assert.IsNotNull(detail);
+		StringAssert.StartsWith(detail, "Download went on after 4 failed requests: ");
+	}
+
+	[TestMethod]
+	public void TestDownloadOutcome()
+	{
+		Assert.AreEqual((50D, 1000L, (string)null), SpeedTester.GetDownloadOutcome(50D, 1000L, 0, 0, null, null));
+
+		Assert.AreEqual((50D, 1000L, "Download went on after 1 failed request: HTTP 429 Too Many Requests"),
+			SpeedTester.GetDownloadOutcome(50D, 1000L, 0, 1, "HTTP 429 Too Many Requests", null));
+
+		// A lost connection takes the rate away even if others were made again.
+		Assert.AreEqual(((double?)null, 1000L, "Download not measured: 2 of 4 connections failed and did not come back (HTTP 403 Forbidden)"),
+			SpeedTester.GetDownloadOutcome(50D, 1000L, 2, 3, "HTTP 403 Forbidden", null));
+
+		var (_, _, detail) = SpeedTester.GetDownloadOutcome(50D, 1000L, 1, 0, null, "Download worked at the second attempt; the first got no byte: HTTP 503 Service Unavailable");
+		Assert.AreEqual("Download worked at the second attempt; the first got no byte: HTTP 503 Service Unavailable; Download not measured: 1 of 4 connections failed and did not come back (no reason known)", detail);
+	}
+
+	[TestMethod]
 	public async Task TestDownloadNeverReusesConnection()
 	{
 		using var server = new HttpServer(_ => 200);
@@ -315,6 +474,18 @@ public class DownloadTest
 		Assert.AreEqual(2 * SpeedTester.DownloadCount, server.Connections);
 		Assert.IsTrue(stopwatch.ElapsedMilliseconds >= 400, $"Lasted {stopwatch.ElapsedMilliseconds} ms");
 		Assert.IsTrue(stopwatch.ElapsedMilliseconds < 8000, $"Lasted {stopwatch.ElapsedMilliseconds} ms");
+	}
+
+	[TestMethod]
+	public async Task TestDownloadFailureTellsTimeToWait()
+	{
+		using var server = new HttpServer(_ => 503);
+
+		var (mbps, bytes, detail) = await MeasureAsync(server.Uri, retryDelay: 100);
+
+		Assert.IsNull(mbps);
+		Assert.AreEqual(0L, bytes);
+		Assert.AreEqual("Download got no byte in two attempts: HTTP 503 Service Unavailable (Retry-After 120)", detail);
 	}
 
 	[TestMethod]

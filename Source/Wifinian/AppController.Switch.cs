@@ -473,8 +473,22 @@ internal partial class AppController
 		}
 	}
 
+	private readonly PendingTicket _postSwitchTicket = new();
+
+	/// <summary>
+	/// Schedules the measurement which checks the automatic switch made in an interface.
+	/// </summary>
+	/// <remarks>
+	/// Only the measurement scheduled last is run. A measurement which could not run and
+	/// a measurement which found the network slow both schedule the next one, and without this
+	/// two of them would run for one switch. It is not run either once the switch has been
+	/// checked or switched back from, because it would then measure a network which no longer
+	/// needs it.
+	/// </remarks>
 	private void MeasureAfterSwitch(Guid interfaceId, TimeSpan delay)
 	{
+		var ticket = _postSwitchTicket.Take(interfaceId);
+
 		Task.Run(async () =>
 		{
 			try
@@ -482,6 +496,9 @@ internal partial class AppController
 				await Task.Delay(delay).ConfigureAwait(false);
 
 				if (_disposed)
+					return;
+
+				if (!_postSwitchTicket.IsLatest(interfaceId, ticket) || !HasLanding(interfaceId))
 					return;
 
 				var sample = await MeasureConnectedAsync(SpeedTrigger.PostSwitch, interfaceId).ConfigureAwait(false);
@@ -499,6 +516,34 @@ internal partial class AppController
 					+ ex);
 			}
 		});
+	}
+
+	/// <summary>
+	/// Tickets by which only the action scheduled last for an interface is run
+	/// </summary>
+	internal sealed class PendingTicket
+	{
+		private readonly Dictionary<Guid, int> _tickets = new();
+
+		/// <summary>
+		/// Takes a ticket, which makes those taken before for the same interface outdated.
+		/// </summary>
+		public int Take(Guid interfaceId)
+		{
+			lock (_tickets)
+			{
+				_tickets.TryGetValue(interfaceId, out int ticket);
+				return _tickets[interfaceId] = unchecked(ticket + 1);
+			}
+		}
+
+		public bool IsLatest(Guid interfaceId, int ticket)
+		{
+			lock (_tickets)
+			{
+				return _tickets.TryGetValue(interfaceId, out int latest) && (latest == ticket);
+			}
+		}
 	}
 
 	/// <summary>
