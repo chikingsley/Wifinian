@@ -142,7 +142,7 @@
           <Directory Id="RuntimesX86NativeFolder" Name="native">
             <Component Id="SqliteNativeX86Library" Guid="{8A5CBE3D-29DC-4F07-8D62-3DF78A7838D6}">
               <File Id="SqliteNativeX86Library"
-                    Source="$(var.Wifinian.TargetDir)runtimes\win-x86\native\" Name="e_sqlite3.dll" KeyPath="yes"/>
+                    Source="$(var.Wifinian.TargetDir)runtimes\win-x86\native\" Name="e_sqlite3.dll" DefaultLanguage="0" KeyPath="yes"/>
             </Component>
           </Directory>
         </Directory>
@@ -150,7 +150,7 @@
           <Directory Id="RuntimesX64NativeFolder" Name="native">
             <Component Id="SqliteNativeX64Library" Guid="{996A2424-DBDA-4BA8-86D7-9F25D6863F7B}">
               <File Id="SqliteNativeX64Library"
-                    Source="$(var.Wifinian.TargetDir)runtimes\win-x64\native\" Name="e_sqlite3.dll" KeyPath="yes"/>
+                    Source="$(var.Wifinian.TargetDir)runtimes\win-x64\native\" Name="e_sqlite3.dll" DefaultLanguage="0" KeyPath="yes"/>
             </Component>
           </Directory>
         </Directory>
@@ -158,7 +158,7 @@
           <Directory Id="RuntimesArm64NativeFolder" Name="native">
             <Component Id="SqliteNativeArm64Library" Guid="{33BE9E49-4D42-4D1F-95AE-4C9AD6484169}">
               <File Id="SqliteNativeArm64Library"
-                    Source="$(var.Wifinian.TargetDir)runtimes\win-arm64\native\" Name="e_sqlite3.dll" KeyPath="yes"/>
+                    Source="$(var.Wifinian.TargetDir)runtimes\win-arm64\native\" Name="e_sqlite3.dll" DefaultLanguage="0" KeyPath="yes"/>
             </Component>
           </Directory>
         </Directory>
