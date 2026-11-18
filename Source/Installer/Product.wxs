@@ -8,12 +8,17 @@
            UpgradeCode="{B3236D41-48D3-4642-9EBC-18E30BB7F56B}">
     <SummaryInformation Description="Installer for Wifinian"/>
 
-    <!-- The installed version is removed first so that every file is replaced whatever its file
-         version is. A package of the same version replaces the installed one as well.
-         It is removed within the transaction of this installation (after InstallInitialize), so
-         that the installed version is put back if this installation fails. -->
-    <MajorUpgrade Schedule="afterInstallInitialize" AllowSameVersionUpgrades="yes"
+    <!-- The files of this version are written first and the installed version is removed only
+         after that (after InstallExecute), so that the installed version stays whole and stays
+         registered if this installation fails. Removing it first, even within the transaction
+         (after InstallInitialize), was seen to leave the files without their registration after
+         a failed update: Windows then no longer listed the app and could not uninstall it.
+         Because the installed version is still there when the files are written, they are
+         written over whatever their file versions are (REINSTALLMODE "amus"). A package of the
+         same version replaces the installed one as well. -->
+    <MajorUpgrade Schedule="afterInstallExecute" AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="A newer version of [ProductName] is already installed."/>
+    <Property Id="REINSTALLMODE" Value="amus"/>
 
     <Media Id="1" Cabinet="source.cab" EmbedCab="yes"/>
 
