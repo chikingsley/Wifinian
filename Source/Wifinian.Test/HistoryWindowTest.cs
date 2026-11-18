@@ -14,6 +14,21 @@ namespace Wifinian.Test;
 [TestClass]
 public class HistoryWindowTest
 {
+	[TestMethod]
+	public void TestNotTestedResult()
+	{
+		// A network which could not be tested is recorded as a row which is never a valid sample.
+		var sample = new SpeedSample { Profile = "EXT2", Result = SpeedResult.NotTested, Trigger = SpeedTrigger.TestAll };
+		Assert.IsFalse(sample.Valid);
+
+		Assert.IsTrue(SpeedSample.TryParseEnum("NotTested", out SpeedResult result));
+		Assert.AreEqual(SpeedResult.NotTested, result);
+
+		Assert.AreEqual("Could not test", HistorySnapshot.FormatResult(SpeedResult.NotTested));
+		Assert.AreEqual("Ok", HistorySnapshot.FormatResult(SpeedResult.Ok));
+		Assert.AreEqual("Aborted", HistorySnapshot.FormatResult(SpeedResult.Aborted));
+	}
+
 	private static readonly DateTime _to = new(2026, 11, 17, 12, 0, 0, DateTimeKind.Utc);
 	private static readonly DateTime _from = _to.AddHours(-24);
 	private static readonly Guid _interfaceId = new("11111111-1111-1111-1111-111111111111");

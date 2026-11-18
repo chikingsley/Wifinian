@@ -64,6 +64,13 @@ internal class SwitchContext
 	public bool? IsLinkBusy { get; set; } = false;
 
 	/// <summary>
+	/// Whether the interface is in the middle of a connection made by someone else (associating
+	/// or authenticating, or a connection has been started and not finished yet)
+	/// </summary>
+	/// <remarks>While this is true, no connection is started.</remarks>
+	public bool IsInterfaceBusy { get; set; }
+
+	/// <summary>
 	/// Current time (local)
 	/// </summary>
 	public DateTime Now { get; set; }
@@ -111,6 +118,14 @@ internal class SwitchState
 
 	public string LastConnectedName { get; set; }
 	public DateTime LastDisconnectedAt { get; set; }
+
+	/// <summary>
+	/// Time when an automatic connection by this app last failed
+	/// </summary>
+	/// <remarks>
+	/// A disconnection which follows it is caused by this app and so is not waited after.
+	/// </remarks>
+	public DateTime OwnFailureAt { get; set; }
 
 	/// <summary>
 	/// Time since when a switch has been deferred because the link is in use
@@ -171,6 +186,15 @@ internal class SwitchDecision
 	/// </summary>
 	/// <remarks>The caller is expected to decide again with the result of the check.</remarks>
 	public bool RequestsLinkCheck { get; set; }
+
+	/// <summary>
+	/// Time after which the decision is to be made again because it only waits (null if none)
+	/// </summary>
+	/// <remarks>
+	/// The caller is expected to load the profiles again after this time because no event may
+	/// come in the meantime.
+	/// </remarks>
+	public TimeSpan? RecheckAfter { get; set; }
 }
 
 /// <summary>
@@ -268,6 +292,37 @@ internal static class SwitchPolicy
 	/// </summary>
 	public const string WeakCode = "weak";
 
+	/// <summary>
+	/// Code of the decision to wait while the interface is being connected by someone else
+	/// </summary>
+	public const string ConnectingCode = "connecting";
+
+	/// <summary>
+	/// Code of the decision to wait just after a disconnection not caused by this app
+	/// </summary>
+	public const string GraceCode = "grace";
+
+	/// <summary>
+	/// Period after a disconnection not caused by this app in which no connection is started
+	/// </summary>
+	/// <remarks>
+	/// When the user (or the system) connects to another network, the interface is disconnected
+	/// for a moment before it starts associating. A connection started by this app in that moment
+	/// would take the interface back from the network being connected to.
+	/// </remarks>
+	public static readonly TimeSpan DisconnectGrace = TimeSpan.FromSeconds(10);
+
+	/// <summary>
+	/// Period after a failed automatic connection in which a disconnection is regarded as
+	/// caused by it
+	/// </summary>
+	public static readonly TimeSpan OwnFailurePeriod = TimeSpan.FromSeconds(30);
+
+	/// <summary>
+	/// Time after which the decision is made again while the interface is being connected
+	/// </summary>
+	public static readonly TimeSpan ConnectingRecheck = TimeSpan.FromSeconds(3);
+
 	public static readonly TimeSpan PersistPeriod = TimeSpan.FromSeconds(30);
 	public static readonly TimeSpan BudgetPeriod = TimeSpan.FromHours(1);
 	public static readonly TimeSpan ExplorePeriod = TimeSpan.FromHours(24);
@@ -350,6 +405,7 @@ internal static class SwitchPolicy
 		}
 
 		state.ClearPending();
+		state.OwnFailureAt = now;
 
 		if (!setsCooldown)
 			return;
@@ -439,6 +495,15 @@ internal static class SwitchPolicy
 			return new SwitchDecision { Kind = SwitchKind.Stay };
 
 		var now = context.Now;
+
+		// (-1) Not connected but someone else is connecting or has just disconnected.
+		// This applies regardless of whether measured speed is used.
+		if (connected is null)
+		{
+			var wait = GetConnectWait(context, state);
+			if (wait is not null)
+				return wait;
+		}
 
 		bool RecentlyFailed(ProfileItem p) => p.LastFailureTime.Add(context.FailureInterval) > now;
 
@@ -833,6 +898,60 @@ internal static class SwitchPolicy
 		return Stay($"stay|{name}|{best?.Name}|{untested?.Name}", stayReason);
 
 		#endregion
+	}
+
+	/// <summary>
+	/// Decides whether to wait instead of connecting while no profile is connected.
+	/// </summary>
+	/// <param name="context">Conditions</param>
+	/// <param name="state">State of the interface (null if not tracked)</param>
+	/// <returns>Decision to wait, null if a connection can be started</returns>
+	/// <remarks>
+	/// "Not connected" includes the moments in which the interface is on its way to a network
+	/// chosen by the user or the system. A connection started then would take the interface back
+	/// and so undo that choice again and again.
+	/// </remarks>
+	public static SwitchDecision GetConnectWait(SwitchContext context, SwitchState state)
+	{
+		if (context is null)
+			throw new ArgumentNullException(nameof(context));
+
+		if (context.IsInterfaceBusy)
+		{
+			return new SwitchDecision
+			{
+				Kind = SwitchKind.Stay,
+				Reason = "Waiting: the adapter is being connected to a network outside this app",
+				Code = ConnectingCode,
+				RecheckAfter = ConnectingRecheck
+			};
+		}
+
+		if (state is null)
+			return null;
+
+		var now = context.Now;
+
+		if ((state.LastDisconnectedAt == default) || !IsWithin(now, state.LastDisconnectedAt, DisconnectGrace))
+			return null;
+
+		// The clock may have been set back.
+		if (now < state.LastDisconnectedAt)
+			return null;
+
+		// A disconnection which follows a failed connection by this app is of its own making.
+		if ((state.OwnFailureAt != default)
+			&& (state.OwnFailureAt <= state.LastDisconnectedAt)
+			&& IsWithin(state.LastDisconnectedAt, state.OwnFailureAt, OwnFailurePeriod))
+			return null;
+
+		return new SwitchDecision
+		{
+			Kind = SwitchKind.Stay,
+			Reason = $"Waiting {DisconnectGrace.TotalSeconds:0} s after disconnection before connecting",
+			Code = GraceCode,
+			RecheckAfter = state.LastDisconnectedAt + DisconnectGrace - now
+		};
 	}
 
 	private static bool IsWithin(DateTime now, DateTime time, TimeSpan period) => (now - time < period);

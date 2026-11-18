@@ -63,7 +63,9 @@ Both hosts can be changed in settings.xml (see below). If another connection (e.
 
 Automatic tests run 20 seconds after a network is connected (unless it was tested within the last 30 minutes), then once an hour while it stays connected, and only for networks with __Auto switch__ ticked and __Avoid__ unticked. An automatic test is put off while the link is carrying more than about 1 Mbps. __Test speed now__ in the menu tests the connected network at any time.
 
-Data use: an automatic test uses up to about 25 MB (20 MB down, 5 MB up), __Test speed now__ up to about 60 MB. Automatic tests stop for the day once 500 MB has been used. The metered connection setting of Windows is not consulted, so untick __Measure speed automatically__ on metered or tethered connections.
+Upload speed is that of the bytes actually sent: it is measured for at least 3 seconds after a second of warm-up, through sockets with small fixed send buffers so that bytes merely handed to the system are not counted.
+
+Data use: an automatic test uses up to about 60 MB (20 MB down and, depending on the upload speed, up to 40 MB up), __Test speed now__ up to about 130 MB. Automatic tests stop for the day once 500 MB has been used. The metered connection setting of Windows is not consulted, so untick __Measure speed automatically__ on metered or tethered connections.
 
 ### How speed-aware Engage decides
 
@@ -75,6 +77,8 @@ Tick __Engage by measured speed__ in the menu. It only has effect while __Engage
  * Before leaving, it retests the current network if its latest result is more than two hours old. After switching, it tests the new network; if that has no internet, or twice measures clearly worse than the network it left, it switches back once and leaves that network alone for 2 hours.
  * With no measurements at all it falls back to the original priority order. A network that has never been tested is tried once a day when the current one is below 50 Mbps. A connected network with no internet or a signal below 30 % is left for the best alternative.
 
+Engage (in priority order as well as by speed) never takes the adapter back from a connection made outside this app: while the adapter is associating or authenticating with a network chosen in the Wi-Fi menu of Windows or by `netsh`, and for 10 seconds after a disconnection this app did not cause, it does not connect to anything. Once that network is connected, the ordinary rules above (time on the network, retest, margin) apply to leaving it.
+
 Every decision is written with its reason to the events table and shown in the Decisions tab of the History window. While __Engage by measured speed__ is off but __Record history__ is on, the same logic runs without acting and records "would switch" rows, so it can be judged before it is turned on.
 
 ### Avoid
@@ -85,8 +89,12 @@ The __Avoid__ checkbox of a network makes this app never connect to that network
 
 Speed is only known for networks that have been connected, so:
 
- * __Test all networks__ in the menu connects to every saved network in range in turn, tests each and returns to the network it started from. Wi-Fi drops for about 30 seconds per network. Choosing the same menu item again (__Cancel test__) stops it and returns to the original network.
+ * __Test all networks__ in the menu connects to every saved network in range in turn, tests each and returns to the network it started from. Wi-Fi drops for about 30 seconds per network. A network is given up to 40 seconds to connect and to get an address; if it cannot be tested, a row with the result "Could not test" (never used as a speed) is added to the measurements. Choosing the same menu item again (__Cancel test__) stops it and returns to the original network.
  * __Test other networks when idle__ (off by default) does the same for one network at a time: at most once every 6 hours, only while speed-aware Engage is on, after 10 minutes without keyboard or mouse input and with no traffic on the link, and only for a network not tested in the last 3 days. The connection drops for about 30 seconds each time.
+
+### Logs
+
+`operation.log` in `%LOCALAPPDATA%\Wifinian` records every start and every orderly shutdown of this app with its reason (Close in the menu, the main window closed, the Windows session ending) and a second instance that was started and ended at once. A process killed from outside (Task Manager, `taskkill`) cannot write anything, so the next start records that the previous run left no record of its end. Unhandled exceptions are always written to `exception.log` in the same folder before the process ends.
 
 ### Settings without UI
 

@@ -1100,6 +1100,182 @@ public class SwitchPolicyTest
 
 	#endregion
 
+	#region Connection made outside
+
+	[TestMethod]
+	public void TestNotConnectedButConnecting()
+	{
+		var a = Profile("A", 80, 0);
+		var b = Profile("B", 70, 1);
+		AddSample("A", TimeSpan.FromMinutes(5), SpeedResult.Ok, 100, 80);
+
+		foreach (var engagesSpeed in new[] { false, true })
+		{
+			// The interface is associating with a network chosen outside this app. It is
+			// "not connected" but must not be connected to anything.
+			var context = CreateContext(engagesSpeed);
+			context.IsInterfaceBusy = true;
+
+			foreach (var state in new[] { new SwitchState(), CreateState("A", TimeSpan.FromHours(1)), null })
+			{
+				if (engagesSpeed && (state is null))
+					continue;
+
+				var decision = SwitchPolicy.Decide([a, b], null, context, state);
+				Assert.IsNull(decision.Target);
+				Assert.AreEqual(SwitchKind.Stay, decision.Kind);
+				Assert.AreEqual(SwitchPolicy.ConnectingCode, decision.Code);
+				Assert.AreEqual(SwitchPolicy.ConnectingRecheck, decision.RecheckAfter);
+				Assert.IsFalse(string.IsNullOrEmpty(decision.Reason));
+			}
+
+			// Once the interface is doing nothing, the connection is made as before.
+			context.IsInterfaceBusy = false;
+
+			var connecting = SwitchPolicy.Decide([a, b], null, context, new SwitchState());
+			Assert.AreSame(a, connecting.Target);
+			Assert.IsNull(connecting.RecheckAfter);
+
+			// A connected interface is not affected.
+			context.IsInterfaceBusy = true;
+			var connected = Profile("A", 80, 0, isConnected: true);
+
+			var staying = SwitchPolicy.Decide([connected, b], connected, context, CreateState("A", TimeSpan.FromHours(1)));
+			Assert.IsNull(staying.Target);
+			Assert.AreNotEqual(SwitchPolicy.ConnectingCode, staying.Code);
+		}
+	}
+
+	[TestMethod]
+	public void TestGraceAfterDisconnection()
+	{
+		var a = Profile("A", 80, 0);
+		var b = Profile("B", 70, 1);
+		AddSample("A", TimeSpan.FromMinutes(5), SpeedResult.Ok, 100, 80);
+
+		foreach (var engagesSpeed in new[] { false, true })
+		{
+			// A was connected and is lost at the base time, not by this app.
+			var state = CreateState("A", TimeSpan.FromHours(1));
+			SwitchPolicy.Track(state, null, _now);
+
+			foreach (var seconds in new[] { 0, 1, 5, 9 })
+			{
+				var decision = SwitchPolicy.Decide([a, b], null, CreateContext(engagesSpeed, TimeSpan.FromSeconds(seconds)), state);
+				Assert.IsNull(decision.Target, $"{seconds} s");
+				Assert.AreEqual(SwitchPolicy.GraceCode, decision.Code);
+				Assert.AreEqual(SwitchPolicy.DisconnectGrace - TimeSpan.FromSeconds(seconds), decision.RecheckAfter);
+			}
+
+			// After the period, the connection is made as before.
+			foreach (var seconds in new[] { 10, 11, 60 })
+			{
+				var decision = SwitchPolicy.Decide([a, b], null, CreateContext(engagesSpeed, TimeSpan.FromSeconds(seconds)), state);
+				Assert.AreSame(a, decision.Target, $"{seconds} s");
+				Assert.IsNull(decision.RecheckAfter);
+			}
+
+			// No profile has ever been connected (at start of this app).
+			var first = SwitchPolicy.Decide([a, b], null, CreateContext(engagesSpeed), new SwitchState());
+			Assert.AreSame(a, first.Target);
+		}
+
+		Assert.AreEqual(TimeSpan.FromSeconds(10), SwitchPolicy.DisconnectGrace);
+	}
+
+	[TestMethod]
+	public void TestNoGraceAfterOwnFailure()
+	{
+		var a = Profile("A", 80, 0);
+		var b = Profile("B", 70, 1);
+
+		foreach (var engagesSpeed in new[] { false, true })
+		{
+			// This app tried to switch from A to B and failed, which left the interface disconnected.
+			var state = CreateState("A", TimeSpan.FromHours(1));
+			SwitchPolicy.RecordAttempt(state, "B", false, _now - TimeSpan.FromSeconds(2), setsCooldown: engagesSpeed);
+			SwitchPolicy.Track(state, null, _now);
+
+			var decision = SwitchPolicy.Decide([a, b], null, CreateContext(engagesSpeed, TimeSpan.FromSeconds(1)), state);
+			Assert.AreSame(a, decision.Target);
+
+			// A disconnection long after the failure is not of its making.
+			state = CreateState("A", TimeSpan.FromHours(1));
+			SwitchPolicy.RecordAttempt(state, "B", false, _now - TimeSpan.FromMinutes(5), setsCooldown: engagesSpeed);
+			SwitchPolicy.Track(state, null, _now);
+
+			decision = SwitchPolicy.Decide([a, b], null, CreateContext(engagesSpeed, TimeSpan.FromSeconds(1)), state);
+			Assert.IsNull(decision.Target);
+			Assert.AreEqual(SwitchPolicy.GraceCode, decision.Code);
+		}
+	}
+
+	[TestMethod]
+	public void TestReplayConnectionMadeOutside()
+	{
+		// The owner is on EXT (about 100 Mbps) and chooses EXT2 in the Wi-Fi menu of Windows.
+		// It took about 16 seconds to associate. This app connected back to EXT four times in a row.
+		var ext = Profile("EXT", 83, 0);
+		var ext2 = Profile("EXT2", 60, 1);
+		AddSample("EXT", TimeSpan.FromMinutes(5), SpeedResult.Ok, 101, 83);
+
+		var state = CreateState("EXT", TimeSpan.FromHours(1));
+		var connects = new List<string>();
+
+		void Step(int seconds, bool isBusy, ProfileItem connected)
+		{
+			var context = CreateContext(elapsed: TimeSpan.FromSeconds(seconds));
+			context.IsInterfaceBusy = isBusy;
+
+			SwitchPolicy.Track(state, connected?.Name, context.Now);
+
+			var decision = SwitchPolicy.Decide([ext, ext2], connected, context, state);
+			if (decision.Target is not null)
+				connects.Add($"{seconds}:{decision.Target.Name}");
+		}
+
+		// Disconnected from EXT, the state of the interface is not "associating" yet.
+		Step(0, false, null);
+		Step(1, false, null);
+
+		// Associating and authenticating with EXT2
+		for (int seconds = 2; seconds <= 16; seconds++)
+			Step(seconds, true, null);
+
+		// A momentary gap between attempts of association is covered by the grace period.
+		Step(8, false, null);
+
+		Assert.AreEqual(0, connects.Count, string.Join(", ", connects));
+
+		// Connected to EXT2, which has no speed data: it is measured, not left.
+		var connectedExt2 = Profile("EXT2", 60, 1, isConnected: true);
+		var after = CreateContext(elapsed: TimeSpan.FromSeconds(17));
+		SwitchPolicy.Track(state, "EXT2", after.Now);
+
+		var decision = SwitchPolicy.Decide([ext, connectedExt2], connectedExt2, after, state);
+		Assert.IsNull(decision.Target);
+		Assert.IsTrue(decision.RequestsVerify);
+		Assert.AreEqual(after.Now, state.ConnectedSince);
+
+		// EXT2 turns out to be slow. The time to stay applies before it is left for EXT.
+		_samples["EXT2"] = new List<SpeedSample> { Sample("EXT2", TimeSpan.FromSeconds(-60), SpeedResult.Ok, 8, 60) };
+
+		decision = SwitchPolicy.Decide([ext, connectedExt2], connectedExt2, CreateContext(elapsed: TimeSpan.FromMinutes(2)), state);
+		Assert.IsNull(decision.Target);
+		Assert.IsTrue(decision.Code.StartsWith("dwell|", StringComparison.Ordinal), decision.Code);
+
+		// After that, the ordinary rules (confirmation, margin) lead back to the faster network.
+		var late = CreateContext(elapsed: TimeSpan.FromMinutes(11), ignoresFreshness: true);
+		decision = SwitchPolicy.Decide([ext, connectedExt2], connectedExt2, late, state);
+		Assert.IsNull(decision.Target);
+		Assert.IsTrue(decision.Code.StartsWith("confirm|", StringComparison.Ordinal), decision.Code);
+
+		decision = SwitchPolicy.Decide([ext, connectedExt2], connectedExt2, CreateContext(elapsed: TimeSpan.FromMinutes(12), ignoresFreshness: true), state);
+		Assert.AreSame(ext, decision.Target);
+	}
+
+	#endregion
+
 	#region Base
 
 	private (ProfileItem ext2, ProfileItem office, ProfileItem ext) CreateOwnerProfiles(string connectedName)

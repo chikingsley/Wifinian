@@ -453,6 +453,19 @@ internal class HistoryNetwork
 internal class HistorySnapshot
 {
 	/// <summary>
+	/// Formats the result of a speed measurement for a row.
+	/// </summary>
+	internal static string FormatResult(SpeedResult result) => result switch
+	{
+		SpeedResult.NotTested => "Could not test",
+		SpeedResult.NoInternet => "No internet",
+		SpeedResult.CaptivePortal => "Sign-in page",
+		SpeedResult.EndpointFailed => "Test server failed",
+		SpeedResult.RouteMismatch => "Other adapter used",
+		_ => result.ToString()
+	};
+
+	/// <summary>
 	/// Number of brushes for series
 	/// </summary>
 	public const int BrushCount = 8;
@@ -641,7 +654,7 @@ internal class HistorySnapshot
 					Down = Format(x.DownMbps),
 					Up = Format(x.UpMbps),
 					Trigger = x.Trigger.ToString(),
-					Result = x.Result.ToString()
+					Result = FormatResult(x.Result)
 				})
 				.ToArray(),
 			Decisions = events

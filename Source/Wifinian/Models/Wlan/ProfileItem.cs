@@ -106,6 +106,12 @@ public class ProfileItem : BindableBase
 	private bool _isRadioOn;
 
 	/// <summary>
+	/// Whether associated wireless interface is in the middle of connection or disconnection
+	/// (associating, authenticating, discovering or disconnecting)
+	/// </summary>
+	public bool IsInterfaceBusy { get; set; }
+
+	/// <summary>
 	/// Whether associated wireless interface is connected to associated wireless LAN
 	/// </summary>
 	public bool IsConnected
@@ -344,11 +350,21 @@ public class ProfileItem : BindableBase
 		this.IsAutoSwitchEnabled = other.IsAutoSwitchEnabled;
 		this.Position = other.Position;
 		this.IsRadioOn = other.IsRadioOn;
+		this.IsInterfaceBusy = other.IsInterfaceBusy;
 		this.IsConnected = other.IsConnected;
-		this.Protocol = other.Protocol;
 		this.Signal = other.Signal;
-		this.Band = other.Band;
-		this.Channel = other.Channel;
+
+		// The radio of a BSS does not change. If the BSS is the same as before but its entry
+		// is missing from the list this time, the values of the radio are kept.
+		if (!(other is { Channel: 0, Signal: > 0 }
+			&& !string.IsNullOrEmpty(other.Bssid)
+			&& string.Equals(this.Bssid, other.Bssid, StringComparison.OrdinalIgnoreCase)))
+		{
+			this.Protocol = other.Protocol;
+			this.Band = other.Band;
+			this.Channel = other.Channel;
+		}
+
 		this.Bssid = other.Bssid;
 		this.Rssi = other.Rssi;
 		this.LinkRate = other.LinkRate;

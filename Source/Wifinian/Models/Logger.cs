@@ -10,6 +10,36 @@ internal class Logger
 {
 	private const string OperationFileName = "operation.log";
 	private const string ExceptionFileName = "exception.log";
+	private const string RunFileName = "running.txt";
+
+	private const int OperationCapacity = 200;
+	private const int ExceptionCapacity = 10;
+
+	private static readonly object _lock = new();
+
+	/// <summary>
+	/// ID of this process
+	/// </summary>
+	public static int ProcessId => _processId ??= GetProcessId();
+	private static int? _processId;
+
+	private static int GetProcessId()
+	{
+		try
+		{
+			using var process = Process.GetCurrentProcess();
+			return process.Id;
+		}
+		catch
+		{
+			return 0;
+		}
+	}
+
+	/// <summary>
+	/// Whether the end of this run has been recorded
+	/// </summary>
+	public static bool IsEndRecorded { get; private set; }
 
 	private const string HeaderStart = "[Date:";
 	private static string ComposeHeader() => $"{HeaderStart} {DateTime.Now} Ver: {ProductInfo.Version}]";
@@ -19,33 +49,109 @@ internal class Logger
 	/// </summary>
 	/// <param name="content">Content</param>
 	/// <remarks>
-	/// A log file of previous dates will be overridden.
+	/// The log file is appended and keeps the latest records regardless of their dates so that
+	/// how the previous runs started and ended can be traced. This method never throws an exception.
 	/// </remarks>
 	public static void RecordOperation(string content)
 	{
 		content = ComposeHeader() + Environment.NewLine
 			+ content + Environment.NewLine + Environment.NewLine;
 
-		RecordToAppData(OperationFileName, content);
+		RecordToAppData(OperationFileName, content, OperationCapacity, keepsOld: true);
 	}
 
 	/// <summary>
-	/// Records exception log to AppData and Desktop.
+	/// Records the start of this run to the operation log and, if the previous run left no record
+	/// of its end, records that as well.
+	/// </summary>
+	/// <remarks>
+	/// A process killed from outside (Task Manager, taskkill, Stop-Process) or lost by power
+	/// failure cannot record anything by itself. The file which is written at start and deleted
+	/// at orderly end tells such an end at the next start. This method never throws an exception.
+	/// </remarks>
+	public static void RecordStart()
+	{
+		try
+		{
+			var runFilePath = Path.Combine(AppDataService.EnsureFolderPath(), RunFileName);
+
+			string previous = null;
+			if (File.Exists(runFilePath))
+				previous = File.ReadAllText(runFilePath, Encoding.UTF8).Trim();
+
+			if (!string.IsNullOrEmpty(previous))
+			{
+				RecordOperation($"The previous run ({previous}) left no record of its end: it was killed from outside (Task Manager, taskkill, Stop-Process -Force), crashed natively or the system went down. "
+					+ "The time of its last history row tells roughly when.");
+			}
+
+			RecordOperation($"Started: process {ProcessId}.");
+
+			File.WriteAllText(runFilePath, $"process {ProcessId} started {DateTime.Now}", Encoding.UTF8);
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to record the start." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Records the orderly end of this run to the operation log.
+	/// </summary>
+	/// <param name="reason">Reason of shutdown</param>
+	/// <param name="exitCode">Exit code</param>
+	/// <remarks>This method never throws an exception.</remarks>
+	public static void RecordEnd(string reason, int exitCode)
+	{
+		try
+		{
+			RecordOperation($"Shutdown: process {ProcessId}, exit code {exitCode}. Reason: {reason}");
+			IsEndRecorded = true;
+
+			File.Delete(Path.Combine(AppDataService.EnsureFolderPath(), RunFileName));
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to record the end." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Records exception log to AppData.
 	/// </summary>
 	/// <param name="exception">Exception</param>
+	/// <param name="source">Where the exception was caught</param>
 	/// <remarks>
-	/// The log file will be appended with new content as long as one day has not yet passed
-	/// since last write. Otherwise, the log file will be overwritten.
+	/// This method shows nothing and so can be called from any thread at any time. The log file
+	/// will be appended with new content as long as one day has not yet passed since last write.
+	/// Otherwise, the log file will be overwritten. This method never throws an exception.
 	/// </remarks>
-	public static void RecordException(Exception exception)
+	public static void RecordException(Exception exception, string source)
+	{
+		if (exception is null)
+			return;
+
+		var content = ComposeHeader() + Environment.NewLine
+			+ $"Source: {source} Process: {ProcessId}" + Environment.NewLine
+			+ exception.ToString() + Environment.NewLine + Environment.NewLine;
+
+		RecordToAppData(ExceptionFileName, content, ExceptionCapacity);
+	}
+
+	/// <summary>
+	/// Asks the user whether to record exception log to Desktop and does so if agreed.
+	/// </summary>
+	/// <param name="exception">Exception</param>
+	/// <remarks>The exception is expected to have been recorded to AppData already.</remarks>
+	public static void PromptException(Exception exception)
 	{
 		if (exception is null)
 			throw new ArgumentNullException(nameof(exception));
 
 		var content = ComposeHeader() + Environment.NewLine
 			+ exception.ToString() + Environment.NewLine + Environment.NewLine;
-
-		RecordToAppData(ExceptionFileName, content);
 
 		if (MessageBox.Show(
 			LanguageService.RecordException,
@@ -60,14 +166,17 @@ internal class Logger
 
 	#region Helper
 
-	private static void RecordToAppData(string fileName, string content, int capacity = 1)
+	private static void RecordToAppData(string fileName, string content, int capacity = 1, bool keepsOld = false)
 	{
 		try
 		{
 			var appDataFolderPath = AppDataService.EnsureFolderPath();
 			var appDataFilePath = Path.Combine(appDataFolderPath, fileName);
 
-			UpdateText(appDataFilePath, content, capacity);
+			lock (_lock)
+			{
+				UpdateText(appDataFilePath, content, capacity, keepsOld);
+			}
 		}
 		catch (Exception ex)
 		{
@@ -99,11 +208,11 @@ internal class Logger
 		sw.Write(content);
 	}
 
-	private static void UpdateText(string filePath, string newContent, int capacity)
+	private static void UpdateText(string filePath, string newContent, int capacity, bool keepsOld = false)
 	{
 		string oldContent = null;
 
-		if ((1 < capacity) && File.Exists(filePath) && (File.GetLastWriteTime(filePath) > DateTime.Now.AddDays(-1)))
+		if ((1 < capacity) && File.Exists(filePath) && (keepsOld || (File.GetLastWriteTime(filePath) > DateTime.Now.AddDays(-1))))
 		{
 			using (var sr = new StreamReader(filePath, Encoding.UTF8))
 				oldContent = sr.ReadToEnd();

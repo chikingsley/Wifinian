@@ -28,6 +28,21 @@ internal partial class AppController
 	private static readonly TimeSpan _probeRetryDelay = TimeSpan.FromSeconds(3);
 	private static readonly TimeSpan _probePollInterval = TimeSpan.FromMilliseconds(500);
 
+	/// <summary>
+	/// Time given to a network being tested to associate and to get an address
+	/// </summary>
+	/// <remarks>
+	/// A weak extender was seen to take 16 seconds to associate and then needed an address.
+	/// </remarks>
+	private static readonly TimeSpan _probeLinkTimeout = TimeSpan.FromSeconds(40);
+
+	/// <summary>
+	/// Time after which a connection is given up when the interface is doing nothing for it
+	/// </summary>
+	private static readonly TimeSpan _probeIdleTimeout = TimeSpan.FromSeconds(6);
+
+	private static readonly TimeSpan _probeLinkInterval = TimeSpan.FromSeconds(1);
+
 	private static readonly TimeSpan _idleTime = TimeSpan.FromMinutes(10);
 	private static readonly TimeSpan _idleRateWindow = TimeSpan.FromSeconds(2);
 	private const double IdleRate = 0.1; // Mbps
@@ -382,34 +397,34 @@ internal partial class AppController
 				{
 					isChanged = true;
 
-					// This connection is not manual and so Engage is not turned off.
-					if (!await ConnectNetworkAsync(target, false).ConfigureAwait(false))
-					{
-						if (!cancellationToken.IsCancellationRequested)
-							AppendProbeEvent(interfaceId, SwitchKind.Probe, original?.Name, target.Name, $"Could not connect to {target.Name}");
+					var stopwatch = Stopwatch.StartNew();
 
-						continue;
-					}
+					// This connection is not manual and so Engage is not turned off. Its result is
+					// not final: a weak network may associate after the connection gave up waiting.
+					await ConnectNetworkAsync(target, false).ConfigureAwait(false);
 
-					if (!await LinkInspector.WaitForAddressAsync(interfaceId, _addressTimeout, cancellationToken).ConfigureAwait(false))
+					var failure = await WaitForLinkAsync(target, _probeLinkTimeout - stopwatch.Elapsed, cancellationToken).ConfigureAwait(false);
+					if (failure is not null)
 					{
-						AppendProbeEvent(interfaceId, SwitchKind.Probe, original?.Name, target.Name, $"No address on {target.Name}");
+						RecordNotTested(target, trigger, original, failure, stopwatch.Elapsed);
 						continue;
 					}
 
 					await Task.Delay(_probeSettleDelay, cancellationToken).ConfigureAwait(false);
 				}
 
+				var measureStopwatch = Stopwatch.StartNew();
+
 				// The measurement requires that the connection is reflected to the profiles.
 				if (!await WaitForConnectedAsync(target, cancellationToken).ConfigureAwait(false))
 				{
-					AppendProbeEvent(interfaceId, SwitchKind.Probe, original?.Name, target.Name, $"Could not test {target.Name}");
+					RecordNotTested(target, trigger, original, $"Could not test {target.Name}", measureStopwatch.Elapsed);
 					continue;
 				}
 
 				var (sample, _) = await MeasureProfileAsync(target, trigger, SpeedTestSize.Quick, false, _probeMeasureWait, isProbe: true).ConfigureAwait(false);
 				if (sample is null)
-					AppendProbeEvent(interfaceId, SwitchKind.Probe, original?.Name, target.Name, $"Could not test {target.Name}");
+					RecordNotTested(target, trigger, original, $"Could not test {target.Name}", measureStopwatch.Elapsed);
 			}
 		}
 		catch (OperationCanceledException)
@@ -434,6 +449,95 @@ internal partial class AppController
 				Trace.WriteLine("Failed to clear pending switch after the test of networks." + Environment.NewLine
 					+ ex);
 			}
+		}
+	}
+
+	/// <summary>
+	/// Waits until the interface is connected to a profile being tested and has an address.
+	/// </summary>
+	/// <param name="target">Profile which has been requested to connect to</param>
+	/// <param name="timeout">Time to wait</param>
+	/// <param name="cancellationToken">Cancellation token</param>
+	/// <returns>Null if the link is ready, sentence which tells why it is not otherwise</returns>
+	/// <remarks>
+	/// Association and getting an address are waited for as a whole because either of them can
+	/// take long on a weak network. The wait ends early when the interface is not connected
+	/// and is doing nothing to connect.
+	/// </remarks>
+	private async Task<string> WaitForLinkAsync(ProfileItem target, TimeSpan timeout, CancellationToken cancellationToken)
+	{
+		var stopwatch = Stopwatch.StartNew();
+		var idleStopwatch = new Stopwatch();
+
+		while (true)
+		{
+			cancellationToken.ThrowIfCancellationRequested();
+
+			if (_disposed)
+				return $"Could not connect to {target.Name}";
+
+			// This load is skipped if an update is running.
+			await LoadProfilesAsync().ConfigureAwait(false);
+
+			if (target.IsConnected)
+			{
+				idleStopwatch.Reset();
+
+				if (LinkInspector.IsReady(target.InterfaceId))
+					return null;
+			}
+			else if (target.IsInterfaceBusy)
+			{
+				idleStopwatch.Reset();
+			}
+			else
+			{
+				idleStopwatch.Start();
+
+				if (idleStopwatch.Elapsed >= _probeIdleTimeout)
+					return $"Could not connect to {target.Name}";
+			}
+
+			if (stopwatch.Elapsed >= timeout)
+			{
+				return target.IsConnected
+					? $"No address on {target.Name} within {_probeLinkTimeout.TotalSeconds:0} s"
+					: $"Could not connect to {target.Name} within {_probeLinkTimeout.TotalSeconds:0} s";
+			}
+
+			await Task.Delay(_probeLinkInterval, cancellationToken).ConfigureAwait(false);
+		}
+	}
+
+	/// <summary>
+	/// Records that a network could not be tested, as a decision and as a speed row which is
+	/// not a valid sample, so that the History window shows it along with the measurements.
+	/// </summary>
+	/// <remarks>This method never throws an exception.</remarks>
+	private void RecordNotTested(ProfileItem target, SpeedTrigger trigger, ProfileItem original, string reason, TimeSpan duration)
+	{
+		try
+		{
+			AppendProbeEvent(target.InterfaceId, SwitchKind.Probe, original?.Name, target.Name, reason);
+
+			History.AppendSpeed(new SpeedSample
+			{
+				Time = DateTime.UtcNow,
+				InterfaceId = target.InterfaceId,
+				Profile = target.Name,
+				Bssid = target.Bssid ?? string.Empty,
+				Band = target.Band,
+				Channel = target.Channel,
+				Signal = target.Signal,
+				DurationMs = (int)Math.Min(int.MaxValue, duration.TotalMilliseconds),
+				Trigger = trigger,
+				Result = SpeedResult.NotTested
+			});
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to record a network which could not be tested." + Environment.NewLine
+				+ ex);
 		}
 	}
 

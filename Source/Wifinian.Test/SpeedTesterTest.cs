@@ -104,6 +104,170 @@ public class SpeedTesterTest
 		Assert.AreEqual(8D, SpeedTester.GetRateMbps(points, 1000, false).Value, 0.001);
 	}
 
+	[TestMethod]
+	public void TestGetRateMbpsMinWindow()
+	{
+		// 8 Mbps for 2.5 seconds after warm-up of 1 second
+		var points = CreatePoints(3500, t => t * 1000, t => 0L);
+
+		Assert.AreEqual(8D, SpeedTester.GetRateMbps(points, 1000, false, 2500).Value, 0.001);
+
+		// The window is shorter than required.
+		Assert.IsNull(SpeedTester.GetRateMbps(points, 1000, false, 3000));
+
+		// A transfer ended by the cap of bytes cannot be longer.
+		Assert.AreEqual(8D, SpeedTester.GetRateMbps(points, 1000, true, 3000).Value, 0.001);
+	}
+
+	[TestMethod]
+	public void TestUploadCap()
+	{
+		// The time after warm-up is at least the minimum window even if a sample is late.
+		foreach (var size in new[] { SpeedTestSize.Quick, SpeedTestSize.Full })
+		{
+			var (capTime, capBytes) = SpeedTester.GetUploadCap(size);
+			Assert.IsTrue(capTime - SpeedTester.UploadWarmup >= SpeedTester.UploadMinWindow + 100, size.ToString());
+			Assert.IsTrue(capBytes >= 40_000_000L, size.ToString());
+		}
+
+		Assert.IsTrue(SpeedTester.UploadMinWindow >= 3000);
+	}
+
+	#endregion
+
+	#region Upload
+
+	/// <summary>
+	/// Server which accepts connections and reads from each of them at a fixed rate
+	/// </summary>
+	private sealed class SlowServer : IDisposable
+	{
+		private readonly System.Net.Sockets.TcpListener _listener;
+		private readonly CancellationTokenSource _cancellation = new();
+		private readonly int _bytesPerSecond;
+		private long _received;
+
+		public int Port { get; }
+		public long Received => Interlocked.Read(ref _received);
+
+		public SlowServer(int bytesPerSecond)
+		{
+			_bytesPerSecond = bytesPerSecond;
+
+			_listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+			_listener.Server.ReceiveBufferSize = 64 * 1024; // Inherited by accepted sockets
+			_listener.Start();
+			Port = ((System.Net.IPEndPoint)_listener.LocalEndpoint).Port;
+
+			_ = Task.Run(AcceptAsync);
+		}
+
+		private async Task AcceptAsync()
+		{
+			try
+			{
+				while (!_cancellation.IsCancellationRequested)
+				{
+					var client = await _listener.AcceptTcpClientAsync();
+					_ = Task.Run(() => ReadAsync(client));
+				}
+			}
+			catch (Exception)
+			{
+				// The listener has been stopped.
+			}
+		}
+
+		private async Task ReadAsync(System.Net.Sockets.TcpClient client)
+		{
+			try
+			{
+				using (client)
+				{
+					var stream = client.GetStream();
+					var buffer = new byte[8 * 1024];
+					var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+					long received = 0L;
+
+					while (!_cancellation.IsCancellationRequested)
+					{
+						// Read only as much as the rate allows up to now.
+						if (received >= stopwatch.Elapsed.TotalSeconds * _bytesPerSecond)
+						{
+							await Task.Delay(5);
+							continue;
+						}
+
+						int read = await stream.ReadAsync(buffer, 0, buffer.Length);
+						if (read <= 0)
+							break;
+
+						received += read;
+						Interlocked.Add(ref _received, read);
+					}
+				}
+			}
+			catch (Exception)
+			{
+				// The connection has been closed by the client.
+			}
+		}
+
+		public void Dispose()
+		{
+			_cancellation.Cancel();
+			_listener.Stop();
+		}
+	}
+
+	[TestMethod]
+	public async Task TestUploadMeasuresBytesActuallySent()
+	{
+		// Each connection is read at 250 kB/s and so the true rate of upload is 2 Mbps per
+		// connection. Bytes can be handed to the sockets far faster than that until their
+		// buffers are full and those bytes must not be taken as uploaded.
+		const int bytesPerSecond = 250_000;
+		var expected = SpeedTester.UploadCount * bytesPerSecond * 8D / 1e6;
+
+		using var server = new SlowServer(bytesPerSecond);
+
+		var uri = new Uri($"http://127.0.0.1:{server.Port}/__up");
+		var counter = new SpeedTester.Counter();
+		var (capTime, capBytes) = SpeedTester.GetUploadCap(SpeedTestSize.Quick);
+
+		var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+		var rate = await SpeedTester.MeasureUploadAsync(uri, System.Net.IPAddress.Loopback, counter, capTime, capBytes, CancellationToken.None);
+		stopwatch.Stop();
+
+		Assert.IsNotNull(rate);
+		Assert.IsTrue(Math.Abs(rate.Value - expected) <= expected * 0.25, $"Measured {rate.Value:f2} Mbps, expected {expected:f2} Mbps");
+
+		// The measurement lasted for warm-up and the minimum window.
+		Assert.IsTrue(stopwatch.ElapsedMilliseconds >= SpeedTester.UploadWarmup + SpeedTester.UploadMinWindow,
+			$"Lasted {stopwatch.ElapsedMilliseconds} ms");
+
+		// The bytes counted in total exceed those sent only by what the buffers hold.
+		Assert.IsTrue(counter.Value > 0L);
+		Assert.IsTrue(server.Received > 0L);
+	}
+
+	[TestMethod]
+	public async Task TestUploadUnreachable()
+	{
+		// Nothing listens on this port and so no byte is uploaded.
+		int port;
+		var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+		listener.Start();
+		port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+		listener.Stop();
+
+		var counter = new SpeedTester.Counter();
+		var rate = await SpeedTester.MeasureUploadAsync(new Uri($"http://127.0.0.1:{port}/"), System.Net.IPAddress.Loopback, counter, 4200, 40_000_000L, CancellationToken.None);
+
+		Assert.IsNull(rate);
+		Assert.AreEqual(0L, counter.Value);
+	}
+
 	#endregion
 
 	#region Measure

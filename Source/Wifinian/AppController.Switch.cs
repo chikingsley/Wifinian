@@ -38,7 +38,137 @@ internal partial class AppController
 	private readonly HashSet<Guid> _revertingIds = new(); // Interface IDs
 	private readonly Dictionary<string, DateTime> _lastVerifyTimes = new(); // UTC
 	private readonly Dictionary<string, DateTime> _lastOfflineTimes = new(); // UTC
+	private readonly Dictionary<Guid, int> _ownConnects = new(); // Numbers of connections by this app in progress
+	private readonly Dictionary<Guid, DateTime> _foreignConnects = new(); // UTC
+	private readonly HashSet<Guid> _recheckIds = new(); // Interface IDs
 	private readonly object _switchLock = new();
+
+	/// <summary>
+	/// Period in which a connection started outside this app is regarded as in progress unless
+	/// its end is notified
+	/// </summary>
+	private static readonly TimeSpan _foreignConnectPeriod = TimeSpan.FromSeconds(40);
+
+	private static readonly TimeSpan _recheckLoadTimeout = TimeSpan.FromSeconds(5);
+	private static readonly TimeSpan _recheckMargin = TimeSpan.FromMilliseconds(300);
+
+	private void BeginOwnConnect(Guid interfaceId)
+	{
+		lock (_switchLock)
+		{
+			_ownConnects.TryGetValue(interfaceId, out int count);
+			_ownConnects[interfaceId] = count + 1;
+		}
+	}
+
+	private void EndOwnConnect(Guid interfaceId)
+	{
+		lock (_switchLock)
+		{
+			if (_ownConnects.TryGetValue(interfaceId, out int count) && (count > 1))
+				_ownConnects[interfaceId] = count - 1;
+			else
+				_ownConnects.Remove(interfaceId);
+		}
+	}
+
+	/// <summary>
+	/// Reflects a notification of connection to the record of connections made outside this app.
+	/// </summary>
+	/// <remarks>
+	/// A connection started by the user (Windows Wi-Fi menu, netsh) or by the system must not be
+	/// taken over by automatic connection of this app. This method never throws an exception.
+	/// </remarks>
+	internal void TrackForeignConnect(Guid interfaceId, ManagedNativeWifi.ConnectionChangedState changedState)
+	{
+		try
+		{
+			lock (_switchLock)
+			{
+				switch (changedState)
+				{
+					case ManagedNativeWifi.ConnectionChangedState.Started:
+						if (!_ownConnects.ContainsKey(interfaceId))
+							_foreignConnects[interfaceId] = DateTime.UtcNow;
+						break;
+
+					case ManagedNativeWifi.ConnectionChangedState.Completed:
+					case ManagedNativeWifi.ConnectionChangedState.Failed:
+						_foreignConnects.Remove(interfaceId);
+						break;
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to track a connection made outside this app." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Determines whether a connection started outside this app is in progress in an interface.
+	/// </summary>
+	private bool IsForeignConnecting(Guid interfaceId)
+	{
+		lock (_switchLock)
+		{
+			if (!_foreignConnects.TryGetValue(interfaceId, out DateTime time))
+				return false;
+
+			if ((DateTime.UtcNow - time).Duration() < _foreignConnectPeriod)
+				return true;
+
+			_foreignConnects.Remove(interfaceId);
+			return false;
+		}
+	}
+
+	/// <summary>
+	/// Loads the profiles again after a specified time so that a decision which only waits
+	/// is made again even if no event comes in the meantime.
+	/// </summary>
+	/// <remarks>This method returns immediately and never throws an exception.</remarks>
+	private void ScheduleRecheck(Guid interfaceId, TimeSpan delay)
+	{
+		lock (_switchLock)
+		{
+			// A recheck of the interface is already scheduled.
+			if (!_recheckIds.Add(interfaceId))
+				return;
+		}
+
+		if (delay < TimeSpan.Zero)
+			delay = TimeSpan.Zero;
+
+		Task.Run(async () =>
+		{
+			try
+			{
+				try
+				{
+					await Task.Delay(delay + _recheckMargin).ConfigureAwait(false);
+				}
+				finally
+				{
+					// The decision made by the following load may schedule another recheck.
+					lock (_switchLock)
+					{
+						_recheckIds.Remove(interfaceId);
+					}
+				}
+
+				// This load is repeated for a while if another update is running.
+				if (!_disposed && EngagesPriority.Value && !_isProbing)
+					await LoadProfilesFreshAsync(_recheckLoadTimeout).ConfigureAwait(false);
+			}
+			catch (Exception ex)
+			{
+				Trace.WriteLine("Failed to recheck switching." + Environment.NewLine
+					+ ex);
+			}
+		});
+	}
 
 	/// <summary>
 	/// Whether networks are being connected to one after another for measurement
@@ -125,6 +255,9 @@ internal partial class AppController
 			var decision = DecideTarget(interfaceId, candidates, connected, engagesSpeed, GetLinkCheck(interfaceId));
 			if (decision is null)
 				return null;
+
+			if (decision.RecheckAfter.HasValue && (decision.Target is null))
+				ScheduleRecheck(interfaceId, decision.RecheckAfter.Value);
 
 			if (decision.RequestsLinkCheck && engagesSpeed)
 				CheckLink(interfaceId);
@@ -262,6 +395,11 @@ internal partial class AppController
 
 			var state = GetSwitchState(_switchStates, interfaceId);
 			var context = CreateSwitchContext(engagesSpeed, isLinkBusy);
+
+			// The interface may be on its way to a network chosen outside this app. The state of
+			// the interface is as of the load of the profiles and the notification covers the
+			// moments before and after it.
+			context.IsInterfaceBusy = candidates.Any(x => x.IsInterfaceBusy) || IsForeignConnecting(interfaceId);
 
 			SwitchPolicy.Track(state, connected?.Name, context.Now);
 

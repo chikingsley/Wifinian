@@ -77,6 +77,9 @@ public partial class MainWindow : Window
 	{
 		if (!e.Cancel)
 		{
+			// Closing this window (e.g. by Alt+F4) ends the app because it is the last window.
+			App.ExitReason ??= "The main window was closed";
+
 			Subscription.Dispose();
 			ViewModel.Dispose();
 		}

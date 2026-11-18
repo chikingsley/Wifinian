@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Cache;
 using System.Net.NetworkInformation;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -49,8 +50,25 @@ internal sealed class SpeedTester
 
 	private const int DownloadCount = 4;
 	private const int DownloadWarmup = 1000; // ms
-	private const int UploadCount = 2;
-	private const int UploadWarmup = 500; // ms
+	internal const int UploadCount = 3;
+	internal const int UploadWarmup = 1000; // ms
+
+	/// <summary>
+	/// Minimum time (ms) after warm-up over which upload speed is measured
+	/// </summary>
+	internal const int UploadMinWindow = 3000;
+
+	/// <summary>
+	/// Size of the send buffer of a socket for upload
+	/// </summary>
+	/// <remarks>
+	/// Uploaded bytes are counted when written to the socket. Bytes written but not sent yet stay
+	/// in this buffer and so it is kept small and fixed: once it is full, which happens within
+	/// warm-up, bytes can be written only as fast as they are sent and acknowledged. The default
+	/// buffer grows with the amount written and would let megabytes be counted as uploaded in
+	/// a moment, which made upload look several times faster than the link.
+	/// </remarks>
+	private const int UploadSendBuffer = 256 * 1024;
 
 	/// <summary>
 	/// Ratio of bytes received by the interface to downloaded bytes below which the download is
@@ -68,16 +86,20 @@ internal sealed class SpeedTester
 	/// </remarks>
 	private const double UploadRouteRatio = 0.5;
 
+	/// <summary>
+	/// Gets the caps of upload. The time includes warm-up and is long enough for the minimum
+	/// window after it regardless of the interval of sampling.
+	/// </summary>
+	internal static (int capTime, long capBytes) GetUploadCap(SpeedTestSize size) => size switch
+	{
+		SpeedTestSize.Full => (UploadWarmup + 5000 + 2 * SampleInterval, 80_000_000L),
+		_ => (UploadWarmup + UploadMinWindow + 2 * SampleInterval, 40_000_000L)
+	};
+
 	private static (int capTime, long capBytes) GetDownloadCap(SpeedTestSize size) => size switch
 	{
 		SpeedTestSize.Full => (8000, 50_000_000L),
 		_ => (5000, 20_000_000L)
-	};
-
-	private static (int capTime, long capBytes) GetUploadCap(SpeedTestSize size) => size switch
-	{
-		SpeedTestSize.Full => (4000, 10_000_000L),
-		_ => (3000, 5_000_000L)
 	};
 
 	#endregion
@@ -252,14 +274,12 @@ internal sealed class SpeedTester
 			var oldSent = LinkInspector.GetBytes(networkInterface).sent;
 			try
 			{
-				var upMbps = await TransferAsync(
-					(stop) => UploadAsync(uploadUri, Bind, uploadCounter, stop),
-					UploadCount,
+				var upMbps = await MeasureUploadAsync(
+					uploadUri,
+					localAddress,
 					uploadCounter,
-					UploadWarmup,
 					uploadCapTime,
 					uploadCapBytes,
-					() => LinkInspector.GetBytes(networkInterface).sent,
 					token).ConfigureAwait(false);
 
 				sample.UpMbps = (uploadCounter.Value > 0L) ? Round(upMbps, 2) : null;
@@ -275,9 +295,8 @@ internal sealed class SpeedTester
 				sample.UpBytes = uploadCounter.Value;
 			}
 
-			// The requests are not bound when the remote address is IPv6 and the interface has no
-			// global IPv6 address, or when binding failed. In such case, the upload may have gone
-			// through another interface.
+			// The upload is bound to the address of the interface. This check is for the case
+			// where the system routed it through another interface regardless.
 			if (sample.UpMbps.HasValue)
 			{
 				var sent = LinkInspector.GetBytes(networkInterface).sent - oldSent;
@@ -492,7 +511,7 @@ internal sealed class SpeedTester
 	/// <summary>
 	/// Counter of bytes shared by parallel transfers
 	/// </summary>
-	private sealed class Counter
+	internal sealed class Counter
 	{
 		private long _value;
 
@@ -512,6 +531,7 @@ internal sealed class SpeedTester
 	/// <param name="capBytes">Maximum bytes</param>
 	/// <param name="getAdapterBytes">Function to get the counter of the network interface</param>
 	/// <param name="token">Cancellation token</param>
+	/// <param name="minWindow">Minimum time (ms) over which the rate must be measured unless the cap of bytes is reached</param>
 	/// <returns>Rate (Mbps) if any byte is transferred, null otherwise</returns>
 	private static async Task<double?> TransferAsync(
 		Func<CancellationToken, Task> work,
@@ -521,7 +541,8 @@ internal sealed class SpeedTester
 		int capTime,
 		long capBytes,
 		Func<long> getAdapterBytes,
-		CancellationToken token)
+		CancellationToken token,
+		int minWindow = 0)
 	{
 		using var stop = CancellationTokenSource.CreateLinkedTokenSource(token);
 		var stopToken = stop.Token;
@@ -561,7 +582,7 @@ internal sealed class SpeedTester
 					break;
 			}
 
-			return GetRateMbps(points, warmupTime, isCapBytesReached);
+			return GetRateMbps(points, warmupTime, isCapBytesReached, minWindow);
 		}
 		finally
 		{
@@ -607,13 +628,14 @@ internal sealed class SpeedTester
 	/// <param name="points">Points in order of time, the first of which is at the first byte</param>
 	/// <param name="warmupTime">Time (ms) from the first byte to be discarded</param>
 	/// <param name="isCapBytesReached">Whether the transfer ended because of the cap of bytes</param>
+	/// <param name="minWindow">Minimum time (ms) over which the rate must be measured unless the cap of bytes is reached</param>
 	/// <returns>Rate (Mbps) if computable, null otherwise</returns>
 	/// <remarks>
 	/// The larger of the bytes of this measurement and those of the network interface is used
 	/// so that traffic of other applications during the measurement does not make the network
-	/// look slow.
+	/// look slow. Both are differences between the same two points and so nothing is counted twice.
 	/// </remarks>
-	internal static double? GetRateMbps(IReadOnlyList<RatePoint> points, int warmupTime, bool isCapBytesReached)
+	internal static double? GetRateMbps(IReadOnlyList<RatePoint> points, int warmupTime, bool isCapBytesReached, int minWindow = 0)
 	{
 		if (points is not { Count: >= 2 })
 			return null;
@@ -639,6 +661,11 @@ internal sealed class SpeedTester
 
 		var time = last.Time - start.Time;
 		if (time <= 0L)
+			return null;
+
+		// A rate over a window shorter than required is not reliable. A transfer ended by
+		// the cap of bytes is of a link so fast that the window cannot be longer.
+		if ((time < minWindow) && !isCapBytesReached)
 			return null;
 
 		var bytes = Math.Max(last.Bytes - start.Bytes, last.AdapterBytes - start.AdapterBytes);
@@ -717,60 +744,152 @@ internal sealed class SpeedTester
 		}
 	}
 
-	private static async Task UploadAsync(Uri uri, BindIPEndPoint bind, Counter counter, CancellationToken stop)
+	/// <summary>
+	/// Measures upload speed (Mbps) by sending random bytes to a URL through parallel connections.
+	/// </summary>
+	/// <param name="uri">URL which accepts a POST request</param>
+	/// <param name="localAddress">Local address to which the connections are bound (null not to bind)</param>
+	/// <param name="counter">Counter of bytes to which the uploaded bytes are added</param>
+	/// <param name="capTime">Maximum time (ms) from the first byte including warm-up</param>
+	/// <param name="capBytes">Maximum bytes</param>
+	/// <param name="token">Cancellation token</param>
+	/// <returns>Rate (Mbps) if measured over the minimum window, null otherwise</returns>
+	/// <remarks>
+	/// The rate is that of the bytes which left the send buffers of the sockets, which are small
+	/// and fixed, after warm-up. The counter of the network interface is not used because the
+	/// bytes of this measurement are already those actually sent.
+	/// </remarks>
+	internal static async Task<double?> MeasureUploadAsync(
+		Uri uri,
+		IPAddress localAddress,
+		Counter counter,
+		int capTime,
+		long capBytes,
+		CancellationToken token)
+	{
+		var remoteAddress = await ResolveAsync(uri.Host, token).ConfigureAwait(false);
+		if (remoteAddress is null)
+			return null;
+
+		return await TransferAsync(
+			(stop) => UploadAsync(uri, localAddress, remoteAddress, counter, stop),
+			UploadCount,
+			counter,
+			UploadWarmup,
+			capTime,
+			capBytes,
+			() => 0L,
+			token,
+			UploadMinWindow).ConfigureAwait(false);
+	}
+
+	private static async Task UploadAsync(Uri uri, IPAddress localAddress, IPAddress remoteAddress, Counter counter, CancellationToken stop)
 	{
 		try
 		{
-			var buffer = new byte[BufferSize];
-			new Random().NextBytes(buffer);
+			// A chunk of chunked transfer encoding: the size, the content and the end of line
+			var header = Encoding.ASCII.GetBytes(BufferSize.ToString("X") + "\r\n");
+			var chunk = new byte[header.Length + BufferSize + 2];
+			new Random().NextBytes(chunk);
+			Buffer.BlockCopy(header, 0, chunk, 0, header.Length);
+			chunk[chunk.Length - 2] = (byte)'\r';
+			chunk[chunk.Length - 1] = (byte)'\n';
 
-			var request = CreateRequest(uri, bind, RequestTimeout);
-			try
+			var host = uri.IsDefaultPort ? uri.Host : $"{uri.Host}:{uri.Port}";
+			var request = Encoding.ASCII.GetBytes(
+				$"POST {uri.PathAndQuery} HTTP/1.1\r\n"
+				+ $"Host: {host}\r\n"
+				+ $"User-Agent: {UserAgent}\r\n"
+				+ "Content-Type: application/octet-stream\r\n"
+				+ "Transfer-Encoding: chunked\r\n"
+				+ "Connection: close\r\n"
+				+ "\r\n");
+
+			// If the server ends a connection, another one is made.
+			while (!stop.IsCancellationRequested)
 			{
-				request.Method = "POST";
-				request.AllowWriteStreamBuffering = false;
-				request.SendChunked = true;
-				request.ContentType = "application/octet-stream";
+				long sent = 0L;
 
-				using var registration = stop.Register(() => Abort(request));
-
-				Stream stream;
-				using (new AbortScope(request, RequestTimeout, CancellationToken.None))
-				{
-					stream = await request.GetRequestStreamAsync().ConfigureAwait(false);
-				}
-
+				var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+				Stream stream = null;
 				try
 				{
+					socket.SendBufferSize = UploadSendBuffer;
+
+					if (localAddress is not null)
+						socket.Bind(new IPEndPoint(localAddress, 0));
+
+					// Closing the socket ends a pending write. The upload is ended without
+					// waiting for a response.
+					using var registration = stop.Register(() => Close(socket));
+
+					var connectTask = socket.ConnectAsync(remoteAddress, uri.Port);
+					if (!await WaitAsync(connectTask, RequestTimeout, stop).ConfigureAwait(false))
+						return;
+
+					await connectTask.ConfigureAwait(false);
+
+					stream = new NetworkStream(socket, false);
+
+					if (uri.Scheme == Uri.UriSchemeHttps)
+					{
+						var sslStream = new SslStream(stream, false);
+						stream = sslStream;
+
+						var authenticateTask = sslStream.AuthenticateAsClientAsync(uri.Host);
+						if (!await WaitAsync(authenticateTask, RequestTimeout, stop).ConfigureAwait(false))
+							return;
+
+						await authenticateTask.ConfigureAwait(false);
+					}
+
+					await stream.WriteAsync(request, 0, request.Length).ConfigureAwait(false);
+
 					while (!stop.IsCancellationRequested)
 					{
-						await stream.WriteAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
-						counter.Add(buffer.Length);
+						await stream.WriteAsync(chunk, 0, chunk.Length).ConfigureAwait(false);
+						counter.Add(BufferSize);
+						sent += BufferSize;
 					}
+				}
+				catch (Exception ex) when (ex is not OperationCanceledException)
+				{
+					// A closed socket comes here.
+					Debug.WriteLine($"Upload connection ended. {ex.Message}");
 				}
 				finally
 				{
-					// The request is aborted without waiting for a response.
-					Abort(request);
+					Close(socket);
 					try
 					{
-						stream.Dispose();
+						stream?.Dispose();
 					}
 					catch (Exception ex)
 					{
 						Debug.WriteLine($"Upload stream ended. {ex.Message}");
 					}
 				}
-			}
-			finally
-			{
-				CloseConnection(request);
+
+				if (sent == 0L)
+					return;
 			}
 		}
 		catch (Exception ex)
 		{
-			// An aborted request comes here.
 			Debug.WriteLine($"Upload ended. {ex.Message}");
+		}
+
+		static void Close(Socket socket)
+		{
+			try
+			{
+				// Bytes left in the send buffer are discarded.
+				socket.Close(0);
+			}
+			catch (Exception ex)
+			{
+				Debug.WriteLine($"Failed to close a socket. {ex.Message}");
+			}
 		}
 	}
 

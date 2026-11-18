@@ -29,7 +29,13 @@ public enum SpeedResult
 	EndpointFailed,
 	RouteMismatch,
 	Aborted,
-	Error
+	Error,
+
+	/// <summary>
+	/// The network could not be tested at all (it could not be connected to or gave no address)
+	/// </summary>
+	/// <remarks>This is not a finding on the speed of the network and so is never valid.</remarks>
+	NotTested
 }
 
 /// <summary>

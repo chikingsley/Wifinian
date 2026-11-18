@@ -73,6 +73,11 @@ internal partial class AppController
 			.Subscribe(async x => await MeasureConnectedAsync(SpeedTrigger.AfterConnect, x.InterfaceId))
 			.AddTo(this.Subscription);
 
+		// A connection made outside this app is not to be taken over by automatic connection.
+		connectionChanged
+			.Subscribe(x => TrackForeignConnect(x.InterfaceId, x.ChangedState))
+			.AddTo(this.Subscription);
+
 		// A measurement is no longer of the network when the connection of the interface changes.
 		connectionChanged
 			.Where(x => x.ChangedState is ConnectionChangedState.Started

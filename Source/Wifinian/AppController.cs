@@ -193,7 +193,11 @@ internal partial class AppController : DisposableBase
 		CloseCommand = new ReactiveProperty<bool>(true)
 			.ToReactiveCommand();
 		CloseCommand
-			.Subscribe(_ => _current.Shutdown())
+			.Subscribe(_ =>
+			{
+				App.ExitReason ??= "Close was chosen in the menu";
+				_current.Shutdown();
+			})
 			.AddTo(this.Subscription);
 
 		#endregion
@@ -977,7 +981,20 @@ internal partial class AppController : DisposableBase
 			ClearPendingSwitch(targetProfile.InterfaceId);
 		}
 
-		return WorkAsync(targetProfile, x => _worker.ConnectNetworkAsync(x, _connectTimeout));
+		return WorkAsync(targetProfile, async x =>
+		{
+			// The connection is marked as made by this app so that it is told from one made
+			// by the user or the system outside this app.
+			BeginOwnConnect(x.InterfaceId);
+			try
+			{
+				return await _worker.ConnectNetworkAsync(x, _connectTimeout);
+			}
+			finally
+			{
+				EndOwnConnect(x.InterfaceId);
+			}
+		});
 	}
 
 	public Task<bool> DisconnectNetworkAsync(ProfileItem targetProfile, bool isManual = true)

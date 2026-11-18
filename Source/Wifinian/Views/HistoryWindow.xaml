@@ -68,6 +68,36 @@
 			<Setter Property="Margin" Value="0,6,0,0"/>
 			<Setter Property="Foreground" Value="{StaticResource App.Foreground.Shadow}"/>
 		</Style>
+
+		<!-- The default tab is white, which does not fit the dark background of this window. -->
+		<Style TargetType="{x:Type TabItem}">
+			<Setter Property="Foreground" Value="{StaticResource App.Foreground.Shadow}"/>
+			<Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+			<Setter Property="Template">
+				<Setter.Value>
+					<ControlTemplate TargetType="{x:Type TabItem}">
+						<Border x:Name="border"
+								Margin="0,0,2,0" Padding="12,4"
+								Background="{StaticResource Grid.Header.Background}"
+								BorderBrush="{StaticResource Menu.Separator}"
+								BorderThickness="1,1,1,0"
+								SnapsToDevicePixels="True">
+							<ContentPresenter ContentSource="Header"
+											  HorizontalAlignment="Center" VerticalAlignment="Center"/>
+						</Border>
+						<ControlTemplate.Triggers>
+							<Trigger Property="IsMouseOver" Value="True">
+								<Setter TargetName="border" Property="Background" Value="{StaticResource Menu.Item.Background.MouseOver}"/>
+							</Trigger>
+							<Trigger Property="IsSelected" Value="True">
+								<Setter TargetName="border" Property="Background" Value="{StaticResource Text.Background.Writable}"/>
+								<Setter Property="Foreground" Value="{StaticResource App.Foreground}"/>
+							</Trigger>
+						</ControlTemplate.Triggers>
+					</ControlTemplate>
+				</Setter.Value>
+			</Setter>
+		</Style>
 	</Window.Resources>
 
 	<Grid Margin="8">
