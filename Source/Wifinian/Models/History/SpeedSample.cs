@@ -33,7 +33,7 @@ public enum SpeedResult
 }
 
 /// <summary>
-/// Speed sample of a wireless profile (a row of speed-yyyyMMdd.csv)
+/// Speed sample of a wireless profile (a row of speed table)
 /// </summary>
 internal class SpeedSample
 {
@@ -80,7 +80,7 @@ internal class SpeedSample
 	/// Whether this sample is a true finding on the network and so can be scored
 	/// </summary>
 	/// <remarks>
-	/// This value is written to the file for other readers but is always computed from the result.
+	/// This value is written to the database for other readers but is always computed from the result.
 	/// </remarks>
 	public bool Valid => Result is SpeedResult.Ok or SpeedResult.NoInternet or SpeedResult.CaptivePortal;
 

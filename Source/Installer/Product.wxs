@@ -105,6 +105,65 @@
               Source="$(var.Wifinian.TargetDir)" Name="System.ValueTuple.dll" KeyPath="yes"/>
       </Component>
 
+      <Component Id="BuffersLibrary" Guid="{F5CA87A2-8D6C-4557-8A87-66B6B25ED674}">
+        <File Id="BuffersLibrary"
+              Source="$(var.Wifinian.TargetDir)" Name="System.Buffers.dll" KeyPath="yes"/>
+      </Component>
+      <Component Id="MemoryLibrary" Guid="{FA924C8F-9F9D-48DD-B5D3-557B169A27E0}">
+        <File Id="MemoryLibrary"
+              Source="$(var.Wifinian.TargetDir)" Name="System.Memory.dll" KeyPath="yes"/>
+      </Component>
+      <Component Id="NumericsVectorsLibrary" Guid="{A68341F1-1CBB-4F75-B675-01F64A9CE0C1}">
+        <File Id="NumericsVectorsLibrary"
+              Source="$(var.Wifinian.TargetDir)" Name="System.Numerics.Vectors.dll" KeyPath="yes"/>
+      </Component>
+
+      <!-- SQLite (history database) -->
+      <Component Id="SqliteLibrary" Guid="{78FBE771-7313-4D51-B3DF-38E2DC26FB92}">
+        <File Id="SqliteLibrary"
+              Source="$(var.Wifinian.TargetDir)" Name="Microsoft.Data.Sqlite.dll" KeyPath="yes"/>
+      </Component>
+      <Component Id="SqliteRawCoreLibrary" Guid="{C22D9EE9-9660-40C4-8AA1-48AE05A178B6}">
+        <File Id="SqliteRawCoreLibrary"
+              Source="$(var.Wifinian.TargetDir)" Name="SQLitePCLRaw.core.dll" KeyPath="yes"/>
+      </Component>
+      <Component Id="SqliteRawBatteriesLibrary" Guid="{D3B8C148-46CB-4B6A-959F-51918A1A57B1}">
+        <File Id="SqliteRawBatteriesLibrary"
+              Source="$(var.Wifinian.TargetDir)" Name="SQLitePCLRaw.batteries_v2.dll" KeyPath="yes"/>
+      </Component>
+      <Component Id="SqliteRawProviderLibrary" Guid="{20D74DCE-B72B-4AAD-87B8-CD0C6E690C77}">
+        <File Id="SqliteRawProviderLibrary"
+              Source="$(var.Wifinian.TargetDir)" Name="SQLitePCLRaw.provider.dynamic_cdecl.dll" KeyPath="yes"/>
+      </Component>
+
+      <!-- Native libraries of SQLite, found by the architecture of the process -->
+      <Directory Id="RuntimesFolder" Name="runtimes">
+        <Directory Id="RuntimesX86Folder" Name="win-x86">
+          <Directory Id="RuntimesX86NativeFolder" Name="native">
+            <Component Id="SqliteNativeX86Library" Guid="{8A5CBE3D-29DC-4F07-8D62-3DF78A7838D6}">
+              <File Id="SqliteNativeX86Library"
+                    Source="$(var.Wifinian.TargetDir)runtimes\win-x86\native\" Name="e_sqlite3.dll" KeyPath="yes"/>
+            </Component>
+          </Directory>
+        </Directory>
+        <Directory Id="RuntimesX64Folder" Name="win-x64">
+          <Directory Id="RuntimesX64NativeFolder" Name="native">
+            <Component Id="SqliteNativeX64Library" Guid="{996A2424-DBDA-4BA8-86D7-9F25D6863F7B}">
+              <File Id="SqliteNativeX64Library"
+                    Source="$(var.Wifinian.TargetDir)runtimes\win-x64\native\" Name="e_sqlite3.dll" KeyPath="yes"/>
+            </Component>
+          </Directory>
+        </Directory>
+        <Directory Id="RuntimesArm64Folder" Name="win-arm64">
+          <Directory Id="RuntimesArm64NativeFolder" Name="native">
+            <Component Id="SqliteNativeArm64Library" Guid="{33BE9E49-4D42-4D1F-95AE-4C9AD6484169}">
+              <File Id="SqliteNativeArm64Library"
+                    Source="$(var.Wifinian.TargetDir)runtimes\win-arm64\native\" Name="e_sqlite3.dll" KeyPath="yes"/>
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+
       <Component Id="WifiLibrary" Guid="{50B8A962-E276-4DF8-8737-A1BE78B33153}">
         <File Id="WifiLibrary"
               Source="$(var.Wifinian.TargetDir)" Name="ManagedNativeWifi.dll" KeyPath="yes"/>
@@ -169,6 +228,16 @@
       <ComponentRef Id="RuntimeCompilerServicesUnsafeLibrary"/>
       <ComponentRef Id="ThreadingTasksExtensionsLibrary"/>
       <ComponentRef Id="ValueTupleLibrary"/>
+      <ComponentRef Id="BuffersLibrary"/>
+      <ComponentRef Id="MemoryLibrary"/>
+      <ComponentRef Id="NumericsVectorsLibrary"/>
+      <ComponentRef Id="SqliteLibrary"/>
+      <ComponentRef Id="SqliteRawCoreLibrary"/>
+      <ComponentRef Id="SqliteRawBatteriesLibrary"/>
+      <ComponentRef Id="SqliteRawProviderLibrary"/>
+      <ComponentRef Id="SqliteNativeX86Library"/>
+      <ComponentRef Id="SqliteNativeX64Library"/>
+      <ComponentRef Id="SqliteNativeArm64Library"/>
       <ComponentRef Id="WifiLibrary"/>
       <ComponentRef Id="FrameLibrary"/>
       <ComponentRef Id="AgencyLibrary"/>

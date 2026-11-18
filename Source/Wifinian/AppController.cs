@@ -74,7 +74,7 @@ internal partial class AppController : DisposableBase
 		WindowPainter = new WindowPainter();
 
 		this._worker = worker;
-		History = new HistoryService(AppDataService.HistoryFolderPath);
+		History = new HistoryService(AppDataService.HistoryFilePath);
 
 		IsUpdating = new BooleanNotifier();
 		IsWorking = new BooleanNotifier();
@@ -663,7 +663,7 @@ internal partial class AppController : DisposableBase
 	}
 
 	/// <summary>
-	/// Purges old history files once a day.
+	/// Purges old history once a day, after importing the files of previous versions at the first time.
 	/// </summary>
 	private async Task PurgeHistoryAsync()
 	{
@@ -681,7 +681,12 @@ internal partial class AppController : DisposableBase
 
 			var retentionDays = Settings.Current.HistoryRetentionDays;
 
-			await Task.Run(() => History.Purge(retentionDays));
+			await Task.Run(() =>
+			{
+				// The import is recorded in the database and so does nothing from the second time.
+				History.ImportCsv(AppDataService.HistoryFolderPath);
+				History.Purge(retentionDays);
+			});
 		}
 		catch (Exception ex)
 		{

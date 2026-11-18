@@ -18,7 +18,7 @@ public enum SwitchKind
 }
 
 /// <summary>
-/// Switching event or decision (a row of events-yyyyMMdd.csv)
+/// Switching event or decision (a row of events table)
 /// </summary>
 internal class SwitchEvent
 {

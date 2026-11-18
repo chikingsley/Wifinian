@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using Microsoft.Data.Sqlite;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
 using Wifinian.Models.History;
@@ -18,12 +19,16 @@ public class HistoryServiceTest
 	private static readonly DateTime _start = new DateTime(2026, 11, 17, 10, 0, 0, DateTimeKind.Utc);
 
 	private string _folderPath;
+	private string _filePath;
+	private string _csvFolderPath;
 	private DateTime _now;
 
 	[TestInitialize]
 	public void Initialize()
 	{
 		_folderPath = Path.Combine(Path.GetTempPath(), "WifinianTest-" + Guid.NewGuid().ToString("N"));
+		_filePath = Path.Combine(_folderPath, "history.db");
+		_csvFolderPath = Path.Combine(_folderPath, "history");
 		_now = _start;
 	}
 
@@ -379,235 +384,604 @@ public class HistoryServiceTest
 
 	#endregion
 
-	#region File
+	#region Database
 
 	[TestMethod]
-	public void TestFilesRollOverByUtcDate()
+	public void TestDatabaseRoundTrip()
 	{
-		using var history = CreateHistory();
-
 		var beforeMidnight = new DateTime(2026, 11, 17, 23, 59, 30, DateTimeKind.Utc);
 		var afterMidnight = new DateTime(2026, 11, 18, 0, 0, 30, DateTimeKind.Utc);
 
-		history.AppendSignals(new[] { CreateSignal(beforeMidnight, "Office", 50) });
-		history.AppendSignals(new[] { CreateSignal(afterMidnight, "Office", 60) });
-		history.AppendSpeed(CreateSpeed(beforeMidnight, "Office", SpeedResult.Ok, 70));
-		history.AppendSpeed(CreateSpeed(afterMidnight, "Office", SpeedResult.Ok, 71));
-		history.AppendEvent(CreateEvent(beforeMidnight, "first"));
-		history.AppendEvent(CreateEvent(afterMidnight, "second"));
+		var signal = CreateSignal(beforeMidnight, TrickyName, 50, connected: true);
+		var speed = CreateSpeed(beforeMidnight, TrickyName, SpeedResult.Ok, 70.25);
+		var switchEvent = new SwitchEvent { Time = beforeMidnight, InterfaceId = _interfaceId, Kind = SwitchKind.WouldSwitch, From = TrickyName, To = "EXT", FromScore = 8.1, ToScore = null, Reason = "a, \"b\"\r\nc" };
 
-		var names = Directory.GetFiles(_folderPath).Select(x => Path.GetFileName(x)).OrderBy(x => x).ToArray();
-		CollectionAssert.AreEqual(new[]
+		using (var history = CreateHistory())
 		{
-			"events-20261117.csv",
-			"events-20261118.csv",
-			"signal-20261117.csv",
-			"signal-20261118.csv",
-			"speed-20261117.csv",
-			"speed-20261118.csv"
-		}, names);
+			history.AppendSignals(new[] { signal });
+			history.AppendSignals(new[] { CreateSignal(afterMidnight, "Office", 60) });
+			history.AppendSpeed(speed);
+			history.AppendSpeed(new SpeedSample { Time = afterMidnight, InterfaceId = _interfaceId, Profile = "Office", Result = SpeedResult.Error, Trigger = SpeedTrigger.Manual, DownMbps = double.NaN });
+			history.AppendEvent(switchEvent);
+			history.AppendEvent(CreateEvent(afterMidnight, "second"));
+		}
 
-		// Header and line ends
-		var bytes = File.ReadAllBytes(Path.Combine(_folderPath, "speed-20261117.csv"));
-		Assert.AreNotEqual(0xEF, bytes[0]); // No BOM
-		var text = Encoding.UTF8.GetString(bytes);
-		var lines = text.Split(new[] { "\r\n" }, StringSplitOptions.None);
-		Assert.AreEqual(3, lines.Length); // Header, row and empty string after the last line end
-		Assert.AreEqual("Time,InterfaceId,Profile,Bssid,Band,Channel,Signal,LinkRate,GatewayMs,LatencyMs,JitterMs,DownMbps,UpMbps,DownBytes,UpBytes,DurationMs,Trigger,Result,Valid", lines[0]);
-		Assert.IsTrue(lines[1].StartsWith("2026-11-17T23:59:30Z,11111111-2222-3333-4444-555555555555,Office,"));
-		Assert.IsTrue(lines[1].EndsWith(",Periodic,Ok,1"));
-		Assert.AreEqual("", lines[2]);
+		Assert.IsTrue(File.Exists(_filePath));
 
-		Assert.AreEqual(SignalSample.Header, File.ReadAllLines(Path.Combine(_folderPath, "signal-20261117.csv"))[0]);
-		Assert.AreEqual(SwitchEvent.Header, File.ReadAllLines(Path.Combine(_folderPath, "events-20261117.csv"))[0]);
+		// The write-ahead log is merged when the database is closed.
+		Assert.IsFalse(File.Exists(_filePath + "-wal"));
 
-		// Time range
-		Assert.AreEqual(2, history.ReadSpeeds(beforeMidnight, afterMidnight).Count);
-		Assert.AreEqual(1, history.ReadSpeeds(beforeMidnight, beforeMidnight.AddSeconds(10)).Count);
-		Assert.AreEqual(71D, history.ReadSpeeds(afterMidnight, afterMidnight).Single().DownMbps);
-		Assert.AreEqual(0, history.ReadSpeeds(afterMidnight.AddSeconds(1), afterMidnight.AddDays(1)).Count);
-		Assert.AreEqual(0, history.ReadSpeeds(afterMidnight, beforeMidnight).Count);
-		Assert.AreEqual(60, history.ReadSignals(afterMidnight, afterMidnight.AddHours(1)).Single().Signal);
-		CollectionAssert.AreEqual(new[] { "first", "second" }, history.ReadEvents(DateTime.MinValue, DateTime.MaxValue).Select(x => x.Reason).ToArray());
+		using (var history = CreateHistory())
+		{
+			var signals = history.ReadSignals(DateTime.MinValue, DateTime.MaxValue);
+			Assert.AreEqual(2, signals.Count);
+			Assert.AreEqual(signal.Time, signals[0].Time);
+			Assert.AreEqual(DateTimeKind.Utc, signals[0].Time.Kind);
+			Assert.AreEqual(signal.InterfaceId, signals[0].InterfaceId);
+			Assert.AreEqual(signal.Profile, signals[0].Profile);
+			Assert.AreEqual(signal.Connected, signals[0].Connected);
+			Assert.AreEqual(signal.Signal, signals[0].Signal);
+			Assert.AreEqual(signal.Rssi, signals[0].Rssi);
+			Assert.AreEqual(signal.Band, signals[0].Band);
+			Assert.AreEqual(signal.Channel, signals[0].Channel);
+			Assert.AreEqual(signal.Protocol, signals[0].Protocol);
+			Assert.AreEqual(signal.Bssid, signals[0].Bssid);
+			Assert.AreEqual(signal.LinkRate, signals[0].LinkRate);
+			Assert.AreEqual(signal.Key, signals[0].Key);
+			Assert.IsFalse(signals[1].Connected);
+			Assert.IsNull(signals[1].LinkRate);
+
+			var speeds = history.ReadSpeeds(DateTime.MinValue, DateTime.MaxValue);
+			Assert.AreEqual(2, speeds.Count);
+			Assert.AreEqual(speed.Time, speeds[0].Time);
+			Assert.AreEqual(speed.InterfaceId, speeds[0].InterfaceId);
+			Assert.AreEqual(speed.Profile, speeds[0].Profile);
+			Assert.AreEqual(speed.Bssid, speeds[0].Bssid);
+			Assert.AreEqual(speed.Band, speeds[0].Band);
+			Assert.AreEqual(speed.Channel, speeds[0].Channel);
+			Assert.AreEqual(speed.Signal, speeds[0].Signal);
+			Assert.AreEqual(speed.LinkRate, speeds[0].LinkRate);
+			Assert.AreEqual(speed.GatewayMs, speeds[0].GatewayMs);
+			Assert.AreEqual(speed.LatencyMs, speeds[0].LatencyMs);
+			Assert.AreEqual(speed.JitterMs, speeds[0].JitterMs);
+			Assert.AreEqual(speed.DownMbps, speeds[0].DownMbps);
+			Assert.AreEqual(speed.UpMbps, speeds[0].UpMbps);
+			Assert.AreEqual(speed.DownBytes, speeds[0].DownBytes);
+			Assert.AreEqual(speed.UpBytes, speeds[0].UpBytes);
+			Assert.AreEqual(speed.DurationMs, speeds[0].DurationMs);
+			Assert.AreEqual(speed.Trigger, speeds[0].Trigger);
+			Assert.AreEqual(speed.Result, speeds[0].Result);
+			Assert.IsTrue(speeds[0].Valid);
+
+			// Unknown values
+			Assert.AreEqual(SpeedResult.Error, speeds[1].Result);
+			Assert.AreEqual(SpeedTrigger.Manual, speeds[1].Trigger);
+			Assert.IsFalse(speeds[1].Valid);
+			Assert.IsNull(speeds[1].DownMbps);
+			Assert.IsNull(speeds[1].LinkRate);
+			Assert.AreEqual("", speeds[1].Bssid);
+
+			var switchEvents = history.ReadEvents(DateTime.MinValue, DateTime.MaxValue);
+			Assert.AreEqual(2, switchEvents.Count);
+			Assert.AreEqual(switchEvent.Time, switchEvents[0].Time);
+			Assert.AreEqual(switchEvent.InterfaceId, switchEvents[0].InterfaceId);
+			Assert.AreEqual(switchEvent.Kind, switchEvents[0].Kind);
+			Assert.AreEqual(switchEvent.From, switchEvents[0].From);
+			Assert.AreEqual(switchEvent.To, switchEvents[0].To);
+			Assert.AreEqual(switchEvent.FromScore, switchEvents[0].FromScore);
+			Assert.IsNull(switchEvents[0].ToScore);
+			Assert.AreEqual("a, \"b\"\r\nc", switchEvents[0].Reason); // Line breaks are kept in the database.
+			Assert.AreEqual("second", switchEvents[1].Reason);
+
+			// Time range
+			Assert.AreEqual(2, history.ReadSpeeds(beforeMidnight, afterMidnight).Count);
+			Assert.AreEqual(1, history.ReadSpeeds(beforeMidnight, beforeMidnight.AddSeconds(10)).Count);
+			Assert.AreEqual(1, history.ReadSpeeds(beforeMidnight.AddMilliseconds(-1), beforeMidnight.AddMilliseconds(1)).Count);
+			Assert.AreEqual(0, history.ReadSpeeds(beforeMidnight.AddMilliseconds(1), afterMidnight.AddMilliseconds(-1)).Count);
+			Assert.AreEqual(SpeedResult.Error, history.ReadSpeeds(afterMidnight, afterMidnight).Single().Result);
+			Assert.AreEqual(0, history.ReadSpeeds(afterMidnight.AddSeconds(1), afterMidnight.AddDays(1)).Count);
+			Assert.AreEqual(0, history.ReadSpeeds(afterMidnight, beforeMidnight).Count);
+			Assert.AreEqual(60, history.ReadSignals(afterMidnight, afterMidnight.AddHours(1)).Single().Signal);
+			Assert.AreEqual("second", history.ReadEvents(afterMidnight.ToLocalTime(), afterMidnight.ToLocalTime()).Single().Reason);
+
+			Assert.AreEqual(70.25, history.GetSummary(HistoryService.GetKey(TrickyName, _interfaceId)).DownMbps);
+		}
+
+		// Schema
+		using var connection = OpenDatabase();
+
+		Assert.AreEqual((long)HistoryService.SchemaVersion, Query(connection, "PRAGMA user_version;").Single());
+		Assert.AreEqual("wal", Query(connection, "PRAGMA journal_mode;").Single());
+
+		CollectionAssert.AreEqual(new object[] { "events", "meta", "signal", "speed" },
+			Query(connection, "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;"));
+		CollectionAssert.AreEqual(new object[]
+		{
+			"ix_events_profile_time",
+			"ix_events_time",
+			"ix_signal_profile_time",
+			"ix_signal_time",
+			"ix_speed_profile_time",
+			"ix_speed_time"
+		}, Query(connection, "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'ix_%' ORDER BY name;"));
+
+		// Typed columns and time as UTC ISO 8601 text
+		CollectionAssert.AreEqual(new object[] { "2026-11-17T23:59:30Z", "2026-11-18T00:00:30Z" },
+			Query(connection, "SELECT time FROM speed ORDER BY id;"));
+		CollectionAssert.AreEqual(new object[] { "text", "text", "real", "integer", "real", "integer", "text", "integer" },
+			Query(connection, "SELECT typeof(time), typeof(interface_id), typeof(band), typeof(link_rate), typeof(down_mbps), typeof(down_bytes), typeof(result), typeof(valid) FROM speed WHERE id = 1;"));
+		CollectionAssert.AreEqual(new object[] { "null", "null" },
+			Query(connection, "SELECT typeof(link_rate), typeof(down_mbps) FROM speed WHERE id = 2;"));
+		Assert.AreEqual(2.4, Query(connection, "SELECT band FROM signal WHERE id = 1;").Single());
+		Assert.AreEqual("11111111-2222-3333-4444-555555555555", Query(connection, "SELECT interface_id FROM events WHERE id = 1;").Single());
 	}
 
 	[TestMethod]
-	public void TestTrickyNameThroughFile()
-	{
-		using var history = CreateHistory();
-
-		history.AppendSpeed(CreateSpeed(_start, TrickyName, SpeedResult.Ok, 12.5));
-		history.AppendEvent(new SwitchEvent { Time = _start, InterfaceId = _interfaceId, Kind = SwitchKind.Switch, From = TrickyName, To = "EXT", Reason = "a, \"b\"" });
-
-		Assert.AreEqual(TrickyName, history.ReadSpeeds(_start, _start).Single().Profile);
-		Assert.AreEqual(12.5, history.GetSummary(HistoryService.GetKey(TrickyName, _interfaceId)).DownMbps);
-
-		var switchEvent = history.ReadEvents(_start, _start).Single();
-		Assert.AreEqual(TrickyName, switchEvent.From);
-		Assert.AreEqual("a, \"b\"", switchEvent.Reason);
-	}
-
-	[TestMethod]
-	public void TestLineBreakThroughFile()
-	{
-		using var history = CreateHistory();
-
-		history.AppendEvent(new SwitchEvent { Time = _start, InterfaceId = _interfaceId, Kind = SwitchKind.Switch, From = "Off\nice", To = "EXT", Reason = "a\r\nb" });
-		history.AppendEvent(CreateEvent(_start.AddMinutes(1), "next"));
-
-		// Header and two rows, each in a single line
-		Assert.AreEqual(3, File.ReadAllLines(Path.Combine(_folderPath, "events-20261117.csv")).Length);
-
-		var switchEvents = history.ReadEvents(_start, _start.AddHours(1));
-		Assert.AreEqual(2, switchEvents.Count);
-		Assert.AreEqual("Off ice", switchEvents[0].From);
-		Assert.AreEqual("a b", switchEvents[0].Reason);
-		Assert.AreEqual("next", switchEvents[1].Reason);
-	}
-
-	[TestMethod]
-	public void TestReadSpeedsToleratesMalformedFile()
-	{
-		Directory.CreateDirectory(_folderPath);
-		var filePath = Path.Combine(_folderPath, "speed-20261117.csv");
-
-		// Extra unknown column, missing optional columns, a malformed line, an unterminated quote
-		// and a truncated last line without line end
-		File.WriteAllText(filePath,
-			"Time,InterfaceId,Profile,Comment,DownMbps,Result,Valid\r\n" +
-			$"2026-11-17T08:00:00Z,{_interfaceId},Office,hello,70.5,Ok,1\r\n" +
-			"this is not a row\r\n" +
-			$"2026-11-17T08:30:00Z,{_interfaceId},\"Office,broken,1.0,Ok,1\r\n" +
-			$"2026-11-17T09:00:00Z,{_interfaceId},EXT,\"a,b\",77.0,Ok,1\r\n" +
-			"2026-11-17T09:30:00Z,11111111-2222-33",
-			new UTF8Encoding(false));
-
-		using var history = CreateHistory();
-
-		var speeds = history.ReadSpeeds(_start.AddDays(-1), _start);
-		Assert.AreEqual(2, speeds.Count);
-		Assert.AreEqual("Office", speeds[0].Profile);
-		Assert.AreEqual(70.5, speeds[0].DownMbps);
-		Assert.IsNull(speeds[0].UpMbps);
-		Assert.AreEqual("EXT", speeds[1].Profile);
-		Assert.AreEqual(77D, speeds[1].DownMbps);
-
-		// The samples are loaded at construction as well.
-		Assert.AreEqual(70.5, history.GetSummary(HistoryService.GetKey("Office", _interfaceId)).DownMbps);
-
-		// A new row starts on a new line after the truncated line.
-		history.AppendSpeed(CreateSpeed(_start, "Office", SpeedResult.Ok, 60));
-
-		var text = File.ReadAllText(filePath);
-		Assert.IsTrue(text.Contains("2026-11-17T09:30:00Z,11111111-2222-33\r\n2026-11-17T10:00:00Z,"));
-		Assert.IsTrue(text.EndsWith("\r\n"));
-
-		speeds = history.ReadSpeeds(_start.AddDays(-1), _start);
-		Assert.AreEqual(3, speeds.Count);
-		Assert.AreEqual(60D, speeds[2].DownMbps);
-		Assert.AreEqual("Office", speeds[2].Profile);
-	}
-
-	[TestMethod]
-	public void TestRowsAreKeptWhileFileIsLocked()
+	public void TestRowsAreKeptWhileDatabaseIsLocked()
 	{
 		using var history = CreateHistory();
 
 		history.AppendEvent(CreateEvent(_start, "first"));
 
-		int changedCount = 0;
-		history.Changed += (_, _) => changedCount++;
-
-		var filePath = Path.Combine(_folderPath, "events-20261117.csv");
-		using (new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-		{
-			history.AppendEvent(CreateEvent(_start.AddMinutes(1), "second"));
-			history.AppendEvent(CreateEvent(_start.AddMinutes(2), "third"));
-		}
-
-		Assert.AreEqual(0, changedCount);
-		Assert.AreEqual(1, history.ReadEvents(_start, _start.AddHours(1)).Count);
-
-		history.AppendEvent(CreateEvent(_start.AddMinutes(3), "fourth"));
-
-		Assert.AreEqual(1, changedCount);
-		CollectionAssert.AreEqual(new[] { "first", "second", "third", "fourth" },
-			history.ReadEvents(_start, _start.AddHours(1)).Select(x => x.Reason).ToArray());
-		Assert.AreEqual(5, File.ReadAllLines(filePath).Length);
-	}
-
-	[TestMethod]
-	public void TestLockedFileDoesNotBlockOtherFiles()
-	{
-		using var history = CreateHistory();
-
-		history.AppendSpeed(CreateSpeed(_start, "Office", SpeedResult.Ok, 70));
-
 		var changedKinds = new List<HistoryKind>();
 		history.Changed += (_, kind) => changedKinds.Add(kind);
 
-		var speedPath = Path.Combine(_folderPath, "speed-20261117.csv");
-		using (new FileStream(speedPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+		// Another process is writing to the database.
+		using (var connection = OpenDatabase())
 		{
-			history.AppendSpeed(CreateSpeed(_start.AddMinutes(1), "Office", SpeedResult.Ok, 71));
-			history.AppendEvent(CreateEvent(_start.AddMinutes(2), "event"));
-			history.AppendSignals(new[] { CreateSignal(_start.AddMinutes(3), "Office", 50) });
-			history.AppendSpeed(CreateSpeed(_start.AddMinutes(4), "Office", SpeedResult.Ok, 72));
+			Execute(connection, "BEGIN IMMEDIATE;");
 
-			// The rows of other files are written while the speed file is locked.
-			Assert.AreEqual("event", history.ReadEvents(_start, _start.AddHours(1)).Single().Reason);
-			Assert.AreEqual(50, history.ReadSignals(_start, _start.AddHours(1)).Single().Signal);
-			CollectionAssert.AreEqual(new[] { HistoryKind.Speed, HistoryKind.Event, HistoryKind.Signal, HistoryKind.Speed }, changedKinds);
+			history.AppendEvent(CreateEvent(_start.AddMinutes(1), "second"));
+			history.AppendSpeed(CreateSpeed(_start.AddMinutes(2), "Office", SpeedResult.Ok, 71));
+			history.AppendSignals(new[] { CreateSignal(_start.AddMinutes(3), "Office", 50) });
+
+			// A speed sample is held in memory and notified even if it could not be written.
+			CollectionAssert.AreEqual(new[] { HistoryKind.Speed }, changedKinds);
+			Assert.AreEqual(71D, history.GetSummary(HistoryService.GetKey("Office", _interfaceId)).DownMbps);
+
+			// Reading is not blocked.
+			Assert.AreEqual("first", history.ReadEvents(_start, _start.AddHours(1)).Single().Reason);
+			Assert.AreEqual(0, history.ReadSpeeds(_start, _start.AddHours(1)).Count);
+
+			Execute(connection, "ROLLBACK;");
 		}
 
-		Assert.AreEqual(1, history.ReadSpeeds(_start, _start.AddHours(1)).Count);
-
 		// The held rows are written in order by the next append of any kind, only once.
-		history.AppendEvent(CreateEvent(_start.AddMinutes(5), "later"));
+		history.AppendEvent(CreateEvent(_start.AddMinutes(4), "fourth"));
 
-		CollectionAssert.AreEqual(new double?[] { 70, 71, 72 },
-			history.ReadSpeeds(_start, _start.AddHours(1)).Select(x => x.DownMbps).ToArray());
-		Assert.AreEqual(4, File.ReadAllLines(speedPath).Length);
+		CollectionAssert.AreEqual(new[] { HistoryKind.Speed, HistoryKind.Event }, changedKinds);
+		CollectionAssert.AreEqual(new[] { "first", "second", "fourth" },
+			history.ReadEvents(_start, _start.AddHours(1)).Select(x => x.Reason).ToArray());
+		Assert.AreEqual(71D, history.ReadSpeeds(_start, _start.AddHours(1)).Single().DownMbps);
+		Assert.AreEqual(50, history.ReadSignals(_start, _start.AddHours(1)).Single().Signal);
 
-		history.AppendEvent(CreateEvent(_start.AddMinutes(6), "last"));
+		history.AppendEvent(CreateEvent(_start.AddMinutes(5), "last"));
 
-		Assert.AreEqual(4, File.ReadAllLines(speedPath).Length);
-		Assert.AreEqual(3, history.ReadEvents(_start, _start.AddHours(1)).Count);
-		Assert.AreEqual(4, File.ReadAllLines(Path.Combine(_folderPath, "events-20261117.csv")).Length);
-		Assert.AreEqual(2, File.ReadAllLines(Path.Combine(_folderPath, "signal-20261117.csv")).Length);
+		Assert.AreEqual(4, history.ReadEvents(_start, _start.AddHours(1)).Count);
+		Assert.AreEqual(1, history.ReadSpeeds(_start, _start.AddHours(1)).Count);
+		Assert.AreEqual(1, history.ReadSignals(_start, _start.AddHours(1)).Count);
 	}
 
 	[TestMethod]
-	public void TestPurgeRemovesOnlyOldFiles()
+	public void TestHeldRowsAreBoundedAndWrittenWhenDisposed()
+	{
+		const int excess = 10;
+
+		using (var history = CreateHistory())
+		{
+			history.AppendEvent(CreateEvent(_start, "first"));
+
+			using (var connection = OpenDatabase())
+			{
+				Execute(connection, "BEGIN IMMEDIATE;");
+
+				// Each sample is the first one of its profile and so is to be written.
+				history.AppendSignals(Enumerable.Range(0, HistoryService.MaxPendingCount + excess)
+					.Select(x => CreateSignal(_start.AddSeconds(x), $"Network {x}", 50)));
+
+				Execute(connection, "ROLLBACK;");
+			}
+
+			Assert.AreEqual(0, history.ReadSignals(_start, _start.AddDays(1)).Count);
+		}
+
+		// The held rows, oldest dropped, are written when the instance is disposed.
+		using (var history = CreateHistory())
+		{
+			var signals = history.ReadSignals(_start, _start.AddDays(1));
+			Assert.AreEqual(HistoryService.MaxPendingCount, signals.Count);
+			Assert.AreEqual($"Network {excess}", signals[0].Profile);
+			Assert.AreEqual($"Network {HistoryService.MaxPendingCount + excess - 1}", signals.Last().Profile);
+		}
+	}
+
+	[TestMethod]
+	public void TestPurgeDeletesOnlyOldRows()
 	{
 		using var history = CreateHistory();
 
 		history.AppendSignals(new[] { CreateSignal(_start.AddDays(-8), "Office", 50) });
 		history.AppendSpeed(CreateSpeed(_start.AddDays(-8), "Office", SpeedResult.Ok, 70));
 		history.AppendEvent(CreateEvent(_start.AddDays(-8), "old"));
-		history.AppendSignals(new[] { CreateSignal(_start.AddDays(-7), "Office", 60) });
-		history.AppendSpeed(CreateSpeed(_start.AddDays(-7), "Office", SpeedResult.Ok, 70));
+		history.AppendSignals(new[] { CreateSignal(_start.Date.AddDays(-7), "Office", 60) }); // Midnight of the oldest day kept
+		history.AppendSpeed(CreateSpeed(_start.AddDays(-7), "Office", SpeedResult.Ok, 71));
+		history.AppendEvent(CreateEvent(_start.Date.AddDays(-7).AddSeconds(-1), "just before"));
 		history.AppendEvent(CreateEvent(_start, "new"));
 
-		var otherPath = Path.Combine(_folderPath, "notes-20200101.csv");
-		File.WriteAllText(otherPath, "other");
-		var unnamedPath = Path.Combine(_folderPath, "speed-backup.csv");
-		File.WriteAllText(unnamedPath, "other");
-
 		history.Purge(0); // Ignored
-		Assert.AreEqual(8, Directory.GetFiles(_folderPath).Length);
+		Assert.AreEqual(2, history.ReadSignals(DateTime.MinValue, DateTime.MaxValue).Count);
+		Assert.AreEqual(2, history.ReadSpeeds(DateTime.MinValue, DateTime.MaxValue).Count);
+		Assert.AreEqual(3, history.ReadEvents(DateTime.MinValue, DateTime.MaxValue).Count);
 
 		history.Purge(7);
 
-		var names = Directory.GetFiles(_folderPath).Select(x => Path.GetFileName(x)).OrderBy(x => x).ToArray();
+		Assert.AreEqual(60, history.ReadSignals(DateTime.MinValue, DateTime.MaxValue).Single().Signal);
+		Assert.AreEqual(71D, history.ReadSpeeds(DateTime.MinValue, DateTime.MaxValue).Single().DownMbps);
+		Assert.AreEqual("new", history.ReadEvents(DateTime.MinValue, DateTime.MaxValue).Single().Reason);
+
+		// Appending works after purging.
+		history.AppendEvent(CreateEvent(_start.AddMinutes(1), "newer"));
+		Assert.AreEqual(2, history.ReadEvents(DateTime.MinValue, DateTime.MaxValue).Count);
+	}
+
+	[TestMethod]
+	public void TestRenameMovesRows()
+	{
+		var oldKey = HistoryService.GetKey(TrickyName, _interfaceId);
+		var newKey = HistoryService.GetKey("Office | 2", _interfaceId);
+		var otherId = Guid.NewGuid();
+
+		using (var history = CreateHistory())
+		{
+			history.AppendSignals(new[]
+			{
+				CreateSignal(_start, TrickyName, 50),
+				CreateSignal(_start, TrickyName, 40, interfaceId: otherId),
+				CreateSignal(_start, "EXT", 30)
+			});
+			history.AppendSpeed(CreateSpeed(_start, TrickyName, SpeedResult.Ok, 70));
+			history.AppendSpeed(CreateSpeed(_start, "EXT", SpeedResult.Ok, 80));
+			history.AppendEvent(new SwitchEvent { Time = _start, InterfaceId = _interfaceId, Kind = SwitchKind.Switch, From = "EXT", To = TrickyName });
+
+			history.Rename(oldKey, newKey);
+
+			Assert.AreEqual(0, history.GetSpeedSamples(oldKey).Count);
+			Assert.AreEqual("Office | 2", history.GetSpeedSamples(newKey).Single().Profile);
+
+			history.AppendSpeed(CreateSpeed(_start.AddMinutes(1), "Office | 2", SpeedResult.Ok, 90));
+			Assert.AreEqual(2, history.GetSummary(newKey).Count);
+		}
+
+		using (var history = CreateHistory())
+		{
+			// The rows of the same name on another interface and of other names are not moved.
+			CollectionAssert.AreEquivalent(new[] { "Office | 2|50", TrickyName + "|40", "EXT|30" },
+				history.ReadSignals(_start, _start).Select(x => $"{x.Profile}|{x.Signal}").ToArray());
+			CollectionAssert.AreEquivalent(new[] { "Office | 2", "EXT", "Office | 2" },
+				history.ReadSpeeds(_start, _start.AddHours(1)).Select(x => x.Profile).ToArray());
+
+			// Events are left as they were recorded.
+			Assert.AreEqual(TrickyName, history.ReadEvents(_start, _start).Single().To);
+
+			Assert.IsNull(history.GetSummary(oldKey));
+			Assert.AreEqual(2, history.GetSummary(newKey).Count);
+			Assert.AreEqual(1, history.GetSummary(HistoryService.GetKey("EXT", _interfaceId)).Count);
+		}
+	}
+
+	[TestMethod]
+	public void TestDatabaseOfNewerVersionIsUsed()
+	{
+		using (var history = CreateHistory())
+		{
+			history.AppendSpeed(CreateSpeed(_start, "Office", SpeedResult.Ok, 70));
+		}
+
+		// A newer version added a column and a table.
+		using (var connection = OpenDatabase())
+		{
+			Execute(connection, "ALTER TABLE speed ADD COLUMN extra TEXT; CREATE TABLE other (id INTEGER PRIMARY KEY); PRAGMA user_version = 99;");
+		}
+
+		using (var history = CreateHistory())
+		{
+			Assert.AreEqual(70D, history.GetSummary(HistoryService.GetKey("Office", _interfaceId)).DownMbps);
+
+			history.AppendSpeed(CreateSpeed(_start.AddMinutes(1), "Office", SpeedResult.Ok, 80));
+			Assert.AreEqual(2, history.ReadSpeeds(_start, _start.AddHours(1)).Count);
+		}
+
+		using (var connection = OpenDatabase())
+		{
+			Assert.AreEqual(99L, Query(connection, "PRAGMA user_version;").Single());
+		}
+	}
+
+	[TestMethod]
+	public void TestBrokenDatabaseDoesNotThrow()
+	{
+		Directory.CreateDirectory(_folderPath);
+		File.WriteAllText(_filePath, new string('x', 5000));
+
+		using var history = CreateHistory();
+
+		history.AppendEvent(CreateEvent(_start, "event"));
+		history.AppendSpeed(CreateSpeed(_start, "Office", SpeedResult.Ok, 70));
+		history.Purge(7);
+		history.Rename(HistoryService.GetKey("Office", _interfaceId), HistoryService.GetKey("Office 2", _interfaceId));
+
+		Assert.AreEqual(0, history.ReadEvents(_start, _start).Count);
+		Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
+		Assert.AreEqual(0, history.ExportCsv(Path.Combine(_filePath, "export"), _start, _start).Count);
+
+		// The speed sample is still held in memory.
+		Assert.AreEqual(70D, history.GetSummary(HistoryService.GetKey("Office 2", _interfaceId)).DownMbps);
+	}
+
+	#endregion
+
+	#region Import/Export
+
+	[TestMethod]
+	public void TestImportCsv()
+	{
+		WriteCsvFiles();
+
+		// Files which are not to be imported
+		File.WriteAllText(Path.Combine(_csvFolderPath, "notes-20261117.csv"), "other");
+		File.WriteAllText(Path.Combine(_csvFolderPath, "speed-backup.csv"), SpeedSample.Header + "\r\n" + CreateSpeed(_start, "Backup", SpeedResult.Ok, 1).ToCsv() + "\r\n");
+		File.WriteAllText(Path.Combine(_csvFolderPath, "export-20261117-100000-speed.csv"), SpeedSample.Header + "\r\n" + CreateSpeed(_start, "Export", SpeedResult.Ok, 1).ToCsv() + "\r\n");
+
+		var importedFolderPath = _csvFolderPath + "-csv-imported";
+
+		using (var history = CreateHistory())
+		{
+			Assert.IsFalse(File.Exists(_filePath));
+
+			var changedKinds = new List<HistoryKind>();
+			history.Changed += (_, kind) => changedKinds.Add(kind);
+
+			Assert.AreEqual(8, history.ImportCsv(_csvFolderPath));
+
+			CollectionAssert.AreEquivalent(new[] { HistoryKind.Signal, HistoryKind.Speed, HistoryKind.Event }, changedKinds);
+			AssertImported(history);
+
+			// The summary is rebuilt from the imported rows.
+			Assert.AreEqual(70.5, history.GetSummary(HistoryService.GetKey("Office", _interfaceId)).DownMbps);
+			Assert.AreEqual(77D, history.GetSummary(HistoryService.GetKey(TrickyName, _interfaceId)).DownMbps);
+
+			// The folder is renamed, not deleted.
+			Assert.IsFalse(Directory.Exists(_csvFolderPath));
+			Assert.AreEqual(9, Directory.GetFiles(importedFolderPath).Length);
+			Assert.IsTrue(File.Exists(Path.Combine(importedFolderPath, "speed-20261117.csv")));
+
+			// Nothing is imported twice even if the same files appear again.
+			Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
+			Assert.AreEqual(0, history.ImportCsv(importedFolderPath));
+
+			WriteCsvFiles();
+			Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
+
+			AssertImported(history);
+			Assert.AreEqual(6, Directory.GetFiles(_csvFolderPath).Length);
+			Assert.IsFalse(Directory.Exists(importedFolderPath + "-2"));
+
+			// Rows are appended after the imported rows.
+			history.AppendSpeed(CreateSpeed(_start, "Office", SpeedResult.Ok, 60));
+			Assert.AreEqual(4, history.ReadSpeeds(DateTime.MinValue, DateTime.MaxValue).Count);
+		}
+
+		using (var history = CreateHistory())
+		{
+			Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
+			Assert.AreEqual(4, history.ReadSpeeds(DateTime.MinValue, DateTime.MaxValue).Count);
+			Assert.AreEqual(2, history.GetSummary(HistoryService.GetKey("Office", _interfaceId)).Count);
+		}
+	}
+
+	[TestMethod]
+	public void TestImportCsvIsRecordedWithRows()
+	{
+		WriteCsvFiles();
+
+		using (var history = CreateHistory())
+		{
+			// A file in use prevents the folder from being renamed.
+			using (new FileStream(Path.Combine(_csvFolderPath, "speed-20261117.csv"), FileMode.Open, FileAccess.Read, FileShare.Read))
+			{
+				Assert.AreEqual(8, history.ImportCsv(_csvFolderPath));
+			}
+
+			Assert.IsTrue(Directory.Exists(_csvFolderPath));
+			AssertImported(history);
+		}
+
+		// The folder is renamed at the next time without importing the files again.
+		using (var history = CreateHistory())
+		{
+			Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
+
+			Assert.IsFalse(Directory.Exists(_csvFolderPath));
+			Assert.IsTrue(Directory.Exists(_csvFolderPath + "-csv-imported"));
+			AssertImported(history);
+		}
+	}
+
+	[TestMethod]
+	public void TestImportCsvAfterRowsAreWritten()
+	{
+		WriteCsvFiles();
+
+		// An existing folder of the same name is left as it is.
+		Directory.CreateDirectory(_csvFolderPath + "-csv-imported");
+
+		using var history = CreateHistory();
+
+		// The database is created by a row before the files are imported.
+		history.AppendSpeed(CreateSpeed(_start, "Office", SpeedResult.Ok, 60));
+
+		Assert.AreEqual(8, history.ImportCsv(_csvFolderPath));
+		Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
+
+		Assert.AreEqual(4, history.ReadSpeeds(DateTime.MinValue, DateTime.MaxValue).Count);
+		Assert.AreEqual(2, history.GetSummary(HistoryService.GetKey("Office", _interfaceId)).Count);
+		Assert.AreEqual(0, Directory.GetFiles(_csvFolderPath + "-csv-imported").Length);
+		Assert.AreEqual(6, Directory.GetFiles(_csvFolderPath + "-csv-imported-2").Length);
+	}
+
+	[TestMethod]
+	public void TestImportCsvWithoutFiles()
+	{
+		using var history = CreateHistory();
+
+		// Nothing is created if there is nothing to be imported.
+		Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
+		Assert.AreEqual(0, history.ImportCsv(null));
+		Assert.IsFalse(Directory.Exists(_folderPath));
+
+		Directory.CreateDirectory(_csvFolderPath);
+		File.WriteAllText(Path.Combine(_csvFolderPath, "export-20261117-100000-speed.csv"), SpeedSample.Header + "\r\n" + CreateSpeed(_start, "Export", SpeedResult.Ok, 1).ToCsv() + "\r\n");
+
+		Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
+		Assert.IsFalse(File.Exists(_filePath));
+
+		// Once the database exists without files to be imported, files are not imported any more
+		// and the folder, which is that of exported files, is not renamed.
+		history.AppendEvent(CreateEvent(_start, "event"));
+		Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
+
+		WriteCsvFiles();
+		Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
+		Assert.AreEqual(0, history.ReadSpeeds(DateTime.MinValue, DateTime.MaxValue).Count);
+		Assert.AreEqual(7, Directory.GetFiles(_csvFolderPath).Length);
+	}
+
+	[TestMethod]
+	public void TestExportCsv()
+	{
+		using var history = CreateHistory();
+
+		history.AppendSignals(new[] { CreateSignal(_start.AddHours(-2), "Office", 40) }); // Out of the range
+		history.AppendSignals(new[] { CreateSignal(_start, TrickyName, 50, connected: true) });
+		history.AppendSpeed(CreateSpeed(_start, TrickyName, SpeedResult.Ok, 70.25));
+		history.AppendSpeed(CreateSpeed(_start.AddMinutes(1), "Office", SpeedResult.RouteMismatch, null));
+		history.AppendEvent(new SwitchEvent { Time = _start, InterfaceId = _interfaceId, Kind = SwitchKind.Switch, From = "Off\nice", To = "EXT", Reason = "a\r\nb" });
+
+		_now = new DateTime(2026, 11, 17, 12, 34, 56, DateTimeKind.Local);
+
+		var filePaths = history.ExportCsv(_csvFolderPath, _start.AddHours(-1), _start.AddHours(1));
+
 		CollectionAssert.AreEqual(new[]
 		{
-			"events-20261117.csv",
-			"notes-20200101.csv",
-			"signal-20261110.csv",
-			"speed-20261110.csv",
-			"speed-backup.csv"
-		}, names);
+			"export-20261117-123456-signal.csv",
+			"export-20261117-123456-speed.csv",
+			"export-20261117-123456-events.csv"
+		}, filePaths.Select(x => Path.GetFileName(x)).ToArray());
+		CollectionAssert.AreEquivalent(filePaths.ToArray(), Directory.GetFiles(_csvFolderPath));
+
+		var bytes = File.ReadAllBytes(filePaths[1]);
+		CollectionAssert.AreEqual(new byte[] { 0xEF, 0xBB, 0xBF }, bytes.Take(3).ToArray()); // BOM
+
+		var lines = Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3).Split(new[] { "\r\n" }, StringSplitOptions.None);
+		Assert.AreEqual(4, lines.Length); // Header, rows and empty string after the last line end
+		Assert.AreEqual("Time,InterfaceId,Profile,Bssid,Band,Channel,Signal,LinkRate,GatewayMs,LatencyMs,JitterMs,DownMbps,UpMbps,DownBytes,UpBytes,DurationMs,Trigger,Result,Valid", lines[0]);
+		Assert.AreEqual("2026-11-17T10:00:00Z,11111111-2222-3333-4444-555555555555,\"Café, \"\"Guest\"\" 5G\",AA:BB:CC:00:00:01,5,36,53,866,1.5,18.2,2.1,70.3,12.3,20000000,5000000,9500,Periodic,Ok,1", lines[1]);
+		Assert.IsTrue(lines[2].EndsWith(",,12.3,20000000,5000000,9500,Periodic,RouteMismatch,0"));
+		Assert.AreEqual("", lines[3]);
+
+		lines = File.ReadAllLines(filePaths[0]);
+		Assert.AreEqual(2, lines.Length);
+		Assert.AreEqual(SignalSample.Header, lines[0]);
+		Assert.AreEqual("2026-11-17T10:00:00Z,11111111-2222-3333-4444-555555555555,\"Café, \"\"Guest\"\" 5G\",1,50,-60,2.4,11,ax,AA:BB:CC:00:00:01,286", lines[1]);
+
+		// Each row is in a single line.
+		lines = File.ReadAllLines(filePaths[2]);
+		Assert.AreEqual(2, lines.Length);
+		Assert.AreEqual(SwitchEvent.Header, lines[0]);
+		Assert.AreEqual("2026-11-17T10:00:00Z,11111111-2222-3333-4444-555555555555,Switch,Off ice,EXT,,,a b", lines[1]);
+
+		// The exported files can be parsed by their headers.
+		var columns = CsvLine.GetColumns(File.ReadAllLines(filePaths[1])[0]);
+		Assert.IsTrue(SpeedSample.TryParse(columns, CsvLine.Split(File.ReadAllLines(filePaths[1])[1]), out SpeedSample speed));
+		Assert.AreEqual(TrickyName, speed.Profile);
+
+		// An empty range
+		_now = _now.AddSeconds(1);
+		filePaths = history.ExportCsv(_csvFolderPath, _start.AddDays(1), _start.AddDays(2));
+		Assert.AreEqual(3, filePaths.Count);
+		Assert.AreEqual(SpeedSample.Header, File.ReadAllLines(filePaths[1]).Single());
+		Assert.AreEqual(6, Directory.GetFiles(_csvFolderPath).Length);
+	}
+
+	/// <summary>
+	/// Writes CSV files as previous versions did, which have 3 signal samples, 3 speed samples
+	/// and 2 switching events to be imported.
+	/// </summary>
+	private void WriteCsvFiles()
+	{
+		Directory.CreateDirectory(_csvFolderPath);
+		var encoding = new UTF8Encoding(false);
+
+		File.WriteAllText(Path.Combine(_csvFolderPath, "signal-20261116.csv"),
+			SignalSample.Header + "\r\n" +
+			CreateSignal(_start.AddDays(-1), "Office", 40).ToCsv() + "\r\n",
+			encoding);
+
+		File.WriteAllText(Path.Combine(_csvFolderPath, "signal-20261117.csv"),
+			SignalSample.Header + "\r\n" +
+			CreateSignal(_start.AddHours(-2), "Office", 50, connected: true).ToCsv() + "\r\n" +
+			CreateSignal(_start.AddHours(-1), TrickyName, 60).ToCsv() + "\r\n",
+			encoding);
+
+		// Columns of another version: an extra unknown column and no optional columns. Then
+		// a malformed line, an unterminated quote and the last line which was cut off
+		File.WriteAllText(Path.Combine(_csvFolderPath, "speed-20261116.csv"),
+			"Time,InterfaceId,Profile,Comment,DownMbps,Result,Valid\r\n" +
+			$"2026-11-16T08:00:00Z,{_interfaceId},Office,hello,70.5,Ok,1\r\n" +
+			"this is not a row\r\n" +
+			$"2026-11-16T08:30:00Z,{_interfaceId},\"Office,broken,1.0,Ok,1\r\n" +
+			$"2026-11-16T09:00:00Z,{_interfaceId},EXT,\"a,b\",77.0,Ok,1\r\n" +
+			"2026-11-16T09:30:00Z,11111111-2222-33",
+			encoding);
+
+		File.WriteAllText(Path.Combine(_csvFolderPath, "speed-20261117.csv"),
+			SpeedSample.Header + "\r\n" +
+			CreateSpeed(_start.AddHours(-1), TrickyName, SpeedResult.Ok, 77).ToCsv() + "\r\n" +
+			CreateSpeed(_start, "Office", SpeedResult.Ok, 99).ToCsv().Substring(0, 30), // Cut off
+			encoding);
+
+		File.WriteAllText(Path.Combine(_csvFolderPath, "events-20261117.csv"),
+			SwitchEvent.Header + "\r\n" +
+			CreateEvent(_start.AddHours(-2), "first, \"quoted\"").ToCsv() + "\r\n" +
+			CreateEvent(_start.AddHours(-1), "second").ToCsv() + "\r\n" +
+			$"2026-11-17T09:30:00Z,{_interfaceId},Sw",
+			encoding);
+
+		File.WriteAllText(Path.Combine(_csvFolderPath, "events-20261118.csv"), string.Empty, encoding);
+	}
+
+	private void AssertImported(HistoryService history)
+	{
+		var signals = history.ReadSignals(DateTime.MinValue, DateTime.MaxValue);
+		CollectionAssert.AreEqual(new[] { 40, 50, 60 }, signals.Select(x => x.Signal).ToArray());
+		Assert.AreEqual(_start.AddDays(-1), signals[0].Time);
+		Assert.IsTrue(signals[1].Connected);
+		Assert.AreEqual(286, signals[1].LinkRate);
+		Assert.AreEqual(TrickyName, signals[2].Profile);
+		Assert.AreEqual(2.4F, signals[2].Band);
+
+		var speeds = history.ReadSpeeds(DateTime.MinValue, _start.AddMinutes(-1));
+		CollectionAssert.AreEqual(new double?[] { 70.5, 77, 77 }, speeds.Select(x => x.DownMbps).ToArray());
+		CollectionAssert.AreEqual(new[] { "Office", "EXT", TrickyName }, speeds.Select(x => x.Profile).ToArray());
+		Assert.IsNull(speeds[0].UpMbps);
+		Assert.AreEqual(12.3, speeds[2].UpMbps);
+		Assert.AreEqual(20_000_000L, speeds[2].DownBytes);
+		Assert.AreEqual(SpeedTrigger.Periodic, speeds[2].Trigger);
+		Assert.AreEqual(_interfaceId, speeds[2].InterfaceId);
+
+		var switchEvents = history.ReadEvents(DateTime.MinValue, DateTime.MaxValue);
+		CollectionAssert.AreEqual(new[] { "first, \"quoted\"", "second" }, switchEvents.Select(x => x.Reason).ToArray());
+		Assert.AreEqual(70D, switchEvents[0].FromScore);
 	}
 
 	#endregion
@@ -615,7 +989,7 @@ public class HistoryServiceTest
 	#region Speed
 
 	[TestMethod]
-	public void TestSummaryIsRebuiltFromExistingFolder()
+	public void TestSummaryIsRebuiltFromExistingDatabase()
 	{
 		var key = HistoryService.GetKey("Office", _interfaceId);
 
@@ -710,7 +1084,7 @@ public class HistoryServiceTest
 	}
 
 	[TestMethod]
-	public void TestFolderIsCreatedOnlyWhenWritten()
+	public void TestDatabaseIsCreatedOnlyWhenWritten()
 	{
 		using var history = CreateHistory();
 
@@ -722,7 +1096,7 @@ public class HistoryServiceTest
 		Assert.IsFalse(Directory.Exists(_folderPath));
 
 		history.AppendEvent(CreateEvent(_start, "event"));
-		Assert.IsTrue(Directory.Exists(_folderPath));
+		Assert.IsTrue(File.Exists(_filePath));
 		Assert.AreEqual(1, history.ReadEvents(_start, _start).Count);
 	}
 
@@ -734,7 +1108,7 @@ public class HistoryServiceTest
 		var filePath = Path.Combine(_folderPath, "occupied");
 		File.WriteAllText(filePath, "file");
 
-		using var history = new HistoryService(filePath, () => _now);
+		using var history = new HistoryService(Path.Combine(filePath, "history.db"), () => _now);
 
 		history.AppendSignals(null);
 		history.AppendSignals(new[] { null, CreateSignal(_start, "Office", 50) });
@@ -757,7 +1131,39 @@ public class HistoryServiceTest
 
 	#region Base
 
-	private HistoryService CreateHistory() => new HistoryService(_folderPath, () => _now);
+	private HistoryService CreateHistory() => new HistoryService(_filePath, () => _now, 1);
+
+	private SqliteConnection OpenDatabase()
+	{
+		var connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _filePath, Pooling = false }.ToString());
+		connection.Open();
+		return connection;
+	}
+
+	private static void Execute(SqliteConnection connection, string text)
+	{
+		using var command = connection.CreateCommand();
+		command.CommandText = text;
+		command.ExecuteNonQuery();
+	}
+
+	/// <summary>
+	/// Gets the values of all the rows in sequence.
+	/// </summary>
+	private static object[] Query(SqliteConnection connection, string text)
+	{
+		using var command = connection.CreateCommand();
+		command.CommandText = text;
+
+		var values = new List<object>();
+		using var reader = command.ExecuteReader();
+		while (reader.Read())
+		{
+			for (int i = 0; i < reader.FieldCount; i++)
+				values.Add(reader.GetValue(i));
+		}
+		return values.ToArray();
+	}
 
 	private static IReadOnlyList<SignalSample> ReadAllSignals(HistoryService history) =>
 		history.ReadSignals(_start.AddDays(-1), _start.AddDays(1));

@@ -4,7 +4,7 @@ using System.Collections.Generic;
 namespace Wifinian.Models.History;
 
 /// <summary>
-/// Signal sample of a wireless profile (a row of signal-yyyyMMdd.csv)
+/// Signal sample of a wireless profile (a row of signal table)
 /// </summary>
 internal class SignalSample
 {

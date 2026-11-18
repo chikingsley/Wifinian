@@ -33,6 +33,7 @@ public class HistoryWindowViewModel : DisposableBase
 
 	public ReactiveCommand RefreshCommand { get; }
 	public ReactiveCommand OpenFolderCommand { get; }
+	public ReactiveCommand ExportCommand { get; }
 
 	public ReactivePropertySlim<bool> IsLoading { get; }
 
@@ -93,7 +94,13 @@ public class HistoryWindowViewModel : DisposableBase
 		OpenFolderCommand = new ReactiveCommand()
 			.AddTo(this.Subscription);
 		OpenFolderCommand
-			.Subscribe(_ => OpenFolder())
+			.Subscribe(_ => OpenFolder(AppDataService.FolderPath))
+			.AddTo(this.Subscription);
+
+		ExportCommand = new ReactiveCommand()
+			.AddTo(this.Subscription);
+		ExportCommand
+			.Subscribe(async _ => await ExportAsync())
 			.AddTo(this.Subscription);
 
 		// Signal samples are appended so often that they do not cause reloading.
@@ -114,11 +121,13 @@ public class HistoryWindowViewModel : DisposableBase
 			.AddTo(this.Subscription);
 	}
 
-	private void OpenFolder()
+	/// <summary>
+	/// Opens a folder, that of the database of history or that of exported files.
+	/// </summary>
+	private static void OpenFolder(string folderPath)
 	{
 		try
 		{
-			var folderPath = AppDataService.HistoryFolderPath;
 			Directory.CreateDirectory(folderPath);
 			Process.Start(folderPath);
 		}
@@ -126,6 +135,42 @@ public class HistoryWindowViewModel : DisposableBase
 		{
 			Trace.WriteLine("Failed to open history folder." + Environment.NewLine
 				+ ex);
+		}
+	}
+
+	private bool _isExporting;
+
+	/// <summary>
+	/// Exports the history of the current range to CSV files and opens the folder of them.
+	/// This method must be called on the UI thread.
+	/// </summary>
+	private async Task ExportAsync()
+	{
+		if (_isExporting)
+			return;
+
+		try
+		{
+			_isExporting = true;
+
+			var toUtc = DateTime.UtcNow;
+			var fromUtc = toUtc.AddHours(-RangeHours.Value);
+
+			var history = _controller.History;
+			var folderPath = AppDataService.HistoryFolderPath;
+
+			var filePaths = await Task.Run(() => history.ExportCsv(folderPath, fromUtc, toUtc));
+			if (filePaths.Count > 0)
+				OpenFolder(folderPath);
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to export history." + Environment.NewLine
+				+ ex);
+		}
+		finally
+		{
+			_isExporting = false;
 		}
 	}
 
@@ -155,7 +200,7 @@ public class HistoryWindowViewModel : DisposableBase
 			var profiles = _controller.GetProfiles();
 			var avoidedNames = Settings.Current.AvoidedProfiles;
 
-			// Reading files, grouping and reducing points are done outside the UI thread.
+			// Reading the database, grouping and reducing points are done outside the UI thread.
 			var snapshot = await Task.Run(() => HistorySnapshot.Build(
 				history.ReadSignals(fromUtc, toUtc),
 				history.ReadSpeeds(fromUtc, toUtc),

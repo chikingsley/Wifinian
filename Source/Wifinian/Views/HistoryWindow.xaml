@@ -103,6 +103,10 @@
 			<Button Style="{StaticResource BarButtonStyle}"
 					Content="Open data folder"
 					Command="{Binding OpenFolderCommand, Mode=OneTime}"/>
+			<Button Style="{StaticResource BarButtonStyle}"
+					Content="Export CSV"
+					ToolTip="Write the shown range to CSV files"
+					Command="{Binding ExportCommand, Mode=OneTime}"/>
 			<TextBlock Margin="8,0,0,0" VerticalAlignment="Center"
 					   Foreground="{StaticResource App.Foreground.Shadow}"
 					   Text="Loading..."

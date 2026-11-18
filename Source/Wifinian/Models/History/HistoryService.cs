@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using Microsoft.Data.Sqlite;
 
 namespace Wifinian.Models.History;
 
@@ -19,21 +20,25 @@ public enum HistoryKind
 }
 
 /// <summary>
-/// Store of signal samples, speed samples and switching events in daily CSV files
+/// Store of signal samples, speed samples and switching events in a local SQLite database
 /// </summary>
 /// <remarks>
 /// No public method of this class throws an exception. Failures are written to trace.
+/// The database is accessed only through a single connection inside the lock.
+/// Time is stored as UTC ISO 8601 text of fixed length (yyyy-MM-ddTHH:mm:ssZ) and so can be
+/// compared as text.
 /// </remarks>
 internal class HistoryService : IDisposable
 {
-	private const string SignalPrefix = "signal";
-	private const string SpeedPrefix = "speed";
-	private const string EventPrefix = "events";
 	private const string DateFormat = "yyyyMMdd";
-	private const string NewLine = "\r\n";
+
+	private const string ImportKey = "csv_import";
+	private const string ImportImported = "imported"; // Rows are imported but the folder is not renamed yet.
+	private const string ImportDone = "done";
+	private const string ImportedSuffix = "-csv-imported";
 
 	/// <summary>
-	/// Maximum number of rows kept in memory while files cannot be written
+	/// Maximum number of rows kept in memory while the database cannot be written
 	/// </summary>
 	internal const int MaxPendingCount = 5000;
 
@@ -52,49 +57,69 @@ internal class HistoryService : IDisposable
 	/// </summary>
 	internal const int SignalMinDifference = 3;
 
-	private readonly string _folderPath;
+	/// <summary>
+	/// Default time (seconds) to wait for the database locked by another process
+	/// </summary>
+	internal const int DefaultTimeout = 3;
+
+	private readonly string _filePath;
 	private readonly Func<DateTime> _utcNow;
+	private readonly int _timeout;
 
 	private readonly object _lock = new();
 	private readonly Dictionary<string, List<SpeedSample>> _speeds = new();
 	private readonly Dictionary<string, SignalSample> _lastSignals = new();
-	private readonly Queue<Row> _pending = new();
+	private readonly Queue<object> _pending = new();
+
+	private SqliteConnection _connection;
 
 	/// <summary>
 	/// Occurs after rows are appended.
 	/// </summary>
 	public event EventHandler<HistoryKind> Changed;
 
-	public HistoryService(string folderPath, Func<DateTime> utcNow = null)
+	/// <param name="filePath">File path of the database</param>
+	/// <param name="utcNow">Function to get the current time (UTC)</param>
+	/// <param name="timeout">Time (seconds) to wait for the database locked by another process</param>
+	public HistoryService(string filePath, Func<DateTime> utcNow = null, int timeout = DefaultTimeout)
 	{
-		this._folderPath = folderPath;
+		this._filePath = filePath;
 		this._utcNow = utcNow ?? (() => DateTime.UtcNow);
+		this._timeout = Math.Max(1, timeout);
 
-		// The folder is created when the first row is written so that nothing is left on disk
+		// The database is created when the first row is written so that nothing is left on disk
 		// as long as nothing is recorded.
 		try
 		{
-			var now = GetNow();
-
-			foreach (var sample in ReadFiles<SpeedSample>(SpeedPrefix, now - SpeedSummary.Period, now.AddDays(1), SpeedSample.TryParse, x => x.Time))
+			lock (_lock)
 			{
-				if (!_speeds.TryGetValue(sample.Key, out List<SpeedSample> samples))
-				{
-					samples = new List<SpeedSample>();
-					_speeds.Add(sample.Key, samples);
-				}
-				samples.Add(sample);
+				LoadSpeeds();
 			}
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to load speed history." + Environment.NewLine
 				+ ex);
+
+			CloseConnection();
 		}
 	}
 
 	public static string GetKey(string profileName, Guid interfaceId) =>
 		profileName + "|" + interfaceId.ToString("D");
+
+	private static bool TrySplitKey(string key, out string profileName, out Guid interfaceId)
+	{
+		profileName = null;
+		interfaceId = default;
+
+		var index = key?.LastIndexOf('|') ?? -1;
+		if (index <= 0)
+			return false;
+
+		profileName = key.Substring(0, index);
+		return Guid.TryParseExact(key.Substring(index + 1), "D", out interfaceId);
+	}
 
 	#region Append
 
@@ -113,7 +138,7 @@ internal class HistoryService : IDisposable
 
 			lock (_lock)
 			{
-				var rows = new List<Row>();
+				var rows = new List<object>();
 
 				foreach (var sample in samples)
 				{
@@ -127,7 +152,7 @@ internal class HistoryService : IDisposable
 						continue;
 
 					_lastSignals[key] = sample;
-					rows.Add(new Row(SignalPrefix, SignalSample.Header, sample.Time, sample.ToCsv()));
+					rows.Add(sample);
 				}
 
 				if (rows.Count == 0)
@@ -184,19 +209,14 @@ internal class HistoryService : IDisposable
 
 			lock (_lock)
 			{
-				var key = sample.Key;
-				if (!_speeds.TryGetValue(key, out List<SpeedSample> samples))
-				{
-					samples = new List<SpeedSample>();
-					_speeds.Add(key, samples);
-				}
-
 				var oldest = GetNow() - SpeedSummary.Period;
-				samples.RemoveAll(x => CsvLine.ToUtc(x.Time) < oldest);
-				samples.Add(sample);
+				if (_speeds.TryGetValue(sample.Key, out List<SpeedSample> samples))
+					samples.RemoveAll(x => CsvLine.ToUtc(x.Time) < oldest);
+
+				HoldSpeed(sample);
 				isAdded = true;
 
-				WriteRows(new List<Row> { new Row(SpeedPrefix, SpeedSample.Header, sample.Time, sample.ToCsv()) });
+				WriteRows(new List<object> { sample });
 			}
 		}
 		catch (Exception ex)
@@ -205,7 +225,7 @@ internal class HistoryService : IDisposable
 				+ ex);
 		}
 
-		// The sample is held in memory even if it could not be written to the file yet.
+		// The sample is held in memory even if it could not be written to the database yet.
 		if (isAdded)
 			OnChanged(HistoryKind.Speed);
 	}
@@ -225,7 +245,7 @@ internal class HistoryService : IDisposable
 
 			lock (_lock)
 			{
-				isWritten = WriteRows(new List<Row> { new Row(EventPrefix, SwitchEvent.Header, switchEvent.Time, switchEvent.ToCsv()) });
+				isWritten = WriteRows(new List<object> { switchEvent });
 			}
 		}
 		catch (Exception ex)
@@ -253,37 +273,233 @@ internal class HistoryService : IDisposable
 
 	#endregion
 
-	#region Write
+	#region Database
 
-	private readonly struct Row
+	/// <summary>
+	/// Version of the schema (PRAGMA user_version) this class writes
+	/// </summary>
+	internal const int SchemaVersion = 1;
+
+	/// <summary>
+	/// Scripts to upgrade the schema, the element of index N upgrading version N to N+1
+	/// </summary>
+	/// <remarks>
+	/// To add a column, append a script of ALTER TABLE ... ADD COLUMN ... here (never change a
+	/// script which has been released), add the column to the columns of the table below and
+	/// increment <see cref="SchemaVersion"/>. A database of a newer version is used as it is
+	/// because columns are always referred to by name.
+	/// </remarks>
+	private static readonly string[] _migrations =
 	{
-		public string Prefix { get; }
-		public string Header { get; }
-		public DateTime Date { get; }
-		public string Line { get; }
+		// 0 -> 1
+		@"CREATE TABLE signal (
+			id INTEGER PRIMARY KEY,
+			time TEXT NOT NULL,
+			interface_id TEXT NOT NULL,
+			profile TEXT NOT NULL,
+			connected INTEGER NOT NULL DEFAULT 0,
+			signal INTEGER NOT NULL DEFAULT 0,
+			rssi INTEGER,
+			band REAL NOT NULL DEFAULT 0,
+			channel INTEGER NOT NULL DEFAULT 0,
+			protocol TEXT NOT NULL DEFAULT '',
+			bssid TEXT NOT NULL DEFAULT '',
+			link_rate INTEGER);
+		CREATE INDEX ix_signal_time ON signal (time);
+		CREATE INDEX ix_signal_profile_time ON signal (profile, time);
 
-		public Row(string prefix, string header, DateTime time, string line)
+		CREATE TABLE speed (
+			id INTEGER PRIMARY KEY,
+			time TEXT NOT NULL,
+			interface_id TEXT NOT NULL,
+			profile TEXT NOT NULL,
+			bssid TEXT NOT NULL DEFAULT '',
+			band REAL NOT NULL DEFAULT 0,
+			channel INTEGER NOT NULL DEFAULT 0,
+			signal INTEGER NOT NULL DEFAULT 0,
+			link_rate INTEGER,
+			gateway_ms REAL,
+			latency_ms REAL,
+			jitter_ms REAL,
+			down_mbps REAL,
+			up_mbps REAL,
+			down_bytes INTEGER NOT NULL DEFAULT 0,
+			up_bytes INTEGER NOT NULL DEFAULT 0,
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			trigger TEXT NOT NULL DEFAULT '',
+			result TEXT NOT NULL DEFAULT '',
+			valid INTEGER NOT NULL DEFAULT 0);
+		CREATE INDEX ix_speed_time ON speed (time);
+		CREATE INDEX ix_speed_profile_time ON speed (profile, time);
+
+		CREATE TABLE events (
+			id INTEGER PRIMARY KEY,
+			time TEXT NOT NULL,
+			interface_id TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			from_profile TEXT NOT NULL DEFAULT '',
+			to_profile TEXT NOT NULL DEFAULT '',
+			from_score REAL,
+			to_score REAL,
+			reason TEXT NOT NULL DEFAULT '');
+		CREATE INDEX ix_events_time ON events (time);
+		CREATE INDEX ix_events_profile_time ON events (to_profile, time);
+
+		CREATE TABLE meta (
+			key TEXT PRIMARY KEY,
+			value TEXT);"
+	};
+
+	private const string SignalTable = "signal";
+	private const string SpeedTable = "speed";
+	private const string EventTable = "events";
+
+	private static readonly string[] _signalColumns =
+	{
+		"time", "interface_id", "profile", "connected", "signal", "rssi", "band", "channel", "protocol", "bssid", "link_rate"
+	};
+
+	private static readonly string[] _speedColumns =
+	{
+		"time", "interface_id", "profile", "bssid", "band", "channel", "signal", "link_rate", "gateway_ms", "latency_ms", "jitter_ms",
+		"down_mbps", "up_mbps", "down_bytes", "up_bytes", "duration_ms", "trigger", "result", "valid"
+	};
+
+	private static readonly string[] _eventColumns =
+	{
+		"time", "interface_id", "kind", "from_profile", "to_profile", "from_score", "to_score", "reason"
+	};
+
+	/// <summary>
+	/// Gets the connection opening the database if necessary.
+	/// </summary>
+	/// <param name="creates">Whether to create the database if it does not exist</param>
+	/// <returns>Connection, null if the database does not exist and is not to be created</returns>
+	/// <remarks>This method must be called inside the lock and can throw an exception.</remarks>
+	private SqliteConnection GetConnection(bool creates)
+	{
+		if (_connection is not null)
+			return _connection;
+
+		if (!File.Exists(_filePath))
 		{
-			this.Prefix = prefix;
-			this.Header = header;
-			this.Date = CsvLine.ToUtc(time).Date;
-			this.Line = line;
+			if (!creates)
+				return null;
+
+			var folderPath = Path.GetDirectoryName(_filePath);
+			if (!string.IsNullOrEmpty(folderPath))
+				Directory.CreateDirectory(folderPath);
+		}
+
+		var builder = new SqliteConnectionStringBuilder
+		{
+			DataSource = _filePath,
+			Mode = SqliteOpenMode.ReadWriteCreate,
+			Pooling = false, // The file must be released when this instance is disposed.
+			DefaultTimeout = _timeout
+		};
+
+		var connection = new SqliteConnection(builder.ToString());
+		try
+		{
+			connection.Open();
+
+			Execute(connection, null, "PRAGMA journal_mode = WAL;");
+			Execute(connection, null, "PRAGMA synchronous = NORMAL;");
+
+			Migrate(connection);
+		}
+		catch
+		{
+			connection.Dispose();
+			throw;
+		}
+
+		_connection = connection;
+		return _connection;
+	}
+
+	private static void Migrate(SqliteConnection connection)
+	{
+		var version = Convert.ToInt32(ExecuteScalar(connection, null, "PRAGMA user_version;"), CultureInfo.InvariantCulture);
+		if (version >= _migrations.Length)
+			return;
+
+		using var transaction = connection.BeginTransaction();
+
+		for (int i = Math.Max(0, version); i < _migrations.Length; i++)
+			Execute(connection, transaction, _migrations[i]);
+
+		Execute(connection, transaction, $"PRAGMA user_version = {_migrations.Length.ToString(CultureInfo.InvariantCulture)};");
+
+		transaction.Commit();
+	}
+
+	/// <summary>
+	/// Closes the connection so that it will be opened anew at the next access.
+	/// </summary>
+	private void CloseConnection()
+	{
+		try
+		{
+			lock (_lock)
+			{
+				_connection?.Dispose();
+				_connection = null;
+			}
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to close history database." + Environment.NewLine
+				+ ex);
+
+			_connection = null;
 		}
 	}
 
-	private string GetFilePath(string prefix, DateTime date) =>
-		Path.Combine(_folderPath, $"{prefix}-{date.ToString(DateFormat, CultureInfo.InvariantCulture)}.csv");
+	private static SqliteCommand CreateCommand(SqliteConnection connection, SqliteTransaction transaction, string text, params (string name, object value)[] parameters)
+	{
+		var command = connection.CreateCommand();
+		command.Transaction = transaction;
+		command.CommandText = text;
+
+		foreach (var (name, value) in parameters)
+			command.Parameters.AddWithValue(name, value ?? DBNull.Value);
+
+		return command;
+	}
+
+	private static void Execute(SqliteConnection connection, SqliteTransaction transaction, string text, params (string name, object value)[] parameters)
+	{
+		using var command = CreateCommand(connection, transaction, text, parameters);
+		command.ExecuteNonQuery();
+	}
+
+	private static object ExecuteScalar(SqliteConnection connection, SqliteTransaction transaction, string text, params (string name, object value)[] parameters)
+	{
+		using var command = CreateCommand(connection, transaction, text, parameters);
+		return command.ExecuteScalar();
+	}
+
+	private static string GetMeta(SqliteConnection connection, string key) =>
+		ExecuteScalar(connection, null, "SELECT value FROM meta WHERE key = $key;", ("$key", key)) as string;
+
+	private static void SetMeta(SqliteConnection connection, SqliteTransaction transaction, string key, string value) =>
+		Execute(connection, transaction, "INSERT OR REPLACE INTO meta (key, value) VALUES ($key, $value);", ("$key", key), ("$value", value));
+
+	#endregion
+
+	#region Write
 
 	/// <summary>
-	/// Writes rows to files following the rows which could not be written before.
+	/// Writes rows to the database following the rows which could not be written before.
 	/// </summary>
-	/// <param name="rows">Rows</param>
-	/// <returns>True if any of the rows is written, false if all of the rows are kept in memory for the next attempt</returns>
+	/// <param name="rows">Rows (signal samples, speed samples and switching events)</param>
+	/// <returns>True if the rows are written, false if the rows are kept in memory for the next attempt</returns>
 	/// <remarks>
-	/// A file which cannot be written holds back only its own rows. The rows of other files are written.
-	/// This method must be called inside the lock.
+	/// All the rows are written in a transaction. This method must be called inside the lock.
 	/// </remarks>
-	private bool WriteRows(List<Row> rows)
+	private bool WriteRows(List<object> rows)
 	{
 		var buffer = (_pending.Count > 0)
 			? _pending.Concat(rows).ToList()
@@ -292,143 +508,172 @@ internal class HistoryService : IDisposable
 		if (buffer.Count == 0)
 			return false;
 
-		// File paths which could not be written, null if the folder is not usable
-		HashSet<string> failedPaths = null;
-
 		try
 		{
-			Directory.CreateDirectory(_folderPath);
+			var connection = GetConnection(true);
 
-			failedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+			using (var transaction = connection.BeginTransaction())
+			{
+				InsertRows(connection, transaction, buffer);
+				transaction.Commit();
+			}
+
+			_pending.Clear();
+			return true;
 		}
 		catch (Exception ex)
 		{
-			Trace.WriteLine("Failed to create history folder." + Environment.NewLine
+			Trace.WriteLine("Failed to write history database." + Environment.NewLine
 				+ ex);
+
+			CloseConnection();
 		}
-
-		if (failedPaths is not null)
-		{
-			// GroupBy method keeps the order of rows in each file.
-			foreach (var group in buffer.GroupBy(x => GetFilePath(x.Prefix, x.Date), StringComparer.OrdinalIgnoreCase))
-			{
-				try
-				{
-					WriteFile(group.Key, group.First().Header, group.Select(x => x.Line));
-				}
-				catch (Exception ex)
-				{
-					Trace.WriteLine("Failed to write history file." + Environment.NewLine
-						+ ex);
-
-					failedPaths.Add(group.Key);
-				}
-			}
-
-			if (failedPaths.Count == 0)
-			{
-				_pending.Clear();
-				return true;
-			}
-		}
-
-		bool IsFailed(Row row) =>
-			(failedPaths is null) || failedPaths.Contains(GetFilePath(row.Prefix, row.Date));
 
 		// Keep the rows which have not been written, oldest dropped, for the next attempt.
-		var remaining = buffer.Where(x => IsFailed(x)).ToArray();
-		bool isWritten = rows.Any(x => !IsFailed(x));
-
 		_pending.Clear();
-		foreach (var row in remaining.Skip(Math.Max(0, remaining.Length - MaxPendingCount)))
+		foreach (var row in buffer.Skip(Math.Max(0, buffer.Count - MaxPendingCount)))
 			_pending.Enqueue(row);
 
-		return isWritten;
+		return false;
 	}
 
-	private static void WriteFile(string filePath, string header, IEnumerable<string> lines)
+	private static void InsertRows(SqliteConnection connection, SqliteTransaction transaction, IEnumerable<object> rows)
 	{
-		// Check the existing header because it will differ if the file was created by another version, and
-		// check if the last line is terminated because it will not be if a previous write was interrupted.
-		string existingHeader = null;
-		bool isTerminated = true;
+		SqliteCommand signalCommand = null;
+		SqliteCommand speedCommand = null;
+		SqliteCommand eventCommand = null;
 
-		var fileInfo = new FileInfo(filePath);
-		if (fileInfo.Exists && (fileInfo.Length > 0))
+		try
 		{
-			using var rs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-			if (rs.Length > 0)
+			foreach (var row in rows)
 			{
-				rs.Seek(-1, SeekOrigin.End);
-				isTerminated = (rs.ReadByte() == '\n');
+				switch (row)
+				{
+					case SignalSample signal:
+						signalCommand ??= CreateInsertCommand(connection, transaction, SignalTable, _signalColumns);
+						Insert(signalCommand, GetValues(signal));
+						break;
 
-				rs.Seek(0, SeekOrigin.Begin);
-				using var sr = new StreamReader(rs, new UTF8Encoding(false), true);
-				existingHeader = sr.ReadLine();
+					case SpeedSample speed:
+						speedCommand ??= CreateInsertCommand(connection, transaction, SpeedTable, _speedColumns);
+						Insert(speedCommand, GetValues(speed));
+						break;
+
+					case SwitchEvent switchEvent:
+						eventCommand ??= CreateInsertCommand(connection, transaction, EventTable, _eventColumns);
+						Insert(eventCommand, GetValues(switchEvent));
+						break;
+				}
 			}
 		}
-
-		using var fs = new FileStream(filePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
-
-		var content = new StringBuilder();
-		if (fs.Length == 0)
+		finally
 		{
-			content.Append(header).Append(NewLine);
+			signalCommand?.Dispose();
+			speedCommand?.Dispose();
+			eventCommand?.Dispose();
 		}
-		else
-		{
-			if (!isTerminated)
-				content.Append(NewLine);
-
-			lines = Rearrange(lines, header, existingHeader);
-		}
-
-		foreach (var line in lines)
-			content.Append(line).Append(NewLine);
-
-		using var sw = new StreamWriter(fs, new UTF8Encoding(false));
-		sw.Write(content.ToString());
-		sw.Flush();
 	}
 
-	/// <summary>
-	/// Rearranges lines to match the header of an existing file so that the file remains readable.
-	/// </summary>
-	private static IEnumerable<string> Rearrange(IEnumerable<string> lines, string header, string existingHeader)
+	private static SqliteCommand CreateInsertCommand(SqliteConnection connection, SqliteTransaction transaction, string table, string[] columns)
 	{
-		if (string.IsNullOrWhiteSpace(existingHeader) ||
-			string.Equals(header, existingHeader.Trim(), StringComparison.Ordinal))
-			return lines;
+		var command = connection.CreateCommand();
+		command.Transaction = transaction;
+		command.CommandText = $"INSERT INTO {table} ({string.Join(", ", columns)}) VALUES ({string.Join(", ", columns.Select(x => "$" + x))});";
 
-		var existingNames = CsvLine.Split(existingHeader)?.Select(x => x.Trim()).ToArray();
-		if ((existingNames is null) || !existingNames.Contains("Time", StringComparer.OrdinalIgnoreCase)) // Not a header
-			return lines;
+		foreach (var column in columns)
+			command.Parameters.AddWithValue("$" + column, DBNull.Value);
 
-		var columns = CsvLine.GetColumns(header);
+		return command;
+	}
 
-		return lines.Select(line =>
-		{
-			var fields = CsvLine.Split(line);
-			return CsvLine.Join(existingNames.Select(x => CsvLine.GetField(columns, fields, x) ?? string.Empty).ToArray());
-		});
+	private static void Insert(SqliteCommand command, object[] values)
+	{
+		for (int i = 0; i < values.Length; i++)
+			command.Parameters[i].Value = values[i] ?? DBNull.Value;
+
+		command.ExecuteNonQuery();
+	}
+
+	private static object[] GetValues(SignalSample sample) => new object[]
+	{
+		CsvLine.FormatTime(sample.Time),
+		sample.InterfaceId.ToString("D"),
+		sample.Profile ?? string.Empty,
+		sample.Connected ? 1 : 0,
+		sample.Signal,
+		sample.Rssi,
+		ToReal(sample.Band, 3),
+		sample.Channel,
+		sample.Protocol ?? string.Empty,
+		sample.Bssid ?? string.Empty,
+		sample.LinkRate
+	};
+
+	private static object[] GetValues(SpeedSample sample) => new object[]
+	{
+		CsvLine.FormatTime(sample.Time),
+		sample.InterfaceId.ToString("D"),
+		sample.Profile ?? string.Empty,
+		sample.Bssid ?? string.Empty,
+		ToReal(sample.Band, 3),
+		sample.Channel,
+		sample.Signal,
+		sample.LinkRate,
+		ToReal(sample.GatewayMs),
+		ToReal(sample.LatencyMs),
+		ToReal(sample.JitterMs),
+		ToReal(sample.DownMbps),
+		ToReal(sample.UpMbps),
+		sample.DownBytes,
+		sample.UpBytes,
+		sample.DurationMs,
+		sample.Trigger.ToString(),
+		sample.Result.ToString(),
+		sample.Valid ? 1 : 0
+	};
+
+	private static object[] GetValues(SwitchEvent switchEvent) => new object[]
+	{
+		CsvLine.FormatTime(switchEvent.Time),
+		switchEvent.InterfaceId.ToString("D"),
+		switchEvent.Kind.ToString(),
+		switchEvent.From ?? string.Empty,
+		switchEvent.To ?? string.Empty,
+		ToReal(switchEvent.FromScore),
+		ToReal(switchEvent.ToScore),
+		switchEvent.Reason ?? string.Empty
+	};
+
+	/// <summary>
+	/// Converts a value to that of a REAL column, null if the value is not a finite number.
+	/// </summary>
+	private static object ToReal(double? value, int digits = 2)
+	{
+		if (!value.HasValue || double.IsNaN(value.Value) || double.IsInfinity(value.Value))
+			return null;
+
+		return Math.Round(value.Value, digits);
 	}
 
 	#endregion
 
 	#region Read
 
-	private delegate bool TryParser<T>(IReadOnlyDictionary<string, int> columns, string[] fields, out T item);
-
 	public IReadOnlyList<SignalSample> ReadSignals(DateTime fromUtc, DateTime toUtc)
 	{
 		try
 		{
-			return ReadFiles<SignalSample>(SignalPrefix, fromUtc, toUtc, SignalSample.TryParse, x => x.Time);
+			lock (_lock)
+			{
+				return ReadRows(SignalTable, _signalColumns, fromUtc, toUtc, ReadSignal);
+			}
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to read signal history." + Environment.NewLine
 				+ ex);
+
+			CloseConnection();
 			return Array.Empty<SignalSample>();
 		}
 	}
@@ -437,12 +682,17 @@ internal class HistoryService : IDisposable
 	{
 		try
 		{
-			return ReadFiles<SpeedSample>(SpeedPrefix, fromUtc, toUtc, SpeedSample.TryParse, x => x.Time);
+			lock (_lock)
+			{
+				return ReadRows(SpeedTable, _speedColumns, fromUtc, toUtc, ReadSpeed);
+			}
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to read speed history." + Environment.NewLine
 				+ ex);
+
+			CloseConnection();
 			return Array.Empty<SpeedSample>();
 		}
 	}
@@ -451,98 +701,182 @@ internal class HistoryService : IDisposable
 	{
 		try
 		{
-			return ReadFiles<SwitchEvent>(EventPrefix, fromUtc, toUtc, SwitchEvent.TryParse, x => x.Time);
+			lock (_lock)
+			{
+				return ReadRows(EventTable, _eventColumns, fromUtc, toUtc, ReadEvent);
+			}
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to read event history." + Environment.NewLine
 				+ ex);
+
+			CloseConnection();
 			return Array.Empty<SwitchEvent>();
 		}
 	}
 
-	private List<T> ReadFiles<T>(string prefix, DateTime fromUtc, DateTime toUtc, TryParser<T> tryParse, Func<T, DateTime> getTime)
+	/// <summary>
+	/// Reads the rows of a table within a range of time in order of time.
+	/// </summary>
+	/// <remarks>This method must be called inside the lock and can throw an exception.</remarks>
+	private List<T> ReadRows<T>(string table, string[] columns, DateTime fromUtc, DateTime toUtc, Func<SqliteDataReader, T> read) where T : class
 	{
+		var items = new List<T>();
+
+		// The stored time has no fraction of a second and so the range is narrowed to whole seconds.
 		fromUtc = CsvLine.ToUtc(fromUtc);
 		toUtc = CsvLine.ToUtc(toUtc);
 
-		var items = new List<T>();
+		var fraction = fromUtc.Ticks % TimeSpan.TicksPerSecond;
+		if (fraction > 0)
+		{
+			if (fromUtc.Ticks - fraction > DateTime.MaxValue.Ticks - TimeSpan.TicksPerSecond)
+				return items;
+
+			fromUtc = new DateTime(fromUtc.Ticks - fraction + TimeSpan.TicksPerSecond, DateTimeKind.Utc);
+		}
+
 		if (toUtc < fromUtc)
 			return items;
 
-		var files = EnumerateFiles(prefix)
-			.Where(x => (fromUtc.Date <= x.date) && (x.date <= toUtc.Date))
-			.OrderBy(x => x.date)
-			.ToArray();
+		var connection = GetConnection(false);
+		if (connection is null)
+			return items;
 
-		foreach (var (filePath, _) in files)
+		// The rows of the same time are in order of insertion.
+		using var command = CreateCommand(connection, null,
+			$"SELECT {string.Join(", ", columns)} FROM {table} WHERE time >= $from AND time <= $to ORDER BY time, id;",
+			("$from", CsvLine.FormatTime(fromUtc)),
+			("$to", CsvLine.FormatTime(toUtc)));
+
+		using var reader = command.ExecuteReader();
+		while (reader.Read())
 		{
-			try
-			{
-				ReadFile(filePath, fromUtc, toUtc, tryParse, getTime, items);
-			}
-			catch (Exception ex)
-			{
-				Trace.WriteLine("Failed to read history file." + Environment.NewLine
-					+ ex);
-			}
-		}
-
-		// OrderBy method is stable and so the order of rows of the same time is kept.
-		return items.OrderBy(x => getTime(x)).ToList();
-	}
-
-	private static void ReadFile<T>(string filePath, DateTime fromUtc, DateTime toUtc, TryParser<T> tryParse, Func<T, DateTime> getTime, List<T> items)
-	{
-		using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-		using var sr = new StreamReader(fs, new UTF8Encoding(false), true);
-
-		var columns = CsvLine.GetColumns(sr.ReadLine());
-		if (columns is not { Count: > 0 })
-			return;
-
-		string line;
-		while ((line = sr.ReadLine()) is not null)
-		{
-			if (line.Length == 0)
-				continue;
-
-			var fields = CsvLine.Split(line);
-			if (fields is null)
-				continue;
-
-			if (!tryParse(columns, fields, out T item))
-				continue;
-
-			var time = getTime(item);
-			if ((fromUtc <= time) && (time <= toUtc))
+			var item = read(reader);
+			if (item is not null)
 				items.Add(item);
 		}
+		return items;
 	}
 
-	private IEnumerable<(string filePath, DateTime date)> EnumerateFiles(string prefix)
+	private static SignalSample ReadSignal(SqliteDataReader reader)
 	{
-		if (!Directory.Exists(_folderPath))
-			yield break;
+		if (!CsvLine.TryParseTime(GetString(reader, 0), out DateTime time) ||
+			!Guid.TryParse(GetString(reader, 1), out Guid interfaceId))
+			return null;
 
-		foreach (var filePath in Directory.EnumerateFiles(_folderPath, prefix + "-*.csv"))
+		return new SignalSample
 		{
-			if (!string.Equals(Path.GetExtension(filePath), ".csv", StringComparison.OrdinalIgnoreCase))
-				continue;
-
-			var name = Path.GetFileNameWithoutExtension(filePath);
-			if (name.Length != prefix.Length + 1 + DateFormat.Length)
-				continue;
-
-			if (DateTime.TryParseExact(name.Substring(prefix.Length + 1), DateFormat, CultureInfo.InvariantCulture,
-				DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out DateTime date))
-				yield return (filePath, date);
-		}
+			Time = time,
+			InterfaceId = interfaceId,
+			Profile = GetString(reader, 2),
+			Connected = (GetLong(reader, 3) ?? 0L) != 0L,
+			Signal = (int)(GetLong(reader, 4) ?? 0L),
+			Rssi = (int?)GetLong(reader, 5),
+			Band = (float)(GetDouble(reader, 6) ?? 0D),
+			Channel = (int)(GetLong(reader, 7) ?? 0L),
+			Protocol = GetString(reader, 8),
+			Bssid = GetString(reader, 9),
+			LinkRate = (int?)GetLong(reader, 10)
+		};
 	}
+
+	private static SpeedSample ReadSpeed(SqliteDataReader reader)
+	{
+		if (!CsvLine.TryParseTime(GetString(reader, 0), out DateTime time) ||
+			!Guid.TryParse(GetString(reader, 1), out Guid interfaceId))
+			return null;
+
+		// An unknown trigger or result is tolerated. An unknown result is never regarded as valid.
+		if (!SpeedSample.TryParseEnum(GetString(reader, 16), out SpeedTrigger trigger))
+			trigger = default;
+
+		if (!SpeedSample.TryParseEnum(GetString(reader, 17), out SpeedResult result))
+			result = SpeedResult.None;
+
+		return new SpeedSample
+		{
+			Time = time,
+			InterfaceId = interfaceId,
+			Profile = GetString(reader, 2),
+			Bssid = GetString(reader, 3),
+			Band = (float)(GetDouble(reader, 4) ?? 0D),
+			Channel = (int)(GetLong(reader, 5) ?? 0L),
+			Signal = (int)(GetLong(reader, 6) ?? 0L),
+			LinkRate = (int?)GetLong(reader, 7),
+			GatewayMs = GetDouble(reader, 8),
+			LatencyMs = GetDouble(reader, 9),
+			JitterMs = GetDouble(reader, 10),
+			DownMbps = GetDouble(reader, 11),
+			UpMbps = GetDouble(reader, 12),
+			DownBytes = GetLong(reader, 13) ?? 0L,
+			UpBytes = GetLong(reader, 14) ?? 0L,
+			DurationMs = (int)(GetLong(reader, 15) ?? 0L),
+			Trigger = trigger,
+			Result = result
+		};
+	}
+
+	private static SwitchEvent ReadEvent(SqliteDataReader reader)
+	{
+		if (!CsvLine.TryParseTime(GetString(reader, 0), out DateTime time) ||
+			!Guid.TryParse(GetString(reader, 1), out Guid interfaceId) ||
+			!SpeedSample.TryParseEnum(GetString(reader, 2), out SwitchKind kind))
+			return null;
+
+		return new SwitchEvent
+		{
+			Time = time,
+			InterfaceId = interfaceId,
+			Kind = kind,
+			From = GetString(reader, 3),
+			To = GetString(reader, 4),
+			FromScore = GetDouble(reader, 5),
+			ToScore = GetDouble(reader, 6),
+			Reason = GetString(reader, 7)
+		};
+	}
+
+	private static string GetString(SqliteDataReader reader, int ordinal) =>
+		reader.IsDBNull(ordinal) ? string.Empty : reader.GetString(ordinal);
+
+	private static long? GetLong(SqliteDataReader reader, int ordinal) =>
+		reader.IsDBNull(ordinal) ? null : reader.GetInt64(ordinal);
+
+	private static double? GetDouble(SqliteDataReader reader, int ordinal) =>
+		reader.IsDBNull(ordinal) ? null : reader.GetDouble(ordinal);
 
 	#endregion
 
 	#region Speed
+
+	/// <summary>
+	/// Loads speed samples within the period of summary from the database.
+	/// </summary>
+	/// <remarks>This method must be called inside the lock and can throw an exception.</remarks>
+	private void LoadSpeeds()
+	{
+		var now = GetNow();
+		var samples = ReadRows(SpeedTable, _speedColumns, now - SpeedSummary.Period, now.AddDays(1), ReadSpeed);
+
+		_speeds.Clear();
+
+		// The samples which have not been written yet follow those in the database.
+		foreach (var sample in samples.Concat(_pending.OfType<SpeedSample>()))
+			HoldSpeed(sample);
+	}
+
+	private void HoldSpeed(SpeedSample sample)
+	{
+		var key = sample.Key;
+		if (!_speeds.TryGetValue(key, out List<SpeedSample> samples))
+		{
+			samples = new List<SpeedSample>();
+			_speeds.Add(key, samples);
+		}
+		samples.Add(sample);
+	}
 
 	/// <summary>
 	/// Gets speed samples of a profile held in memory.
@@ -616,11 +950,14 @@ internal class HistoryService : IDisposable
 	}
 
 	/// <summary>
-	/// Moves samples of a profile held in memory to a new key.
+	/// Moves the history of a profile to a new key.
 	/// </summary>
 	/// <param name="oldKey">Old profile key</param>
 	/// <param name="newKey">New profile key</param>
-	/// <remarks>Rows in files are not changed.</remarks>
+	/// <remarks>
+	/// Signal samples and speed samples in the database are moved as well as those held in
+	/// memory. Switching events are left as they were recorded.
+	/// </remarks>
 	public void Rename(string oldKey, string newKey)
 	{
 		try
@@ -649,12 +986,43 @@ internal class HistoryService : IDisposable
 						(CsvLine.ToUtc(existing.Time) < CsvLine.ToUtc(last.Time)))
 						_lastSignals[newKey] = last;
 				}
+
+				if (!TrySplitKey(oldKey, out string oldName, out Guid oldId) ||
+					!TrySplitKey(newKey, out string newName, out Guid newId) ||
+					(oldId != newId))
+					return;
+
+				// The samples held in memory and waiting to be written are the same instances.
+				foreach (var sample in (samples ?? Enumerable.Empty<SpeedSample>()).Where(x => x.Profile == oldName))
+					sample.Profile = newName;
+
+				foreach (var sample in _pending.OfType<SignalSample>().Where(x => (x.InterfaceId == oldId) && (x.Profile == oldName)))
+					sample.Profile = newName;
+
+				var connection = GetConnection(false);
+				if (connection is null)
+					return;
+
+				using var transaction = connection.BeginTransaction();
+
+				foreach (var table in new[] { SignalTable, SpeedTable })
+				{
+					Execute(connection, transaction,
+						$"UPDATE {table} SET profile = $new WHERE profile = $old AND interface_id = $id;",
+						("$new", newName),
+						("$old", oldName),
+						("$id", oldId.ToString("D")));
+				}
+
+				transaction.Commit();
 			}
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to rename history." + Environment.NewLine
 				+ ex);
+
+			CloseConnection();
 		}
 	}
 
@@ -663,7 +1031,7 @@ internal class HistoryService : IDisposable
 	#region Purge
 
 	/// <summary>
-	/// Deletes files older than retention days.
+	/// Deletes rows older than retention days.
 	/// </summary>
 	/// <param name="retentionDays">Retention days</param>
 	public void Purge(int retentionDays)
@@ -673,35 +1041,273 @@ internal class HistoryService : IDisposable
 			if (retentionDays < 1)
 				return;
 
-			var oldest = GetNow().Date.AddDays(-retentionDays);
+			var oldest = CsvLine.FormatTime(GetNow().Date.AddDays(-retentionDays));
 
 			lock (_lock)
 			{
-				var filePaths = new[] { SignalPrefix, SpeedPrefix, EventPrefix }
-					.SelectMany(x => EnumerateFiles(x))
-					.Where(x => x.date < oldest)
-					.Select(x => x.filePath)
-					.ToArray();
+				var connection = GetConnection(false);
+				if (connection is null)
+					return;
 
-				foreach (var filePath in filePaths)
+				using (var transaction = connection.BeginTransaction())
 				{
-					try
-					{
-						File.Delete(filePath);
-					}
-					catch (Exception ex)
-					{
-						Trace.WriteLine("Failed to delete history file." + Environment.NewLine
-							+ ex);
-					}
+					foreach (var table in new[] { SignalTable, SpeedTable, EventTable })
+						Execute(connection, transaction, $"DELETE FROM {table} WHERE time < $oldest;", ("$oldest", oldest));
+
+					transaction.Commit();
 				}
+
+				// Let the file of write-ahead log start over.
+				Execute(connection, null, "PRAGMA wal_checkpoint(TRUNCATE);");
 			}
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to purge history." + Environment.NewLine
 				+ ex);
+
+			CloseConnection();
 		}
+	}
+
+	#endregion
+
+	#region Import/Export
+
+	private delegate bool TryParser<T>(IReadOnlyDictionary<string, int> columns, string[] fields, out T item);
+
+	/// <summary>
+	/// Imports the daily CSV files written by previous versions (signal-yyyyMMdd.csv,
+	/// speed-yyyyMMdd.csv, events-yyyyMMdd.csv) into the database, once, and then renames the folder.
+	/// </summary>
+	/// <param name="folderPath">Folder path of CSV files</param>
+	/// <returns>Number of imported rows</returns>
+	/// <remarks>
+	/// All the rows are imported in a transaction which records the completion as well, and so
+	/// the files are never imported twice even if this method is interrupted or called again.
+	/// The folder is renamed (not deleted) to that with "-csv-imported" suffix.
+	/// This method takes time and so must not be called on the UI thread.
+	/// </remarks>
+	public int ImportCsv(string folderPath)
+	{
+		int count = 0;
+
+		try
+		{
+			if (string.IsNullOrEmpty(folderPath))
+				return 0;
+
+			string state;
+			lock (_lock)
+			{
+				var connection = GetConnection(false);
+				state = (connection is not null) ? GetMeta(connection, ImportKey) : null;
+			}
+
+			if (state == ImportDone)
+				return 0;
+
+			if (state != ImportImported)
+			{
+				var rows = new List<object>();
+				rows.AddRange(ReadCsvFiles<SignalSample>(folderPath, "signal", SignalSample.TryParse));
+				rows.AddRange(ReadCsvFiles<SpeedSample>(folderPath, "speed", SpeedSample.TryParse));
+				rows.AddRange(ReadCsvFiles<SwitchEvent>(folderPath, "events", SwitchEvent.TryParse));
+
+				lock (_lock)
+				{
+					// Nothing is created if there is nothing to be imported.
+					var connection = GetConnection(rows.Count > 0);
+					if (connection is null)
+						return 0;
+
+					if (GetMeta(connection, ImportKey) is not null) // Imported by another call in the meantime
+						return 0;
+
+					using (var transaction = connection.BeginTransaction())
+					{
+						InsertRows(connection, transaction, rows);
+						SetMeta(connection, transaction, ImportKey, (rows.Count > 0) ? ImportImported : ImportDone);
+						transaction.Commit();
+					}
+
+					count = rows.Count;
+					if (count == 0)
+						return 0;
+
+					LoadSpeeds();
+				}
+			}
+
+			if (RenameImportedFolder(folderPath))
+			{
+				lock (_lock)
+				{
+					SetMeta(GetConnection(true), null, ImportKey, ImportDone);
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to import history files." + Environment.NewLine
+				+ ex);
+
+			CloseConnection();
+		}
+
+		if (count > 0)
+		{
+			OnChanged(HistoryKind.Signal);
+			OnChanged(HistoryKind.Speed);
+			OnChanged(HistoryKind.Event);
+		}
+		return count;
+	}
+
+	/// <summary>
+	/// Renames the folder of imported CSV files.
+	/// </summary>
+	/// <returns>True if the folder is renamed or does not exist</returns>
+	private static bool RenameImportedFolder(string folderPath)
+	{
+		try
+		{
+			folderPath = folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+			if (!Directory.Exists(folderPath))
+				return true;
+
+			var newPath = folderPath + ImportedSuffix;
+			for (int i = 2; Directory.Exists(newPath) || File.Exists(newPath); i++)
+				newPath = folderPath + ImportedSuffix + "-" + i.ToString(CultureInfo.InvariantCulture);
+
+			Directory.Move(folderPath, newPath);
+			return true;
+		}
+		catch (Exception ex)
+		{
+			// It will be tried again when this application starts next time.
+			Trace.WriteLine("Failed to rename folder of imported history files." + Environment.NewLine
+				+ ex);
+			return false;
+		}
+	}
+
+	private static List<T> ReadCsvFiles<T>(string folderPath, string prefix, TryParser<T> tryParse)
+	{
+		var items = new List<T>();
+
+		foreach (var filePath in EnumerateCsvFiles(folderPath, prefix).OrderBy(x => x.date).Select(x => x.filePath))
+		{
+			try
+			{
+				ReadCsvFile(filePath, tryParse, items);
+			}
+			catch (Exception ex)
+			{
+				Trace.WriteLine("Failed to read history file." + Environment.NewLine
+					+ ex);
+			}
+		}
+		return items;
+	}
+
+	/// <summary>
+	/// Reads a CSV file by its header skipping the lines which cannot be parsed, such as the last
+	/// line which was cut off.
+	/// </summary>
+	private static void ReadCsvFile<T>(string filePath, TryParser<T> tryParse, List<T> items)
+	{
+		using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+		using var sr = new StreamReader(fs, new UTF8Encoding(false), true);
+
+		var columns = CsvLine.GetColumns(sr.ReadLine());
+		if (columns is not { Count: > 0 })
+			return;
+
+		string line;
+		while ((line = sr.ReadLine()) is not null)
+		{
+			if (line.Length == 0)
+				continue;
+
+			var fields = CsvLine.Split(line);
+			if (fields is null)
+				continue;
+
+			if (tryParse(columns, fields, out T item))
+				items.Add(item);
+		}
+	}
+
+	private static IEnumerable<(string filePath, DateTime date)> EnumerateCsvFiles(string folderPath, string prefix)
+	{
+		if (!Directory.Exists(folderPath))
+			yield break;
+
+		foreach (var filePath in Directory.EnumerateFiles(folderPath, prefix + "-*.csv"))
+		{
+			if (!string.Equals(Path.GetExtension(filePath), ".csv", StringComparison.OrdinalIgnoreCase))
+				continue;
+
+			var name = Path.GetFileNameWithoutExtension(filePath);
+			if (name.Length != prefix.Length + 1 + DateFormat.Length)
+				continue;
+
+			if (DateTime.TryParseExact(name.Substring(prefix.Length + 1), DateFormat, CultureInfo.InvariantCulture,
+				DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out DateTime date))
+				yield return (filePath, date);
+		}
+	}
+
+	/// <summary>
+	/// Exports the rows within a range of time to three CSV files (signal, speed and events).
+	/// </summary>
+	/// <param name="folderPath">Folder path to export to</param>
+	/// <param name="fromUtc">Start of the range (UTC)</param>
+	/// <param name="toUtc">End of the range (UTC)</param>
+	/// <returns>File paths of exported files, empty if failed</returns>
+	/// <remarks>
+	/// The file names (export-yyyyMMdd-HHmmss-signal.csv and so on, in local time) never match
+	/// those of the files to be imported.
+	/// </remarks>
+	public IReadOnlyList<string> ExportCsv(string folderPath, DateTime fromUtc, DateTime toUtc)
+	{
+		try
+		{
+			var signals = ReadSignals(fromUtc, toUtc);
+			var speeds = ReadSpeeds(fromUtc, toUtc);
+			var events = ReadEvents(fromUtc, toUtc);
+
+			Directory.CreateDirectory(folderPath);
+
+			var stamp = GetNow().ToLocalTime().ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+			string GetFilePath(string name) => Path.Combine(folderPath, $"export-{stamp}-{name}.csv");
+
+			var filePaths = new[] { GetFilePath("signal"), GetFilePath("speed"), GetFilePath("events") };
+
+			WriteCsvFile(filePaths[0], SignalSample.Header, signals.Select(x => x.ToCsv()));
+			WriteCsvFile(filePaths[1], SpeedSample.Header, speeds.Select(x => x.ToCsv()));
+			WriteCsvFile(filePaths[2], SwitchEvent.Header, events.Select(x => x.ToCsv()));
+
+			return filePaths;
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to export history files." + Environment.NewLine
+				+ ex);
+			return Array.Empty<string>();
+		}
+	}
+
+	private static void WriteCsvFile(string filePath, string header, IEnumerable<string> lines)
+	{
+		// The byte order mark lets spreadsheet applications read names in UTF-8.
+		using var sw = new StreamWriter(filePath, false, new UTF8Encoding(true));
+		sw.NewLine = "\r\n";
+
+		sw.WriteLine(header);
+		foreach (var line in lines)
+			sw.WriteLine(line);
 	}
 
 	#endregion
@@ -733,7 +1339,7 @@ internal class HistoryService : IDisposable
 				{
 					// Try to write the rows which could not be written before.
 					if (_pending.Count > 0)
-						WriteRows(new List<Row>());
+						WriteRows(new List<object>());
 				}
 			}
 			catch (Exception ex)
@@ -741,6 +1347,9 @@ internal class HistoryService : IDisposable
 				Trace.WriteLine("Failed to dispose history." + Environment.NewLine
 					+ ex);
 			}
+
+			// The write-ahead log is merged into the database when the last connection is closed.
+			CloseConnection();
 		}
 
 		_isDisposed = true;

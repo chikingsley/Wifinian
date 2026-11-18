@@ -25,6 +25,14 @@ internal static class AppDataService
 	}
 	private static string _folderPath;
 
+	/// <summary>
+	/// File path of the database of history
+	/// </summary>
+	public static string HistoryFilePath => Path.Combine(FolderPath, "history.db");
+
+	/// <summary>
+	/// Folder path of exported history files (and of the files of previous versions to be imported)
+	/// </summary>
 	public static string HistoryFolderPath => Path.Combine(FolderPath, "history");
 
 	public static string EnsureFolderPath()

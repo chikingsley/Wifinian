@@ -27,13 +27,26 @@ This fork records how each saved network performs and can let __Engage__ choose 
 
 ### What is recorded and where
 
-History is kept as plain CSV files (UTC times, one file per day) in `%LOCALAPPDATA%\Wifinian\history`. Files older than 90 days are deleted. Nothing is sent anywhere.
+History is kept in one local SQLite database, `%LOCALAPPDATA%\Wifinian\history.db`. Rows older than 90 days are deleted. Nothing is sent anywhere.
 
- * `signal-yyyyMMdd.csv` - signal of every saved network in range, at most about once a minute while it changes and at least every 5 minutes: `Time,InterfaceId,Profile,Connected,Signal,Rssi,Band,Channel,Protocol,Bssid,LinkRate`
- * `speed-yyyyMMdd.csv` - one row per speed test: `Time,InterfaceId,Profile,Bssid,Band,Channel,Signal,LinkRate,GatewayMs,LatencyMs,JitterMs,DownMbps,UpMbps,DownBytes,UpBytes,DurationMs,Trigger,Result,Valid`
- * `events-yyyyMMdd.csv` - every automatic switch and the reason for it, decisions to stay, and what speed-aware Engage would have done while it is off: `Time,InterfaceId,Kind,From,To,FromScore,ToScore,Reason`
+ * `signal` table - signal of every saved network in range, at most about once a minute while it changes and at least every 5 minutes: `time, interface_id, profile, connected, signal, rssi, band, channel, protocol, bssid, link_rate`
+ * `speed` table - one row per speed test: `time, interface_id, profile, bssid, band, channel, signal, link_rate, gateway_ms, latency_ms, jitter_ms, down_mbps, up_mbps, down_bytes, up_bytes, duration_ms, trigger, result, valid`
+ * `events` table - every automatic switch and the reason for it, decisions to stay, and what speed-aware Engage would have done while it is off: `time, interface_id, kind, from_profile, to_profile, from_score, to_score, reason`
 
-__History...__ in the menu opens a window with a summary per network, charts of signal and download speed (24 hours, 7 days or 30 days), the list of measurements and the list of decisions. The latest result is also shown at the right of each network's name in the main window (download / upload in Mbps, latency, age).
+`time` is UTC as ISO 8601 text (`2026-11-17T23:37:29Z`), so it sorts and compares as text; each table is indexed by `time` and by profile and `time`. The database can be read with any SQLite tool while the app is running (it uses write-ahead logging, hence the `history.db-wal` and `history.db-shm` files beside it while the app runs), for example:
+
+```sql
+SELECT profile, count(*) AS tests, round(avg(down_mbps), 1) AS down, round(avg(latency_ms), 1) AS latency
+FROM speed WHERE valid = 1 AND time >= '2026-11-01' GROUP BY profile;
+```
+
+The schema version is kept in `PRAGMA user_version`. When a network is renamed in this app, its rows in `signal` and `speed` are moved to the new name; `events` are left as they were recorded.
+
+__History...__ in the menu opens a window with a summary per network, charts of signal and download speed (24 hours, 7 days or 30 days), the list of measurements and the list of decisions. __Open data folder__ opens the folder of the database. __Export CSV__ writes the shown range to three CSV files (`export-yyyyMMdd-HHmmss-signal.csv`, `-speed.csv` and `-events.csv`, UTF-8) in `%LOCALAPPDATA%\Wifinian\history` and opens that folder. The latest result is also shown at the right of each network's name in the main window (download / upload in Mbps, latency, age).
+
+Earlier builds of this fork wrote daily CSV files (`signal-yyyyMMdd.csv`, `speed-yyyyMMdd.csv`, `events-yyyyMMdd.csv`) in `%LOCALAPPDATA%\Wifinian\history`. They are imported into the database once, in the background shortly after the app starts, and the folder is then renamed to `history-csv-imported`. It is not deleted and is no longer used, so it can be removed by hand.
+
+The database is accessed through [Microsoft.Data.Sqlite](https://learn.microsoft.com/dotnet/standard/data/sqlite/) with the native SQLite library of SQLitePCLRaw, which is placed under `runtimes\win-x86`, `win-x64` and `win-arm64` beside the executable and chosen by the architecture of the process.
 
 ### Speed test
 
@@ -58,7 +71,7 @@ Tick __Engage by measured speed__ in the menu. It only has effect while __Engage
  * Before leaving, it retests the current network if its latest result is more than two hours old. After switching, it tests the new network; if that has no internet, or twice measures clearly worse than the network it left, it switches back once and leaves that network alone for 2 hours.
  * With no measurements at all it falls back to the original priority order. A network that has never been tested is tried once a day when the current one is below 50 Mbps. A connected network with no internet or a signal below 30 % is left for the best alternative.
 
-Every decision is written with its reason to the events file and shown in the Decisions tab of the History window. While __Engage by measured speed__ is off but __Record history__ is on, the same logic runs without acting and records "would switch" rows, so it can be judged before it is turned on.
+Every decision is written with its reason to the events table and shown in the Decisions tab of the History window. While __Engage by measured speed__ is off but __Record history__ is on, the same logic runs without acting and records "would switch" rows, so it can be judged before it is turned on.
 
 ### Avoid
 
@@ -79,7 +92,7 @@ These values are only in `%LOCALAPPDATA%\Wifinian\settings.xml`. Close the app b
 |-|-|-|-|
 |SampleInterval|60|30-300|Seconds between checks of signal and of what to do|
 |ScanInterval|5|0-1440|Minutes between background scans (0 for never); a scan is skipped while the link is in use|
-|HistoryRetentionDays|90|7-365|Days history files are kept|
+|HistoryRetentionDays|90|7-365|Days history is kept|
 |SpeedTestInterval|60|15-240|Minutes between periodic tests of the connected network|
 |SpeedTestDailyBudget|500|50-5000|MB a day automatic tests may use|
 |SwitchDwellTime|10|2-60|Minutes to stay on a network before switching for speed|

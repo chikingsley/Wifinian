@@ -53,6 +53,7 @@
 
   <ItemGroup>
     <PackageReference Include="ManagedNativeWifi" Version="3.0.2" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.15" />
     <PackageReference Include="Microsoft.Xaml.Behaviors.Wpf" Version="1.1.135" />
     <PackageReference Include="ReactiveProperty" Version="9.7.0" />
     <PackageReference Include="System.Reactive.Core" Version="6.0.1" />
@@ -62,6 +63,18 @@
     <PackageReference Include="System.Reactive.Windows.Threading" Version="6.0.1" />
     <PackageReference Include="System.Runtime.CompilerServices.Unsafe" Version="6.1.0" />
     <PackageReference Include="System.ValueTuple" Version="4.5.0" />
+  </ItemGroup>
+
+  <!--
+    Native library of SQLite. The targets of the package would copy only the x86 library next to
+    this AnyCPU executable, and so the libraries are placed for each architecture where
+    SQLitePCLRaw looks for them (runtimes\[RID]\native).
+  -->
+  <ItemGroup>
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.13" ExcludeAssets="all" GeneratePathProperty="true" />
+    <Content Include="$(PkgSQLitePCLRaw_lib_e_sqlite3)\runtimes\win-x86\native\e_sqlite3.dll" Link="runtimes\win-x86\native\e_sqlite3.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <Content Include="$(PkgSQLitePCLRaw_lib_e_sqlite3)\runtimes\win-x64\native\e_sqlite3.dll" Link="runtimes\win-x64\native\e_sqlite3.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <Content Include="$(PkgSQLitePCLRaw_lib_e_sqlite3)\runtimes\win-arm64\native\e_sqlite3.dll" Link="runtimes\win-arm64\native\e_sqlite3.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
 
 </Project>
