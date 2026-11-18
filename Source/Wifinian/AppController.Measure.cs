@@ -605,6 +605,11 @@ internal partial class AppController
 		if (!isFailed && !((sample.Result is SpeedResult.Ok) && !string.IsNullOrWhiteSpace(sample.Detail)))
 			return null;
 
+		// While a server is known to limit requests, each measurement uses another server or
+		// leaves upload out. That time is recorded once, when it starts and when it ends.
+		if (!isFailed && SpeedTester.IsRoutineDetail(sample.Detail))
+			return null;
+
 		return $"Speed test of {sample.Profile} ({sample.Trigger}) ended as {sample.Result} after {sample.DurationMs} ms"
 			+ $" (latency {(sample.LatencyMs.HasValue ? sample.LatencyMs.Value.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + " ms" : "not measured")},"
 			+ $" {sample.DownBytes} bytes down, {sample.UpBytes} bytes up): "

@@ -57,9 +57,9 @@ The database is accessed through [Microsoft.Data.Sqlite](https://learn.microsoft
 A test measures the network the PC is connected to, through the Wi-Fi adapter only:
 
  1. It requests `http://www.msftconnecttest.com/connecttest.txt` to tell working internet from no internet or a sign-in (captive portal) page.
- 2. It measures latency to, downloads from and uploads to `speed.cloudflare.com`.
+ 2. It measures latency to, downloads from and uploads to `speed.cloudflare.com`, or downloads from another server while that one fails or limits requests (see __Test servers and their limits__ below).
 
-Both hosts can be changed in settings.xml (see below). If another connection (e.g. Ethernet) carries the traffic instead of Wi-Fi, the result is recorded as not valid and is never used.
+The hosts can be changed in settings.xml (see below). If another connection (e.g. Ethernet) carries the traffic instead of Wi-Fi, the result is recorded as not valid and is never used.
 
 Every test is timed, not sized: after a second of warm-up it downloads for 4 seconds and then uploads for 4 seconds (8 seconds each for __Test speed now__), whatever the speed of the link. No amount of data ends a test early. (Earlier builds stopped at 20 MB, which on a 100 Mbps link left only about a second to measure and made results jump around.) The only limits left are safety ones: 2 GB per direction, 10 seconds to get the first byte.
 
@@ -97,6 +97,27 @@ Speed is only known for networks that have been connected, so:
  * If this app is closed (Close in the menu, sign-out, shutdown) while a test has the adapter on another network, it asks Windows to reconnect the network it started from before it exits, waits a few seconds (6 at most) and records that in the Decisions list and in `operation.log`. Windows completes the connection even after the app has gone. A process killed from outside cannot do this.
  * __Test other networks when idle__ (off by default) does the same for one network at a time: at most once every 6 hours, only while speed-aware Engage is on, after 10 minutes without keyboard or mouse input and with no traffic on the link, and only for a network not tested in the last 3 days. The connection drops for about 30 seconds each time.
 
+### Test servers and their limits
+
+Download uses the first of these servers that works, in this order:
+
+|Server|File|What it is|
+|-|-|-|
+|`speed.cloudflare.com`|`/__down?bytes=25000000`|Cloudflare's speed test (also the only server for upload, `/__up`)|
+|`cachefly.cachefly.net`|`/100mb.test`|Test file CacheFly publishes on its content delivery network|
+|`proof.ovh.net`|`/files/1Gb.dat`|Test file OVHcloud publishes for testing its network (in Europe)|
+
+A URL set as `SpeedTestDownloadUrl` goes first and these three follow it.
+
+These servers are free and public, and they throttle heavy use. Cloudflare limits how much it serves to one address: after a day of repeated tests (hourly tests, __Test all networks__, tests after switching) it answered every request with HTTP 429 and `Retry-After: 3600` for an hour, and counted the requests made meanwhile. Every test uses data in proportion to the speed of the link (see above), so a fast link tested often reaches such a limit sooner. This is how the app deals with it:
+
+ * A server that answers 429, or 403/503 with a `Retry-After` header, is not asked again until the time it gave is over (30 minutes if it gave none, never less than a minute or more than 6 hours). Not even the latency check connects to it meanwhile. The list is kept in `%LOCALAPPDATA%Wifiniandataservers.txt`, so restarting the app does not forget it; delete that file (with the app closed) to forget it by hand.
+ * The test in which that happens goes on to the next server at once, and so do the tests after it. The same happens when a server cannot be reached or gives no data (the first server asked is tried once more after 3 seconds before it is given up, the others are not). A test fails with "Test server failed" only if no server at all gave a speed.
+ * The `detail` of the speed row names the server when it was not the first one, for example `Server: cachefly.cachefly.net (speed.cloudflare.com limits requests until 14:05)`. Download speeds from different servers are close enough to compare Wi-Fi networks with, but they are not identical on a fast link, and latency is to the server used (the farther server shows a higher one), so the note explains an odd value.
+ * Upload has no second server: no public server is known that accepts this kind of upload from anyone over HTTPS. While the upload server is blocked the test is still recorded as Ok with the upload left blank, the same as when upload alone fails; networks are compared by download speed only, so nothing changes for switching.
+ * `operation.log` gets one line when a server is blocked (with what it answered and until when) and one when it is used again, not one per test.
+ * A test in which the servers failed is never taken as a finding on the network, because internet access was confirmed just before: it does not count in the typical speed, never marks a network as without internet, never causes a switch back, and the check after an automatic switch is simply repeated a minute later.
+
 ### Logs
 
 `operation.log` in `%LOCALAPPDATA%\Wifinian` records every start and every orderly shutdown of this app with its reason (Close in the menu, the main window closed, the Windows session ending) and a second instance that was started and ended at once. A process killed from outside (Task Manager, `taskkill`) cannot write anything, so the next start records that the previous run left no record of its end. Unhandled exceptions are always written to `exception.log` in the same folder before the process ends.
@@ -119,8 +140,8 @@ These values are only in `%LOCALAPPDATA%\Wifinian\settings.xml`. Close the app b
 |SwitchMaxDeferral|15|0-120|Minutes to wait for a pause in traffic before switching anyway (0 for no wait)|
 |ProbeInterval|6|1-48|Hours between tests of other networks when idle|
 |ConnectivityCheckUrl|`http://www.msftconnecttest.com/connecttest.txt`| |Must return the text "Microsoft Connect Test"|
-|SpeedTestDownloadUrl|`https://speed.cloudflare.com/__down?bytes=25000000`| |Any large file over HTTP(S)|
-|SpeedTestUploadUrl|`https://speed.cloudflare.com/__up`| |Must accept HTTP POST|
+|SpeedTestDownloadUrl|`https://speed.cloudflare.com/__down?bytes=25000000`| |Any large file over HTTP(S); used first, the built-in servers follow|
+|SpeedTestUploadUrl|`https://speed.cloudflare.com/__up`| |Must accept HTTP POST; used first, the built-in server follows if this one is blocked|
 
 A network without measurements still needs the signal set by the number on __Engage__ (50-90 %) to be connected to.
 

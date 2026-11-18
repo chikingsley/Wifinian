@@ -206,6 +206,73 @@ public class RevertTest
 		Assert.IsFalse(SwitchPolicy.IsLandingKept(new SwitchLanding { FromName = "A", FromScore = 0, ToName = "B" }, Sample("B", TimeSpan.Zero, 90, 70)));
 	}
 
+	[TestMethod]
+	public void TestReplayPostSwitchTestServerFailed()
+	{
+		// EXT (40 Mbps) is left for EXT2, which looks faster (90 Mbps).
+		var ext = Profile("EXT", 80, 0);
+		var ext2 = Profile("EXT2", 70, 1, isConnected: true);
+		var profiles = new[] { ext, ext2 };
+
+		AddSample("EXT", TimeSpan.FromMinutes(5), 40, 80);
+		AddSample("EXT2", TimeSpan.FromHours(3), 90, 70);
+
+		var state = new SwitchState();
+		SwitchPolicy.RecordAttempt(state, "EXT2", true, _now, setsCooldown: true);
+		SwitchPolicy.Track(state, "EXT2", _now);
+
+		var landing = new SwitchLanding { FromName = "EXT", FromScore = 40, ToName = "EXT2", Time = _utcNow };
+
+		// (1) 20 seconds later the test after the switch finds internet access but every test
+		// server fails (the first limits requests, the others give nothing).
+		var elapsed = TimeSpan.FromSeconds(20);
+		var failed = AddSample("EXT2", -elapsed, null, 70, SpeedTrigger.PostSwitch);
+		failed.Result = SpeedResult.EndpointFailed;
+		failed.Detail = "speed.cloudflare.com failed: Download got no byte: HTTP 429 Too Many Requests (Retry-After 3600); cachefly.cachefly.net failed: Download got no byte: no response within 10 s";
+
+		// It is not a finding on the network: nothing is decided, the switch stays to be checked
+		// and the test is repeated.
+		Assert.IsFalse(failed.Valid);
+		Assert.AreEqual(LandingAction.None, SwitchPolicy.EvaluateLanding(landing, failed, _utcNow + elapsed));
+		Assert.AreEqual(0, landing.LowCount);
+		Assert.IsFalse(SwitchPolicy.IsLandingKept(landing, failed));
+		Assert.IsTrue(AppController.IsLandingUnchecked(failed));
+		Assert.IsTrue(AppController.IsLandingUnchecked(null));
+
+		// The network is not regarded as dead or slower: its summary is that of before.
+		var summary = SpeedSummary.Create(_samples["EXT2"], _utcNow + elapsed);
+		Assert.AreEqual(90D, summary.DownMbps);
+		Assert.AreEqual(SpeedResult.Ok, summary.LastResult);
+		Assert.IsFalse(summary.IsOffline);
+		Assert.IsFalse(summary.IsDead);
+		Assert.AreEqual(1, summary.Count);
+
+		// EXT2 is kept.
+		var decision = SwitchPolicy.Decide(profiles, ext2, CreateContext(elapsed), state);
+		Assert.IsNull(decision.Target);
+		Assert.IsNull(state.PendingTarget);
+
+		// (2) The same happens again a minute later: still nothing against EXT2, however often.
+		elapsed += TimeSpan.FromSeconds(60);
+		var again = AddSample("EXT2", -elapsed, null, 70, SpeedTrigger.PostSwitch);
+		again.Result = SpeedResult.EndpointFailed;
+		Assert.AreEqual(LandingAction.None, SwitchPolicy.EvaluateLanding(landing, again, _utcNow + elapsed));
+		Assert.AreEqual(0, landing.LowCount);
+		Assert.IsFalse(SpeedSummary.Create(_samples["EXT2"], _utcNow + elapsed).IsDead);
+
+		decision = SwitchPolicy.Decide(profiles, ext2, CreateContext(elapsed), state);
+		Assert.IsNull(decision.Target);
+
+		// (3) The next test goes through another server and measures 85 Mbps: the switch is
+		// checked and EXT2 is kept for good.
+		elapsed += TimeSpan.FromSeconds(60);
+		var ok = AddSample("EXT2", -elapsed, 85, 70, SpeedTrigger.PostSwitch);
+		ok.Detail = "Server: cachefly.cachefly.net (speed.cloudflare.com limits requests until 13:00)";
+		Assert.IsFalse(AppController.IsLandingUnchecked(ok));
+		Assert.AreEqual(LandingAction.Clear, SwitchPolicy.EvaluateLanding(landing, ok, _utcNow + elapsed));
+		Assert.IsTrue(SwitchPolicy.IsLandingKept(landing, ok));
+	}
+
 	#endregion
 
 	#region Test of networks

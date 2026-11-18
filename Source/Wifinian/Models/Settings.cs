@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reactive.Linq;
 using System.Windows;
@@ -179,6 +180,33 @@ public class Settings : DisposableBase
 	internal const string DefaultSpeedTestDownloadUrl = "https://speed.cloudflare.com/__down?bytes=25000000";
 	internal const string DefaultSpeedTestUploadUrl = "https://speed.cloudflare.com/__up";
 	internal const string DefaultConnectivityCheckUrl = "http://www.msftconnecttest.com/connecttest.txt";
+
+	/// <summary>
+	/// URLs to download from in speed measurement, in the order in which they are used
+	/// </summary>
+	/// <remarks>
+	/// The first is used as long as it answers. The others are files which their hosts publish
+	/// for testing speed (a content delivery network and a hosting provider) and are used while
+	/// an earlier one fails or limits requests.
+	/// </remarks>
+	internal static readonly IReadOnlyList<string> DefaultSpeedTestDownloadUrls = new[]
+	{
+		DefaultSpeedTestDownloadUrl,
+		"https://cachefly.cachefly.net/100mb.test",
+		"https://proof.ovh.net/files/1Gb.dat"
+	};
+
+	/// <summary>
+	/// URLs to upload to in speed measurement, in the order in which they are used
+	/// </summary>
+	/// <remarks>
+	/// No other public server is known which accepts uploads of this kind over HTTPS for anyone,
+	/// and so while this one limits requests upload is left out of a measurement.
+	/// </remarks>
+	internal static readonly IReadOnlyList<string> DefaultSpeedTestUploadUrls = new[]
+	{
+		DefaultSpeedTestUploadUrl
+	};
 
 	/// <summary>
 	/// URL to download from in speed measurement

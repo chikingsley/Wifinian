@@ -507,7 +507,7 @@ internal partial class AppController
 				// a finding on the network (the test server failed, aborted) leaves the switch
 				// unchecked and so is repeated as long as the check is due. The record of
 				// the switch expires and so does this repetition.
-				if (((sample is null) || !sample.Valid) && !_disposed && !_isProbing && HasLanding(interfaceId))
+				if (IsLandingUnchecked(sample) && !_disposed && !_isProbing && HasLanding(interfaceId))
 					MeasureAfterSwitch(interfaceId, _retestDelay);
 			}
 			catch (Exception ex)
@@ -517,6 +517,17 @@ internal partial class AppController
 			}
 		});
 	}
+
+	/// <summary>
+	/// Determines whether a measurement after an automatic switch left the switch unchecked and
+	/// so is to be repeated: it could not run or is not a finding on the network.
+	/// </summary>
+	/// <remarks>
+	/// A measurement in which every test server failed is such a one. Internet access was
+	/// confirmed before the servers were asked and so it says nothing against the network.
+	/// </remarks>
+	internal static bool IsLandingUnchecked(SpeedSample sample) =>
+		(sample is null) || !sample.Valid;
 
 	/// <summary>
 	/// Tickets by which only the action scheduled last for an interface is run
