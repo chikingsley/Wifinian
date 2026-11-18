@@ -516,10 +516,16 @@ internal partial class AppController
 				if (landing is null)
 					return;
 
+				// The record of the switch expires by the clock and is then removed by whoever
+				// looks at it. That is the end of the time to wait and not a cancellation, which
+				// is the record being removed (checked, switched back from, cleared by the user)
+				// or replaced before its time.
+				bool IsExpired() => DateTime.UtcNow - landing.Time >= SwitchPolicy.LandingPeriod;
+
 				bool IsOver() => _disposed
 					|| _isProbing
 					|| !_postSwitchTicket.IsLatest(interfaceId, ticket)
-					|| !ReferenceEquals(GetLanding(interfaceId), landing);
+					|| IsLandingGone(PeekLanding(interfaceId), landing, IsExpired());
 
 				var wait = await MeasureIdentity.WaitForTargetAsync(
 					() => GetLiveConnection(interfaceId),
@@ -527,7 +533,8 @@ internal partial class AppController
 					SwitchPolicy.LandingPeriod - (DateTime.UtcNow - landing.Time),
 					_targetPollInterval,
 					IsOver,
-					live => Logger.RecordOperation($"The speed test after the switch to {landing.ToName} is waiting: the adapter is on {live.Describe()}.")).ConfigureAwait(false);
+					live => Logger.RecordOperation($"The speed test after the switch to {landing.ToName} is waiting: the adapter is on {live.Describe()}."),
+					isExpired: IsExpired).ConfigureAwait(false);
 
 				if (wait is TargetWait.Canceled)
 					return;
@@ -605,6 +612,32 @@ internal partial class AppController
 	/// Determines whether an automatic switch in an interface is yet to be checked.
 	/// </summary>
 	private bool HasLanding(Guid interfaceId) => GetLanding(interfaceId) is not null;
+
+	/// <summary>
+	/// Gets the record of the automatic switch in an interface as it is kept, expired or not,
+	/// without removing it.
+	/// </summary>
+	private SwitchLanding PeekLanding(Guid interfaceId)
+	{
+		lock (_switchLock)
+		{
+			return _landings.TryGetValue(interfaceId, out SwitchLanding landing) ? landing : null;
+		}
+	}
+
+	/// <summary>
+	/// Determines whether the record of an automatic switch which a measurement is waiting for
+	/// was removed or replaced before its time, so that the measurement is no longer needed.
+	/// </summary>
+	/// <param name="current">Record kept now (null if none)</param>
+	/// <param name="landing">Record which the measurement is for</param>
+	/// <param name="isExpired">Whether the time of the record which the measurement is for is over</param>
+	/// <remarks>
+	/// The current record is to be got before the expiry is determined. A record whose time is
+	/// over is removed by whoever looks at it, which is not a removal before its time.
+	/// </remarks>
+	internal static bool IsLandingGone(SwitchLanding current, SwitchLanding landing, bool isExpired) =>
+		!ReferenceEquals(current, landing) && !isExpired;
 
 	/// <summary>
 	/// Gets the record of the automatic switch in an interface which is yet to be checked.

@@ -312,7 +312,15 @@ internal static class MeasureIdentity
 	/// <param name="isCanceled">Function to tell that waiting is no longer necessary</param>
 	/// <param name="onWaiting">Action called once, with the connection found, when waiting begins</param>
 	/// <param name="delay">Function to wait for an interval (for test)</param>
-	/// <remarks>The first query is made immediately. This method never throws an exception.</remarks>
+	/// <param name="isExpired">Function to tell that the time to wait is over by the clock</param>
+	/// <remarks>
+	/// <para>The first query is made immediately. This method never throws an exception.</para>
+	/// <para>The time to wait is counted by the intervals waited, which is less than the time
+	/// elapsed because the queries take time as well. Where the wait must end with something
+	/// which expires by the clock, the clock is to be given: otherwise that thing is gone
+	/// before the intervals add up to the time, and the wait would end as canceled instead of
+	/// timed out.</para>
+	/// </remarks>
 	public static async Task<TargetWait> WaitForTargetAsync(
 		Func<LiveConnection> query,
 		string expectedName,
@@ -320,7 +328,8 @@ internal static class MeasureIdentity
 		TimeSpan interval,
 		Func<bool> isCanceled = null,
 		Action<LiveConnection> onWaiting = null,
-		Func<TimeSpan, Task> delay = null)
+		Func<TimeSpan, Task> delay = null,
+		Func<bool> isExpired = null)
 	{
 		try
 		{
@@ -333,6 +342,9 @@ internal static class MeasureIdentity
 			{
 				if (isCanceled?.Invoke() is true)
 					return TargetWait.Canceled;
+
+				if (isExpired?.Invoke() is true)
+					return TargetWait.TimedOut;
 
 				var live = query?.Invoke();
 				if (live is null)

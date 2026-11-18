@@ -128,6 +128,11 @@ internal class SwitchState
 	public DateTime OwnFailureAt { get; set; }
 
 	/// <summary>
+	/// Times when automatic connections to networks by this app last failed
+	/// </summary>
+	public Dictionary<string, DateTime> FailedAt { get; } = new(StringComparer.Ordinal);
+
+	/// <summary>
 	/// Time since when a switch has been deferred because the link is in use
 	/// </summary>
 	public DateTime DeferredSince { get; set; }
@@ -323,6 +328,18 @@ internal static class SwitchPolicy
 	/// </summary>
 	public static readonly TimeSpan ConnectingRecheck = TimeSpan.FromSeconds(3);
 
+	/// <summary>
+	/// Time after a failed automatic connection to a network in which it is not attempted again
+	/// in priority order
+	/// </summary>
+	/// <remarks>
+	/// The profiles are loaded again as soon as an attempt has ended (its notifications ask
+	/// for it) and a network which cannot be joined would otherwise be attempted back-to-back
+	/// without end. With switching by speed, the far longer period of exclusion after a failure
+	/// does this.
+	/// </remarks>
+	public static readonly TimeSpan RetrySpacing = TimeSpan.FromSeconds(30);
+
 	public static readonly TimeSpan PersistPeriod = TimeSpan.FromSeconds(30);
 	public static readonly TimeSpan BudgetPeriod = TimeSpan.FromHours(1);
 	public static readonly TimeSpan ExplorePeriod = TimeSpan.FromHours(24);
@@ -419,11 +436,13 @@ internal static class SwitchPolicy
 		if (result)
 		{
 			state.FailureCounts.Remove(targetName);
+			state.FailedAt.Remove(targetName);
 			return;
 		}
 
 		state.ClearPending();
 		state.OwnFailureAt = now;
+		state.FailedAt[targetName] = now;
 
 		if (!setsCooldown)
 			return;
@@ -518,6 +537,21 @@ internal static class SwitchPolicy
 		&& (sample.DownMbps.Value >= RevertRatio * landing.FromScore.Value);
 
 	/// <summary>
+	/// Determines whether an automatic switch yet to be checked is to the specified network, so
+	/// that the measurement after the switch takes the place of the one after connection.
+	/// </summary>
+	/// <param name="landing">Record of the switch (null if none)</param>
+	/// <param name="profileName">Name of the profile connected</param>
+	/// <remarks>
+	/// The measurement after a switch runs only on the network switched to and otherwise waits
+	/// as long as the record remains. If the interface is on another network, connected to
+	/// outside this app, that network would not be measured at all in that time.
+	/// </remarks>
+	public static bool IsLandingOf(SwitchLanding landing, string profileName) =>
+		(landing is not null)
+		&& string.Equals(landing.ToName, profileName, StringComparison.Ordinal);
+
+	/// <summary>
 	/// Decides the profile to connect to.
 	/// </summary>
 	/// <param name="candidates">Profiles allowed to be connected to except avoided ones (this may or may not include connected profile)</param>
@@ -558,14 +592,27 @@ internal static class SwitchPolicy
 
 		if (!context.EngagesSpeed)
 		{
-			var pick = UpstreamPick(candidates);
+			// A network which this app has just failed to connect to is left out for a moment.
+			// The next one in order is taken instead, and if there is none, nothing is attempted.
+			var pick = UpstreamPick(candidates.Where(x => !IsRetryTooSoon(state, x.Name, now)));
+
+			var target = ((pick is null) || ReferenceEquals(pick, connected)) ? null : pick;
+
+			// The decision is made again when the first of the networks left out can be attempted.
+			var retryAt = (target is null)
+				? candidates
+					.Where(x => (context.SignalThreshold <= x.Signal) && !ReferenceEquals(x, connected) && IsRetryTooSoon(state, x.Name, now))
+					.Select(x => (DateTime?)(state.FailedAt[x.Name] + RetrySpacing))
+					.Min()
+				: null;
 
 			return new SwitchDecision
 			{
-				Target = ((pick is null) || ReferenceEquals(pick, connected)) ? null : pick,
+				Target = target,
 				Kind = SwitchKind.Switch,
 				Reason = "priority order",
-				Code = "priority"
+				Code = "priority",
+				RecheckAfter = retryAt - now
 			};
 		}
 
@@ -1011,6 +1058,17 @@ internal static class SwitchPolicy
 			RecheckAfter = state.LastDisconnectedAt + DisconnectGrace - now
 		};
 	}
+
+	/// <summary>
+	/// Determines whether an automatic connection to a network failed so shortly before that
+	/// it is not to be attempted again yet.
+	/// </summary>
+	internal static bool IsRetryTooSoon(SwitchState state, string targetName, DateTime now) =>
+		(state is not null)
+		&& (targetName is not null)
+		&& state.FailedAt.TryGetValue(targetName, out DateTime failedAt)
+		&& (failedAt <= now) // The clock may have been set back.
+		&& IsWithin(now, failedAt, RetrySpacing);
 
 	private static bool IsWithin(DateTime now, DateTime time, TimeSpan period) => (now - time < period);
 }

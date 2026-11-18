@@ -477,25 +477,28 @@ internal partial class AppController : DisposableBase
 
 			if (targetProfiles.Length > 0)
 			{
-				await Task.WhenAll(targetProfiles.Select(async x =>
+				var results = await Task.WhenAll(targetProfiles.Select(async x =>
 				{
 					var result = await ConnectNetworkAsync(x, false);
 					x.LastFailureTime = result ? default : DateTime.Now;
 					RecordSwitchResult(x, result);
+					return result;
 				}));
 
 				// The notifications of these connections ask for a load while this update is
 				// still running, and a load is skipped while an update is running. Without
 				// another load, the profiles would go on showing the previous network as
-				// connected until something else happens to load them.
-				if (!_disposed)
+				// connected until something else happens to load them. A failed attempt
+				// connected nothing and so asks for no load by itself: a load right after it
+				// would only make the decision, and so the attempt, again at once.
+				if (results.Any(x => x) && !_disposed)
 					_ = Task.Run(() => LoadProfilesFreshAsync(_reloadTimeout));
 			}
 		}
 	}
 
 	private readonly SemaphoreSlim _updateSemaphore = new(1);
-	private int _isLoadPending; // 1 if a change was notified while an update was running
+	private readonly PendingLoad _pendingLoad = new(); // A change notified while an update was running
 
 	/// <summary>
 	/// Loads profiles on a notification of change and, if another update is running, makes sure
@@ -517,7 +520,7 @@ internal partial class AppController : DisposableBase
 			if (await UpdateAsync(() => Task.Run(() => LoadProfilesBaseAsync())).ConfigureAwait(false))
 				return;
 
-			Interlocked.Exchange(ref _isLoadPending, 1);
+			_pendingLoad.Leave();
 
 			// The running update may have ended before the request was left.
 			if (_updateSemaphore.CurrentCount > 0)
@@ -538,17 +541,70 @@ internal partial class AppController : DisposableBase
 	{
 		try
 		{
-			if (_disposed || (Interlocked.Exchange(ref _isLoadPending, 0) == 0))
-				return;
-
-			// If yet another update has started, the request is left for its end.
-			if (!await UpdateAsync(() => Task.Run(() => LoadProfilesBaseAsync())).ConfigureAwait(false))
-				Interlocked.Exchange(ref _isLoadPending, 1);
+			await _pendingLoad.PerformAsync(
+				() => UpdateAsync(() => Task.Run(() => LoadProfilesBaseAsync())),
+				() => _updateSemaphore.CurrentCount == 0,
+				() => _disposed).ConfigureAwait(false);
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to load profiles after an update." + Environment.NewLine
 				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Request for a load left by a change notified while an update was running
+	/// </summary>
+	/// <remarks>
+	/// An update, when it ends, releases its place first and then looks for the request.
+	/// Whoever leaves the request looks, after leaving it, whether an update is still running.
+	/// Either the update finds the request or the one who left it finds no update running and
+	/// performs the load, and so the request is never left with nobody to perform it.
+	/// </remarks>
+	internal sealed class PendingLoad
+	{
+		private int _isPending; // 1 if pending
+
+		public bool IsPending => Volatile.Read(ref _isPending) != 0;
+
+		/// <summary>
+		/// Leaves the request.
+		/// </summary>
+		public void Leave() => Interlocked.Exchange(ref _isPending, 1);
+
+		/// <summary>
+		/// Performs the load if it is requested.
+		/// </summary>
+		/// <param name="tryUpdate">Function to perform the load which returns false if skipped because another update is running</param>
+		/// <param name="isUpdating">Function to tell whether an update is running</param>
+		/// <param name="isStopped">Function to tell that no load is to be performed any longer</param>
+		/// <returns>True if the load is performed by this call</returns>
+		/// <remarks>
+		/// If the load is skipped, the request is left again for the end of the running update.
+		/// That update may have ended, and found no request, between the time the request was
+		/// taken and the time it was left again. Nothing would then perform it, and so this
+		/// method looks again and tries once more unless an update is running.
+		/// </remarks>
+		public async Task<bool> PerformAsync(Func<Task<bool>> tryUpdate, Func<bool> isUpdating, Func<bool> isStopped = null)
+		{
+			while (true)
+			{
+				if (isStopped?.Invoke() is true)
+					return false;
+
+				if (Interlocked.Exchange(ref _isPending, 0) == 0)
+					return false;
+
+				if (await tryUpdate().ConfigureAwait(false))
+					return true;
+
+				Leave();
+
+				// The running update performs the request when it ends.
+				if (isUpdating())
+					return false;
+			}
 		}
 	}
 
@@ -612,7 +668,7 @@ internal partial class AppController : DisposableBase
 				IsUpdating.TurnOff();
 
 				// A change notified during this update is loaded now.
-				if (Volatile.Read(ref _isLoadPending) != 0)
+				if (_pendingLoad.IsPending)
 					_ = Task.Run(() => LoadProfilesPendingAsync());
 			}
 		}

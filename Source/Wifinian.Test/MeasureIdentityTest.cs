@@ -365,6 +365,237 @@ public class MeasureIdentityTest
 		Assert.AreEqual(TargetWait.Unknown, wait);
 	}
 
+	[TestMethod]
+	public async Task TestWaitEndsAsTimedOutWhenTheRecordExpiresByTheClock()
+	{
+		// The record of the switch expires by the clock, which runs ahead of the intervals
+		// waited because the queries take time as well. As in the app, the record is then
+		// removed by whoever looks at it. That is the time being over and not a cancellation:
+		// the switch was left unchecked and this is to be told.
+		var landing = new SwitchLanding { FromName = "EXT", ToName = "Office", Time = _utcNow };
+		SwitchLanding kept = landing;
+
+		var clock = TimeSpan.FromSeconds(20); // Time since the switch, the wait beginning 20 seconds after it
+		bool IsExpired() => clock >= SwitchPolicy.LandingPeriod;
+
+		// Someone else (the measurement after connection) looks at the record and removes it
+		// once it is expired.
+		void Look()
+		{
+			if (IsExpired())
+				kept = null;
+		}
+
+		var count = 0;
+		var wait = await MeasureIdentity.WaitForTargetAsync(
+			() => { count++; return Live("EXT", ExtSsid, ExtBssid); },
+			"Office",
+			SwitchPolicy.LandingPeriod - TimeSpan.FromSeconds(20),
+			TimeSpan.FromSeconds(2),
+			isCanceled: () => AppController.IsLandingGone(kept, landing, IsExpired()),
+			delay: x =>
+			{
+				clock += x + TimeSpan.FromMilliseconds(50); // A query takes time.
+				Look();
+				return Task.CompletedTask;
+			},
+			isExpired: IsExpired);
+
+		Assert.AreEqual(TargetWait.TimedOut, wait);
+		Assert.IsNull(kept);
+		Assert.IsTrue(count <= 140); // Before the intervals add up to the time (140 of them and so 141 queries)
+
+		// Without the clock, the same wait ended silently as canceled.
+		kept = landing;
+		clock = TimeSpan.FromSeconds(20);
+		wait = await MeasureIdentity.WaitForTargetAsync(
+			() => Live("EXT", ExtSsid, ExtBssid),
+			"Office",
+			SwitchPolicy.LandingPeriod - TimeSpan.FromSeconds(20),
+			TimeSpan.FromSeconds(2),
+			isCanceled: () => !ReferenceEquals(kept, landing),
+			delay: x =>
+			{
+				clock += x + TimeSpan.FromMilliseconds(50);
+				Look();
+				return Task.CompletedTask;
+			});
+
+		Assert.AreEqual(TargetWait.Canceled, wait);
+
+		// The record removed (checked, switched back from, cleared by the user) or replaced by
+		// that of a newer switch before its time is still a cancellation.
+		Assert.IsTrue(AppController.IsLandingGone(null, landing, isExpired: false));
+		Assert.IsTrue(AppController.IsLandingGone(new SwitchLanding { ToName = "Office", Time = _utcNow }, landing, isExpired: false));
+		Assert.IsFalse(AppController.IsLandingGone(landing, landing, isExpired: false));
+		Assert.IsFalse(AppController.IsLandingGone(landing, landing, isExpired: true));
+		Assert.IsFalse(AppController.IsLandingGone(null, landing, isExpired: true));
+
+		kept = null;
+		clock = TimeSpan.FromSeconds(30);
+		wait = await MeasureIdentity.WaitForTargetAsync(
+			() => Live("EXT", ExtSsid, ExtBssid),
+			"Office",
+			TimeSpan.FromMinutes(4),
+			TimeSpan.FromSeconds(2),
+			isCanceled: () => AppController.IsLandingGone(kept, landing, IsExpired()),
+			delay: _ => Task.CompletedTask,
+			isExpired: IsExpired);
+
+		Assert.AreEqual(TargetWait.Canceled, wait);
+
+		// On the network in time: the clock changes nothing.
+		kept = landing;
+		wait = await MeasureIdentity.WaitForTargetAsync(
+			() => Live("Office", OfficeSsid, OfficeBssid),
+			"Office",
+			TimeSpan.FromMinutes(4),
+			TimeSpan.FromSeconds(2),
+			isCanceled: () => AppController.IsLandingGone(kept, landing, IsExpired()),
+			delay: _ => Task.CompletedTask,
+			isExpired: IsExpired);
+
+		Assert.AreEqual(TargetWait.OnTarget, wait);
+	}
+
+	[TestMethod]
+	public void TestTestAfterConnectionRunsOnAnotherNetworkThanSwitchedTo()
+	{
+		// Switched to Office and the check is pending. The measurement after connection is
+		// replaced by that after the switch on Office only.
+		var landing = new SwitchLanding { FromName = "EXT", FromScore = 50D, ToName = "Office", Time = _utcNow };
+
+		Assert.IsTrue(SwitchPolicy.IsLandingOf(landing, "Office"));
+
+		// The user then picked Home in the Wi-Fi menu of Windows. The measurement after the
+		// switch waits for Office, and so Home is measured by that after connection.
+		Assert.IsFalse(SwitchPolicy.IsLandingOf(landing, "Home"));
+		Assert.IsFalse(SwitchPolicy.IsLandingOf(landing, null));
+		Assert.IsFalse(SwitchPolicy.IsLandingOf(null, "Office"));
+
+		// That measurement of Home ends the check of the switch, which ends the wait.
+		var sample = new SpeedSample
+		{
+			Time = _utcNow + TimeSpan.FromSeconds(50),
+			InterfaceId = _interfaceId,
+			Profile = "Home",
+			Result = SpeedResult.Ok,
+			DownMbps = 40D,
+			Trigger = SpeedTrigger.AfterConnect
+		};
+		Assert.AreEqual(LandingAction.Clear, SwitchPolicy.EvaluateLanding(landing, sample, sample.Time));
+	}
+
+	[TestMethod]
+	public async Task TestPendingLoadIsNotStranded()
+	{
+		// A change was notified during update U1 and the load is requested at its end. Before
+		// the load takes its place, update U2 takes it, so the load is skipped. U2 ends and
+		// finds no request, because the request was taken and is not yet left again.
+		var pending = new AppController.PendingLoad();
+		pending.Leave();
+
+		var isUpdating = true; // U2 is running
+		var calls = 0;
+		var loads = 0;
+
+		Task<bool> TryUpdate()
+		{
+			if (++calls == 1)
+			{
+				// U2 ends here: it has released its place and sees no request.
+				Assert.IsFalse(pending.IsPending);
+				isUpdating = false;
+				return Task.FromResult(false);
+			}
+
+			loads++;
+			return Task.FromResult(true);
+		}
+
+		// The request must not be left with nobody to perform it.
+		Assert.IsTrue(await pending.PerformAsync(TryUpdate, () => isUpdating));
+		Assert.AreEqual(1, loads);
+		Assert.IsFalse(pending.IsPending);
+
+		// Another update is really running: the request is left for its end and nothing spins.
+		pending.Leave();
+		calls = 0;
+		Assert.IsFalse(await pending.PerformAsync(() => { calls++; return Task.FromResult(false); }, () => true));
+		Assert.AreEqual(1, calls);
+		Assert.IsTrue(pending.IsPending);
+
+		// That update ends and performs it.
+		Assert.IsTrue(await pending.PerformAsync(() => Task.FromResult(true), () => false));
+		Assert.IsFalse(pending.IsPending);
+
+		// Nothing requested: nothing is loaded.
+		Assert.IsFalse(await pending.PerformAsync(() => { Assert.Fail(); return Task.FromResult(true); }, () => false));
+
+		// Disposed: the request is not performed.
+		pending.Leave();
+		Assert.IsFalse(await pending.PerformAsync(() => { Assert.Fail(); return Task.FromResult(true); }, () => false, () => true));
+	}
+
+	[TestMethod]
+	public async Task TestPendingLoadUnderConcurrentUpdates()
+	{
+		// The same arrangement as in the app: an update releases its place and then looks for
+		// the request; a notification which finds an update running leaves the request and then
+		// looks whether an update is still running. Every notification must be followed by
+		// a load which started after it.
+		var pending = new AppController.PendingLoad();
+		var semaphore = new System.Threading.SemaphoreSlim(1);
+		long notified = 0; // Number of the last notification
+		long loaded = 0; // Number of the last notification seen by a load
+		var tasks = new System.Collections.Concurrent.ConcurrentBag<Task>();
+
+		async Task<bool> UpdateAsync()
+		{
+			if (!semaphore.Wait(TimeSpan.Zero))
+				return false;
+
+			try
+			{
+				var seen = System.Threading.Interlocked.Read(ref notified);
+				await Task.Yield();
+				System.Threading.Interlocked.Exchange(ref loaded, seen);
+				return true;
+			}
+			finally
+			{
+				semaphore.Release();
+
+				if (pending.IsPending)
+					tasks.Add(Task.Run(() => pending.PerformAsync(UpdateAsync, () => semaphore.CurrentCount == 0)));
+			}
+		}
+
+		async Task NotifyAsync()
+		{
+			System.Threading.Interlocked.Increment(ref notified);
+
+			if (await UpdateAsync().ConfigureAwait(false))
+				return;
+
+			pending.Leave();
+
+			if (semaphore.CurrentCount > 0)
+				await pending.PerformAsync(UpdateAsync, () => semaphore.CurrentCount == 0).ConfigureAwait(false);
+		}
+
+		for (int round = 0; round < 200; round++)
+		{
+			await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => Task.Run(NotifyAsync)));
+
+			while (tasks.TryTake(out Task task))
+				await task;
+
+			Assert.AreEqual(System.Threading.Interlocked.Read(ref notified), System.Threading.Interlocked.Read(ref loaded), $"Round {round}");
+			Assert.IsFalse(pending.IsPending, $"Round {round}");
+		}
+	}
+
 	#endregion
 
 	#region Replay

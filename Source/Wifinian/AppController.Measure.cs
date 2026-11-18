@@ -301,8 +301,10 @@ internal partial class AppController
 				switch (trigger)
 				{
 					case SpeedTrigger.AfterConnect:
-						// The measurement after an automatic switch takes the place of this one.
-						if (HasLanding(targetId))
+						// The measurement after an automatic switch takes the place of this one,
+						// which it does only on the network switched to. On another network
+						// (connected to outside this app) this one runs and ends that check.
+						if (SwitchPolicy.IsLandingOf(GetLanding(targetId), profile.Name))
 							return PutOff();
 
 						var summary = History.GetSummary(key);

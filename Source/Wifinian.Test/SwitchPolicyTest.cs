@@ -1184,6 +1184,107 @@ public class SwitchPolicyTest
 	}
 
 	[TestMethod]
+	public void TestRetrySpacingAfterFailureInPriorityOrder()
+	{
+		// Priority order only. The only network in range cannot be joined: every load after
+		// a failed attempt would pick it again at once.
+		var x = Profile("X", 80, 0);
+		var state = new SwitchState();
+		var context = CreateContext(engagesSpeed: false);
+
+		var decision = SwitchPolicy.Decide([x], null, context, state);
+		Assert.AreSame(x, decision.Target);
+		Assert.IsNull(decision.RecheckAfter);
+
+		// The attempt fails. As in the app, no period of exclusion is set without speed.
+		SwitchPolicy.RecordAttempt(state, "X", false, _now, setsCooldown: false);
+		x.LastFailureTime = _now;
+		Assert.AreEqual(0, state.CooldownUntil.Count);
+
+		// The loads which follow at once (that of the notification, any other) attempt nothing
+		// and ask for the decision to be made again when the time is over.
+		foreach (var seconds in new[] { 0, 1, 10, 29 })
+		{
+			decision = SwitchPolicy.Decide([x], null, CreateContext(engagesSpeed: false, TimeSpan.FromSeconds(seconds)), state);
+			Assert.IsNull(decision.Target, $"{seconds}");
+			Assert.AreEqual(SwitchPolicy.RetrySpacing - TimeSpan.FromSeconds(seconds), decision.RecheckAfter, $"{seconds}");
+		}
+
+		// The time of failure kept in the profile is cleared when its signal changes. That
+		// must not bring the attempt back.
+		x.LastFailureTime = default;
+		decision = SwitchPolicy.Decide([x], null, CreateContext(engagesSpeed: false, TimeSpan.FromSeconds(5)), state);
+		Assert.IsNull(decision.Target);
+
+		// After that time it is attempted again, as before.
+		decision = SwitchPolicy.Decide([x], null, CreateContext(engagesSpeed: false, SwitchPolicy.RetrySpacing), state);
+		Assert.AreSame(x, decision.Target);
+		Assert.IsNull(decision.RecheckAfter);
+
+		// A whole run of loads back-to-back makes one attempt in each period, not one in each load.
+		state = new SwitchState();
+		var attempts = 0;
+		for (int ms = 0; ms < 120_000; ms += 500)
+		{
+			var elapsed = TimeSpan.FromMilliseconds(ms);
+			decision = SwitchPolicy.Decide([x], null, CreateContext(engagesSpeed: false, elapsed), state);
+			if (decision.Target is null)
+				continue;
+
+			attempts++;
+			SwitchPolicy.RecordAttempt(state, "X", false, _now + elapsed, setsCooldown: false);
+		}
+		Assert.AreEqual(4, attempts); // At 0, 30, 60 and 90 seconds
+	}
+
+	[TestMethod]
+	public void TestRetrySpacingTakesNextInPriorityOrder()
+	{
+		var x = Profile("X", 80, 0);
+		var y = Profile("Y", 70, 1);
+		var weak = Profile("W", 40, 2);
+
+		// The next network in order is taken while the failed one is left out.
+		var state = new SwitchState();
+		SwitchPolicy.RecordAttempt(state, "X", false, _now, setsCooldown: false);
+
+		var decision = SwitchPolicy.Decide([x, y, weak], null, CreateContext(engagesSpeed: false, TimeSpan.FromSeconds(1)), state);
+		Assert.AreSame(y, decision.Target);
+		Assert.IsNull(decision.RecheckAfter);
+
+		// Both failed: nothing is attempted until the first of them can be.
+		SwitchPolicy.RecordAttempt(state, "Y", false, _now + TimeSpan.FromSeconds(10), setsCooldown: false);
+
+		decision = SwitchPolicy.Decide([x, y, weak], null, CreateContext(engagesSpeed: false, TimeSpan.FromSeconds(12)), state);
+		Assert.IsNull(decision.Target);
+		Assert.AreEqual(TimeSpan.FromSeconds(18), decision.RecheckAfter);
+
+		// Connected to the lower one while the higher one has just failed: it stays, and
+		// the higher one is attempted again later.
+		var connected = Profile("Y", 70, 1, isConnected: true);
+		state = CreateState("Y", TimeSpan.FromHours(1));
+		SwitchPolicy.RecordAttempt(state, "X", false, _now, setsCooldown: false);
+
+		decision = SwitchPolicy.Decide([x, connected], connected, CreateContext(engagesSpeed: false, TimeSpan.FromSeconds(2)), state);
+		Assert.IsNull(decision.Target);
+		Assert.AreEqual(TimeSpan.FromSeconds(28), decision.RecheckAfter);
+
+		decision = SwitchPolicy.Decide([x, connected], connected, CreateContext(engagesSpeed: false, TimeSpan.FromSeconds(31)), state);
+		Assert.AreSame(x, decision.Target);
+
+		// A successful connection ends it, and so does a clock set back.
+		SwitchPolicy.RecordAttempt(state, "X", true, _now + TimeSpan.FromSeconds(31), setsCooldown: false);
+		Assert.IsFalse(SwitchPolicy.IsRetryTooSoon(state, "X", _now + TimeSpan.FromSeconds(32)));
+
+		SwitchPolicy.RecordAttempt(state, "X", false, _now, setsCooldown: false);
+		Assert.IsTrue(SwitchPolicy.IsRetryTooSoon(state, "X", _now + TimeSpan.FromSeconds(29)));
+		Assert.IsFalse(SwitchPolicy.IsRetryTooSoon(state, "X", _now + TimeSpan.FromSeconds(30)));
+		Assert.IsFalse(SwitchPolicy.IsRetryTooSoon(state, "X", _now - TimeSpan.FromSeconds(1)));
+		Assert.IsFalse(SwitchPolicy.IsRetryTooSoon(state, "Y", _now));
+		Assert.IsFalse(SwitchPolicy.IsRetryTooSoon(null, "X", _now));
+	}
+
+	[TestMethod]
 	public void TestNoGraceAfterOwnFailure()
 	{
 		var a = Profile("A", 80, 0);
