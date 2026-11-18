@@ -166,7 +166,8 @@ internal partial class AppController : DisposableBase
 				if (RushesRescan.Value)
 					RescanTimer.Start(TimeSpan.FromSeconds(Settings.Current.RescanInterval)); // Wait for due time.
 
-				await LoadProfilesAsync();
+				// The change notified must not be lost if an update is running.
+				await LoadProfilesNotifiedAsync();
 			})
 			.AddTo(this.Subscription);
 
@@ -482,11 +483,74 @@ internal partial class AppController : DisposableBase
 					x.LastFailureTime = result ? default : DateTime.Now;
 					RecordSwitchResult(x, result);
 				}));
+
+				// The notifications of these connections ask for a load while this update is
+				// still running, and a load is skipped while an update is running. Without
+				// another load, the profiles would go on showing the previous network as
+				// connected until something else happens to load them.
+				if (!_disposed)
+					_ = Task.Run(() => LoadProfilesFreshAsync(_reloadTimeout));
 			}
 		}
 	}
 
 	private readonly SemaphoreSlim _updateSemaphore = new(1);
+	private int _isLoadPending; // 1 if a change was notified while an update was running
+
+	/// <summary>
+	/// Loads profiles on a notification of change and, if another update is running, makes sure
+	/// that they are loaded when it has ended.
+	/// </summary>
+	/// <remarks>
+	/// <para><see cref="LoadProfilesAsync"/> does nothing while another update is running.
+	/// That update may have got the profiles before the change notified, or may be the very
+	/// one which is making the change: an automatic connection is made inside the update which
+	/// decided it and the notification of its completion can come before that update ends.
+	/// The load was then skipped and the profiles went on showing the previous network as
+	/// connected until something else loaded them, up to a sample interval later.</para>
+	/// <para>This method never throws an exception.</para>
+	/// </remarks>
+	private async Task LoadProfilesNotifiedAsync()
+	{
+		try
+		{
+			if (await UpdateAsync(() => Task.Run(() => LoadProfilesBaseAsync())).ConfigureAwait(false))
+				return;
+
+			Interlocked.Exchange(ref _isLoadPending, 1);
+
+			// The running update may have ended before the request was left.
+			if (_updateSemaphore.CurrentCount > 0)
+				await LoadProfilesPendingAsync().ConfigureAwait(false);
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to load profiles on a notification." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Loads profiles if a change was notified while an update was running.
+	/// </summary>
+	/// <remarks>This method never throws an exception.</remarks>
+	private async Task LoadProfilesPendingAsync()
+	{
+		try
+		{
+			if (_disposed || (Interlocked.Exchange(ref _isLoadPending, 0) == 0))
+				return;
+
+			// If yet another update has started, the request is left for its end.
+			if (!await UpdateAsync(() => Task.Run(() => LoadProfilesBaseAsync())).ConfigureAwait(false))
+				Interlocked.Exchange(ref _isLoadPending, 1);
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to load profiles after an update." + Environment.NewLine
+				+ ex);
+		}
+	}
 
 	/// <summary>
 	/// Loads profiles and confirms that the load has been performed by this call.
@@ -546,6 +610,10 @@ internal partial class AppController : DisposableBase
 			{
 				_updateSemaphore.Release();
 				IsUpdating.TurnOff();
+
+				// A change notified during this update is loaded now.
+				if (Volatile.Read(ref _isLoadPending) != 0)
+					_ = Task.Run(() => LoadProfilesPendingAsync());
 			}
 		}
 	}

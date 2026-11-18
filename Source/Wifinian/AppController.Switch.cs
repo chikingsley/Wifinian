@@ -18,6 +18,8 @@ internal partial class AppController
 
 	private static readonly TimeSpan _postSwitchDelay = TimeSpan.FromSeconds(20);
 	private static readonly TimeSpan _retestDelay = TimeSpan.FromSeconds(60);
+	private static readonly TimeSpan _targetPollInterval = TimeSpan.FromSeconds(2);
+	private static readonly TimeSpan _reloadTimeout = TimeSpan.FromSeconds(5);
 	private static readonly TimeSpan _verifyInterval = TimeSpan.FromMinutes(10);
 	private static readonly TimeSpan _recheckRecordInterval = TimeSpan.FromMinutes(30);
 	private static readonly TimeSpan _dryRunInterval = TimeSpan.FromHours(1);
@@ -408,6 +410,11 @@ internal partial class AppController
 				SwitchPolicy.RecordAttempt(state, target.Name, result, now, setsCooldown: engagesSpeed,
 					countsBudget: !result || (fromName is not null));
 
+				// The time of connection is that of the switch itself, whenever the profiles
+				// are loaded next.
+				if (result)
+					SwitchPolicy.Track(state, target.Name, now);
+
 				_landings.Remove(interfaceId);
 			}
 
@@ -484,6 +491,10 @@ internal partial class AppController
 	/// two of them would run for one switch. It is not run either once the switch has been
 	/// checked or switched back from, because it would then measure a network which no longer
 	/// needs it.
+	/// <para>The measurement is of the network switched to and of no other. If the interface
+	/// is not connected to it at the scheduled time (it is still connecting, or it is on
+	/// another network), the measurement waits until it is, as long as the record of the switch
+	/// remains, instead of measuring whatever network the profiles as loaded show.</para>
 	/// </remarks>
 	private void MeasureAfterSwitch(Guid interfaceId, TimeSpan delay)
 	{
@@ -498,10 +509,36 @@ internal partial class AppController
 				if (_disposed)
 					return;
 
-				if (!_postSwitchTicket.IsLatest(interfaceId, ticket) || !HasLanding(interfaceId))
+				if (!_postSwitchTicket.IsLatest(interfaceId, ticket))
 					return;
 
-				var sample = await MeasureConnectedAsync(SpeedTrigger.PostSwitch, interfaceId).ConfigureAwait(false);
+				var landing = GetLanding(interfaceId);
+				if (landing is null)
+					return;
+
+				bool IsOver() => _disposed
+					|| _isProbing
+					|| !_postSwitchTicket.IsLatest(interfaceId, ticket)
+					|| !ReferenceEquals(GetLanding(interfaceId), landing);
+
+				var wait = await MeasureIdentity.WaitForTargetAsync(
+					() => GetLiveConnection(interfaceId),
+					landing.ToName,
+					SwitchPolicy.LandingPeriod - (DateTime.UtcNow - landing.Time),
+					_targetPollInterval,
+					IsOver,
+					live => Logger.RecordOperation($"The speed test after the switch to {landing.ToName} is waiting: the adapter is on {live.Describe()}.")).ConfigureAwait(false);
+
+				if (wait is TargetWait.Canceled)
+					return;
+
+				if (wait is TargetWait.TimedOut)
+				{
+					Logger.RecordOperation($"The switch to {landing.ToName} was not checked: the adapter was not on it while the check was due.");
+					return;
+				}
+
+				var sample = await MeasureConnectedAsync(SpeedTrigger.PostSwitch, interfaceId, expectedName: landing.ToName).ConfigureAwait(false);
 
 				// A measurement which could not run (another one was running) or which is not
 				// a finding on the network (the test server failed, aborted) leaves the switch
@@ -567,18 +604,24 @@ internal partial class AppController
 	/// <summary>
 	/// Determines whether an automatic switch in an interface is yet to be checked.
 	/// </summary>
-	private bool HasLanding(Guid interfaceId)
+	private bool HasLanding(Guid interfaceId) => GetLanding(interfaceId) is not null;
+
+	/// <summary>
+	/// Gets the record of the automatic switch in an interface which is yet to be checked.
+	/// </summary>
+	/// <returns>Record if any and not expired, null otherwise</returns>
+	private SwitchLanding GetLanding(Guid interfaceId)
 	{
 		lock (_switchLock)
 		{
 			if (!_landings.TryGetValue(interfaceId, out SwitchLanding landing))
-				return false;
+				return null;
 
 			if (DateTime.UtcNow - landing.Time < SwitchPolicy.LandingPeriod)
-				return true;
+				return landing;
 
 			_landings.Remove(interfaceId);
-			return false;
+			return null;
 		}
 	}
 
@@ -702,21 +745,36 @@ internal partial class AppController
 		// a network whose signal has become weak is not returned to.
 		var entrySignal = Settings.Current.SpeedSignalThreshold + SwitchPolicy.EntryMargin;
 
-		ProfileItem current;
 		ProfileItem from;
 		lock (_profilesLock)
 		{
-			var subProfiles = Profiles.Where(x => x.InterfaceId == interfaceId).ToArray();
-
-			current = subProfiles.FirstOrDefault(x => x.IsConnected);
-			from = subProfiles.FirstOrDefault(x => !x.IsConnected
+			from = Profiles.FirstOrDefault(x => (x.InterfaceId == interfaceId)
 				&& !x.IsAvoided
 				&& (x.Signal >= entrySignal)
 				&& string.Equals(x.Name, landing.FromName, StringComparison.Ordinal));
 		}
 
-		if (!string.Equals(current?.Name, landing.ToName, StringComparison.Ordinal))
+		// The network to be left is the one the interface is actually on, which the profiles
+		// as loaded may not show yet.
+		var live = GetLiveConnection(interfaceId);
+		var currentName = (live is not null)
+			? (live.IsConnected ? live.ProfileName : null)
+			: GetCachedConnected(interfaceId)?.Name;
+
+		if (!string.Equals(currentName, landing.ToName, StringComparison.Ordinal))
+		{
+			AppendSwitchEvent(new SwitchEvent
+			{
+				Time = DateTime.UtcNow,
+				InterfaceId = interfaceId,
+				Kind = SwitchKind.Stay,
+				From = currentName ?? string.Empty,
+				To = string.Empty,
+				FromScore = sample.DownMbps,
+				Reason = $"{why} but the adapter is no longer on it - not switching back"
+			});
 			return;
+		}
 
 		if (from is null)
 		{

@@ -148,6 +148,11 @@ internal class MockWorker : IWlanWorker
 		return Task.FromResult(true);
 	}
 
+	public Measure.LiveConnection GetConnection(Guid interfaceId) =>
+		Measure.MeasureIdentity.FromProfile(
+			_sourceProfiles?.FirstOrDefault(x => x.IsConnected && (x.InterfaceId == interfaceId)),
+			interfaceId);
+
 	public Task<bool> ConnectNetworkAsync(ProfileItem profileItem, TimeSpan timeout)
 	{
 		var targetProfiles = _sourceProfiles

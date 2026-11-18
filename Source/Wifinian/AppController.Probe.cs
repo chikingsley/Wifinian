@@ -163,9 +163,16 @@ internal partial class AppController
 			.Subscribe(_ =>
 			{
 				if (_isProbing)
+				{
+					// The same command stops the running test, which is not obvious when
+					// the test was started by this app itself while idle.
+					RecordProbeOperation("The command to test all networks stopped the test of networks which was running.");
 					CancelProbe(false);
+				}
 				else
+				{
 					Task.Run(() => ProbeAllAsync());
+				}
 			})
 			.AddTo(this.Subscription);
 	}
@@ -420,7 +427,12 @@ internal partial class AppController
 				.Distinct()
 				.ToArray();
 			if (interfaceIds.Length == 0)
+			{
+				RecordIgnored(GetProbeName(SpeedTrigger.TestAll), (GetProfiles().Length == 0)
+					? "the profiles have not been loaded yet"
+					: "no network is in range (no profile has signal or the radio is off)");
 				return;
+			}
 
 			await ProbeAsync(interfaceIds, null, SpeedTrigger.TestAll).ConfigureAwait(false);
 		}
@@ -428,8 +440,15 @@ internal partial class AppController
 		{
 			Trace.WriteLine("Failed to test all networks." + Environment.NewLine
 				+ ex);
+			RecordIgnored(GetProbeName(SpeedTrigger.TestAll), $"it failed ({ex.Message})");
 		}
 	}
+
+	/// <summary>
+	/// Gets the name of a test of networks for a sentence.
+	/// </summary>
+	internal static string GetProbeName(SpeedTrigger trigger) =>
+		(trigger is SpeedTrigger.TestAll) ? "Test of all networks" : "Test of a network when idle";
 
 	/// <summary>
 	/// Connects to networks one after another, measures speed of each and then restores
@@ -444,19 +463,30 @@ internal partial class AppController
 	/// </remarks>
 	private async Task ProbeAsync(IReadOnlyList<Guid> interfaceIds, IReadOnlyList<ProfileItem> targets, SpeedTrigger trigger)
 	{
+		var name = GetProbeName(trigger);
+
 		if (_disposed || _isClosing)
+		{
+			RecordIgnored(name, "this app is being closed");
 			return;
+		}
 
 		// Only one test runs at a time.
 		if (Interlocked.CompareExchange(ref _probeCount, 1, 0) != 0)
+		{
+			RecordIgnored(name, "another test of networks is running");
 			return;
+		}
 
 		CancellationTokenSource cancellation = null;
 		try
 		{
 			// Closing this app may have started in the meantime.
 			if (_isClosing)
+			{
+				RecordIgnored(name, "this app is being closed");
 				return;
+			}
 
 			cancellation = new CancellationTokenSource();
 
@@ -477,7 +507,12 @@ internal partial class AppController
 
 			// An automatic connection or a measurement started just before is waited for.
 			if (!await WaitForQuietAsync(token).ConfigureAwait(false))
+			{
+				RecordIgnored(name, _disposed
+					? "this app is being closed"
+					: GetBusyText(IsUpdating.Value, IsWorking.Value, IsMeasuring.Value, _probeQuietTimeout));
 				return;
+			}
 
 			foreach (var interfaceId in interfaceIds)
 			{
@@ -494,6 +529,7 @@ internal partial class AppController
 		{
 			Trace.WriteLine("Failed to test networks." + Environment.NewLine
 				+ ex);
+			RecordIgnored(name, $"it failed ({ex.Message})");
 		}
 		finally
 		{
@@ -532,6 +568,21 @@ internal partial class AppController
 	}
 
 	/// <summary>
+	/// Gets the reason why a test of networks gave up waiting for other work to end.
+	/// </summary>
+	internal static string GetBusyText(bool isUpdating, bool isWorking, bool isMeasuring, TimeSpan timeout)
+	{
+		var works = new[]
+		{
+			isUpdating ? "a scan or a load of profiles" : null,
+			isWorking ? "a connection or a change of a profile" : null,
+			isMeasuring ? "a speed test" : null
+		}.Where(x => x is not null).ToArray();
+
+		return $"{((works.Length > 0) ? string.Join(" and ", works) : "other work")} was still running after {timeout.TotalSeconds:0} s";
+	}
+
+	/// <summary>
 	/// Waits for update, connection/disconnection and measurement in progress to end.
 	/// </summary>
 	/// <returns>True if none of them is in progress</returns>
@@ -566,6 +617,7 @@ internal partial class AppController
 			if (!await LoadProfilesFreshAsync(_probeFreshTimeout).ConfigureAwait(false))
 			{
 				Trace.WriteLine("Failed to load profiles before the test of networks.");
+				RecordIgnored(GetProbeName(trigger), $"the profiles could not be loaded within {_probeFreshTimeout.TotalSeconds:0} s because another update was running");
 				return;
 			}
 
@@ -582,7 +634,10 @@ internal partial class AppController
 				.Where(x => x.InterfaceId == interfaceId)
 				.ToArray();
 			if (targets.Count == 0)
+			{
+				RecordIgnored(GetProbeName(trigger), "no network to test is in range");
 				return;
+			}
 
 			// What was pending on the interface is no longer valid after the test.
 			ClearPendingSwitch(interfaceId);
@@ -608,7 +663,9 @@ internal partial class AppController
 					_lastProbeTimes[HistoryService.GetKey(target.Name, interfaceId)] = DateTime.UtcNow;
 				}
 
-				if (!target.IsConnected)
+				// Whether the network requires connection is asked of the system: the profiles
+				// may not show yet the connection made for the previous network.
+				if (!IsOnProfile(target))
 				{
 					isChanged = true;
 
@@ -728,10 +785,12 @@ internal partial class AppController
 			if (_disposed)
 				return $"Could not connect to {target.Name}";
 
-			// This load is skipped if an update is running.
+			// This load is skipped if an update is running and so the connection itself is
+			// asked of the system.
 			await LoadProfilesAsync().ConfigureAwait(false);
 
-			if (target.IsConnected)
+			var isConnected = IsOnProfile(target);
+			if (isConnected)
 			{
 				idleStopwatch.Reset();
 
@@ -752,7 +811,7 @@ internal partial class AppController
 
 			if (stopwatch.Elapsed >= timeout)
 			{
-				return target.IsConnected
+				return isConnected
 					? $"No address on {target.Name} within {_probeLinkTimeout.TotalSeconds:0} s"
 					: $"Could not connect to {target.Name} within {_probeLinkTimeout.TotalSeconds:0} s";
 			}
@@ -794,13 +853,17 @@ internal partial class AppController
 	}
 
 	/// <summary>
-	/// Waits until a profile connected to is shown as connected in the profiles.
+	/// Waits until the interface is connected by a profile connected to, as the system tells.
 	/// </summary>
+	/// <remarks>
+	/// The profiles are loaded as well but are not what is waited for: a load is skipped if
+	/// an update is running and the measurement identifies the network by itself.
+	/// </remarks>
 	private async Task<bool> WaitForConnectedAsync(ProfileItem target, CancellationToken cancellationToken)
 	{
 		var stopwatch = Stopwatch.StartNew();
 
-		while (!target.IsConnected)
+		while (!IsOnProfile(target))
 		{
 			if (_disposed || (stopwatch.Elapsed >= _probeLoadTimeout))
 				return false;
@@ -808,7 +871,7 @@ internal partial class AppController
 			// This load is skipped if an update is running.
 			await LoadProfilesAsync().ConfigureAwait(false);
 
-			if (target.IsConnected)
+			if (IsOnProfile(target))
 				break;
 
 			await Task.Delay(_probePollInterval, cancellationToken).ConfigureAwait(false);
@@ -847,7 +910,7 @@ internal partial class AppController
 			if (_isProbeInterrupted)
 				return ProbeReturn.LeftToUser;
 
-			if (isLoaded && original.IsConnected)
+			if (isLoaded && IsOnProfile(original))
 				return ProbeReturn.Restored;
 
 			// The closing thread may have asked for the connection in the meantime.

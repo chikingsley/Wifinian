@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Threading.Tasks;
 using ManagedNativeWifi;
 
+using Wifinian.Models.Measure;
+
 namespace Wifinian.Models.Wlan;
 
 internal interface IWlanWorker : IDisposable
@@ -26,6 +28,16 @@ internal interface IWlanWorker : IDisposable
 	bool IncludesRadioDetails { get; set; }
 
 	Task<IEnumerable<ProfileItem>> GetProfilesAsync();
+
+	/// <summary>
+	/// Queries the current connection of an interface from the system.
+	/// </summary>
+	/// <returns>Connection (not connected if the interface is not), null if it cannot be queried</returns>
+	/// <remarks>
+	/// This is a read-only query made at each call and so is never older than the call, unlike
+	/// the profiles got before. This method never throws an exception.
+	/// </remarks>
+	LiveConnection GetConnection(Guid interfaceId);
 
 
 	Task<bool> SetProfileOptionAsync(ProfileItem profileItem);

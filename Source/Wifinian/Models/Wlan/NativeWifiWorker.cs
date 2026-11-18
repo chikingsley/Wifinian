@@ -6,6 +6,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using ManagedNativeWifi;
 
+using Wifinian.Models.Measure;
+
 namespace Wifinian.Models.Wlan;
 
 internal class NativeWifiWorker : IWlanWorker
@@ -377,6 +379,72 @@ internal class NativeWifiWorker : IWlanWorker
 			return null;
 
 		return BitConverter.ToString(bytes).Replace('-', ':');
+	}
+
+	#endregion
+
+	#region Get connection
+
+	public LiveConnection GetConnection(Guid interfaceId)
+	{
+		if (!IsWorkable)
+			return null;
+
+		try
+		{
+			var (result, info) = _player.GetCurrentConnection(interfaceId);
+
+			if (result == ActionResult.NotConnected)
+				return new LiveConnection { InterfaceId = interfaceId };
+
+			if ((result != ActionResult.Success) || (info is null))
+				return null;
+
+			// While the interface is connecting, the query already tells the profile being
+			// connected to. That is not a connection yet.
+			if (info.InterfaceState != InterfaceState.Connected)
+				return new LiveConnection { InterfaceId = interfaceId };
+
+			var connection = new LiveConnection
+			{
+				InterfaceId = interfaceId,
+				IsConnected = true,
+				ProfileName = info.ProfileName,
+				Ssid = FormatSsid(info.Ssid),
+				Bssid = FormatBssid(info.Bssid),
+				Signal = (info.SignalQuality is >= 0 and <= 100) ? info.SignalQuality : 0,
+				LinkRate = info.RxRate / 1000
+			};
+
+			try
+			{
+				// The band and the channel are those of the BSS in use. The list is refreshed
+				// only by a scan and so may lack it, in which case they are left unknown.
+				var entry = (connection.Bssid is null)
+					? null
+					: _player.EnumerateBssNetworks()
+						.Where(x => x.InterfaceInfo.Id == interfaceId)
+						.FirstOrDefault(x => string.Equals(FormatBssid(x.Bssid), connection.Bssid, StringComparison.OrdinalIgnoreCase));
+				if (entry is not null)
+				{
+					connection.Band = entry.Band;
+					connection.Channel = entry.Channel;
+				}
+			}
+			catch (Exception ex)
+			{
+				Debug.WriteLine("Failed to enumerate BSS networks." + Environment.NewLine
+					+ ex);
+			}
+
+			return connection;
+		}
+		catch (Exception ex)
+		{
+			Debug.WriteLine("Failed to get current connection." + Environment.NewLine
+				+ ex);
+			return null;
+		}
 	}
 
 	#endregion

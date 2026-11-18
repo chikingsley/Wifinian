@@ -213,20 +213,39 @@ internal partial class AppController
 	/// <param name="trigger">Trigger</param>
 	/// <param name="interfaceId">Interface ID (any interface if null)</param>
 	/// <param name="isRecheck">Whether this is to check again a network found without internet access</param>
+	/// <param name="expectedName">Name of the profile which the measurement is for (null for whichever is connected)</param>
 	/// <returns>Speed sample if measured, null otherwise</returns>
-	/// <remarks>This method never throws an exception.</remarks>
-	private Task<SpeedSample> MeasureConnectedAsync(SpeedTrigger trigger, Guid? interfaceId = null, bool isRecheck = false)
+	/// <remarks>
+	/// The network is the one the interface is actually connected to, as queried from the system
+	/// when this method is called and again when the measurement starts, not the one shown as
+	/// connected in the profiles as loaded. If a profile is expected and the interface is not
+	/// connected by it, nothing is measured. This method never throws an exception.
+	/// </remarks>
+	private Task<SpeedSample> MeasureConnectedAsync(SpeedTrigger trigger, Guid? interfaceId = null, bool isRecheck = false, string expectedName = null)
 	{
-		return Task.Run(() => MeasureConnectedBaseAsync(trigger, interfaceId, isRecheck));
+		return Task.Run(() => MeasureConnectedBaseAsync(trigger, interfaceId, isRecheck, expectedName));
 	}
 
-	private async Task<SpeedSample> MeasureConnectedBaseAsync(SpeedTrigger trigger, Guid? interfaceId, bool isRecheck)
+	private async Task<SpeedSample> MeasureConnectedBaseAsync(SpeedTrigger trigger, Guid? interfaceId, bool isRecheck, string expectedName)
 	{
 		try
 		{
-			// While networks are being tested one after another, they are measured by the test itself.
-			if (_disposed || _isProbing)
+			// A measurement asked for by the user is never dropped without a word.
+			void Ignore(string why)
+			{
+				if (trigger is SpeedTrigger.Manual)
+					RecordIgnored("Speed test", why);
+			}
+
+			if (_disposed)
 				return null;
+
+			// While networks are being tested one after another, they are measured by the test itself.
+			if (_isProbing)
+			{
+				Ignore("a test of networks is running");
+				return null;
+			}
 
 			// Automatic measurements are for the networks between which this app can switch.
 			var isAutomatic = trigger is SpeedTrigger.AfterConnect or SpeedTrigger.Periodic;
@@ -261,13 +280,14 @@ internal partial class AppController
 					return null;
 			}
 
-			ProfileItem profile;
-			lock (_profilesLock)
-			{
-				profile = Profiles.FirstOrDefault(x => x.IsConnected && ((interfaceId is null) || (x.InterfaceId == interfaceId)));
-			}
+			// The profile is that of the connection as the system tells it now. The profiles as
+			// loaded can still show the previous network as connected after a switch.
+			var profile = await ResolveConnectedAsync(trigger, interfaceId, expectedName).ConfigureAwait(false);
 			if (profile is null)
+			{
+				Ignore("no network is connected");
 				return null;
+			}
 
 			var targetId = profile.InterfaceId;
 			var key = HistoryService.GetKey(profile.Name, targetId);
@@ -321,14 +341,8 @@ internal partial class AppController
 					if (!await WaitForIdleAsync().ConfigureAwait(false))
 						return PutOff();
 
-					// The connection may have changed in the meantime.
-					ProfileItem currentProfile;
-					lock (_profilesLock)
-					{
-						currentProfile = Profiles.FirstOrDefault(x => x.IsConnected && (x.InterfaceId == targetId));
-					}
-					if (!ReferenceEquals(currentProfile, profile))
-						return null;
+					// The connection may have changed in the meantime. The measurement queries
+					// it again when it starts and does not run if it is no longer by this profile.
 				}
 			}
 
@@ -349,9 +363,13 @@ internal partial class AppController
 				(trigger is SpeedTrigger.Manual) ? SpeedTestSize.Full : SpeedTestSize.Quick,
 				isRecheck).ConfigureAwait(false);
 
-			// Another measurement or the test of networks is running.
+			// Another measurement or the test of networks is running, or the interface is
+			// no longer connected by the profile.
 			if (sample is null)
+			{
+				Ignore("another speed test is running or the connection has just changed");
 				return PutOff();
+			}
 
 			if (!isRecorded)
 				return sample;
@@ -390,12 +408,18 @@ internal partial class AppController
 	/// <param name="isProbe">Whether this is a measurement by the test of networks</param>
 	/// <returns>
 	/// Speed sample and whether it is recorded in history. The sample is null if not measured
-	/// because another measurement is running or because the test of networks is running and
-	/// this is not a measurement by it.
+	/// because another measurement is running, because the test of networks is running and
+	/// this is not a measurement by it, or because the interface is not connected by the profile
+	/// when the measurement is about to start.
 	/// </returns>
 	/// <remarks>
-	/// No condition for the trigger is checked by this method. If the connection has changed
-	/// during the measurement, the result is recorded as aborted.
+	/// <para>No condition for the trigger is checked by this method.</para>
+	/// <para>What the sample records of the network (profile, BSSID, band, channel, signal,
+	/// link rate) is taken from the connection queried from the system at the moment
+	/// the measurement starts, not from the profile as loaded. The connection is queried again
+	/// when the measurement ends: if the interface is no longer on the same SSID, the result is
+	/// recorded as aborted with the reason in its detail, because it is a finding on neither
+	/// network. Moving to another access point of the same SSID is noted in the detail.</para>
 	/// </remarks>
 	private async Task<(SpeedSample sample, bool isRecorded)> MeasureProfileAsync(ProfileItem profile, SpeedTrigger trigger, SpeedTestSize size, bool isRecheck = false, TimeSpan waitTime = default, bool isProbe = false)
 	{
@@ -420,19 +444,8 @@ internal partial class AppController
 
 			profile.IsMeasuring = true;
 
-			// The limit of frequency counts only the measurements actually started.
-			if ((trigger is SpeedTrigger.Verify) && !isRecheck)
-			{
-				lock (_switchLock)
-				{
-					_lastVerifyTimes[key] = DateTime.UtcNow;
-				}
-			}
-
 			lock (_measureLock)
 			{
-				_lastAttemptTimes[key] = DateTime.UtcNow;
-
 				cancellation = new CancellationTokenSource();
 				_measureCancellation = cancellation;
 				_measureInterfaceId = targetId;
@@ -449,44 +462,43 @@ internal partial class AppController
 				// The measurement will record this as aborted.
 			}
 
-			var linkRate = profile.LinkRate;
-
-			sample = new SpeedSample
+			// The network is identified now, at the start of the measurement, from the system.
+			// Only if the system cannot be asked, the profile as loaded is relied on.
+			var live = GetLiveConnection(targetId);
+			var (status, _, _) = MeasureIdentity.ResolveStart(GetCachedConnected(targetId)?.Name, live, profile.Name);
+			if (status is not IdentityStart.Use)
 			{
-				Time = DateTime.UtcNow,
-				InterfaceId = targetId,
-				Profile = profile.Name,
-				Bssid = profile.Bssid ?? string.Empty,
-				Band = profile.Band,
-				Channel = profile.Channel,
-				Signal = profile.Signal,
-				LinkRate = (linkRate > 0) ? linkRate : null,
-				Trigger = trigger
-			};
+				RecordIgnored($"Speed test of {profile.Name} ({trigger})",
+					$"the adapter is on {(live ?? MeasureIdentity.FromProfile(GetCachedConnected(targetId), targetId)).Describe()}");
+				return (null, false);
+			}
+
+			var start = live ?? MeasureIdentity.FromProfile(profile, targetId);
+
+			// The limits of frequency count only the measurements actually started.
+			if ((trigger is SpeedTrigger.Verify) && !isRecheck)
+			{
+				lock (_switchLock)
+				{
+					_lastVerifyTimes[key] = DateTime.UtcNow;
+				}
+			}
+
+			lock (_measureLock)
+			{
+				_lastAttemptTimes[key] = DateTime.UtcNow;
+			}
+
+			sample = MeasureIdentity.CreateSample(start, profile, trigger, DateTime.UtcNow);
 
 			await _tester.MeasureAsync(sample, size, token).ConfigureAwait(false);
 
-			// If the connection has changed during the measurement, the result is not of the network.
-			ProfileItem currentProfile;
-			lock (_profilesLock)
-			{
-				currentProfile = Profiles.FirstOrDefault(x => x.IsConnected && (x.InterfaceId == targetId));
-			}
+			// If the interface has left the network during the measurement, the result is of
+			// neither network. The connection at the end is asked in the same way as at the start.
+			var end = (live is not null) ? GetLiveConnection(targetId) : null;
+			end ??= MeasureIdentity.FromProfile(GetCachedConnected(targetId), targetId);
 
-			if (!ReferenceEquals(currentProfile, profile))
-			{
-				sample.Result = SpeedResult.Aborted;
-			}
-			else
-			{
-				var currentBssid = currentProfile.Bssid;
-				if (!string.IsNullOrEmpty(currentBssid)
-					&& !string.IsNullOrEmpty(sample.Bssid)
-					&& !string.Equals(currentBssid, sample.Bssid, StringComparison.OrdinalIgnoreCase))
-				{
-					sample.Result = SpeedResult.Aborted;
-				}
-			}
+			MeasureIdentity.ApplyEnd(sample, start, end);
 
 			var isOffline = sample.Result is SpeedResult.NoInternet or SpeedResult.CaptivePortal;
 			if (isOffline)
@@ -530,6 +542,134 @@ internal partial class AppController
 
 		return (sample, isRecorded);
 	}
+
+	/// <summary>
+	/// Queries the current connection of an interface from the system.
+	/// </summary>
+	/// <returns>Connection, null if it cannot be queried</returns>
+	/// <remarks>This method never throws an exception.</remarks>
+	private LiveConnection GetLiveConnection(Guid interfaceId)
+	{
+		try
+		{
+			return _worker.GetConnection(interfaceId);
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to query the current connection." + Environment.NewLine
+				+ ex);
+			return null;
+		}
+	}
+
+	/// <summary>
+	/// Gets the profile shown as connected in the profiles as loaded.
+	/// </summary>
+	/// <remarks>This can be older than the connection: see <see cref="GetLiveConnection"/>.</remarks>
+	private ProfileItem GetCachedConnected(Guid interfaceId)
+	{
+		lock (_profilesLock)
+		{
+			return Profiles.FirstOrDefault(x => x.IsConnected && (x.InterfaceId == interfaceId));
+		}
+	}
+
+	private ProfileItem FindProfile(Guid interfaceId, string name)
+	{
+		lock (_profilesLock)
+		{
+			return Profiles.FirstOrDefault(x => (x.InterfaceId == interfaceId)
+				&& string.Equals(x.Name, name, StringComparison.Ordinal));
+		}
+	}
+
+	/// <summary>
+	/// Determines whether an interface is connected by a profile, asking the system and, only
+	/// if it cannot be asked, relying on the profile as loaded.
+	/// </summary>
+	private bool IsOnProfile(ProfileItem profile)
+	{
+		var live = GetLiveConnection(profile.InterfaceId);
+		return (live is not null) ? live.IsOn(profile.Name) : profile.IsConnected;
+	}
+
+	/// <summary>
+	/// Finds the profile by which an interface is actually connected.
+	/// </summary>
+	/// <param name="trigger">Trigger of the measurement which asks</param>
+	/// <param name="interfaceId">Interface ID (any interface if null)</param>
+	/// <param name="expectedName">Name of the profile which the measurement is for (null for whichever is connected)</param>
+	/// <returns>Profile if the interface is connected (by the expected profile if any), null otherwise</returns>
+	/// <remarks>
+	/// If the profiles as loaded disagree with the connection, the connection wins and
+	/// the profiles are loaded again.
+	/// </remarks>
+	private async Task<ProfileItem> ResolveConnectedAsync(SpeedTrigger trigger, Guid? interfaceId, string expectedName)
+	{
+		Guid[] interfaceIds;
+		if (interfaceId.HasValue)
+		{
+			interfaceIds = [interfaceId.Value];
+		}
+		else
+		{
+			lock (_profilesLock)
+			{
+				interfaceIds = Profiles
+					.OrderByDescending(x => x.IsConnected)
+					.Select(x => x.InterfaceId)
+					.Distinct()
+					.ToArray();
+			}
+		}
+
+		foreach (var id in interfaceIds)
+		{
+			var cached = GetCachedConnected(id);
+			var live = GetLiveConnection(id);
+
+			var (status, name, isStale) = MeasureIdentity.ResolveStart(cached?.Name, live, expectedName);
+
+			if (isStale && !_disposed)
+			{
+				Logger.RecordOperation($"The profiles were out of date before a speed test ({trigger}): "
+					+ $"they showed {cached?.Name ?? "no network"} as connected while the adapter is on {live.Describe()}. Loading them again.");
+
+				// This load is repeated for a while if another update is running.
+				await LoadProfilesFreshAsync(_recheckLoadTimeout).ConfigureAwait(false);
+			}
+
+			if (status is not IdentityStart.Use)
+				continue;
+
+			// The profile is found by the name of the connection whether or not it is shown
+			// as connected, in case the load could not be performed.
+			var profile = isStale ? FindProfile(id, name) : cached;
+			if (profile is not null)
+				return profile;
+		}
+		return null;
+	}
+
+	/// <summary>
+	/// Records to the operation log that something asked for was not run, so that it is never
+	/// dropped without a word.
+	/// </summary>
+	/// <remarks>This method never throws an exception.</remarks>
+	private static void RecordIgnored(string what, string why)
+	{
+		try
+		{
+			Logger.RecordOperation(GetIgnoredText(what, why));
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to record what was not run." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	internal static string GetIgnoredText(string what, string why) => $"{what} was not run: {why}.";
 
 	/// <summary>
 	/// Records a measurement which failed for a reason other than the network itself, or which

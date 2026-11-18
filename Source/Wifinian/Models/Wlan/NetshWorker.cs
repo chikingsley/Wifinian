@@ -165,6 +165,9 @@ internal class NetshWorker : IWlanWorker
 
 	#endregion
 
+	// Netsh is not asked for each measurement: the profiles as loaded are relied on.
+	public Measure.LiveConnection GetConnection(Guid interfaceId) => null;
+
 	#region Connect/Disconnect
 
 	public async Task<bool> ConnectNetworkAsync(ProfileItem profileItem, TimeSpan timeout)
