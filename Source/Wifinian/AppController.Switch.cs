@@ -38,16 +38,9 @@ internal partial class AppController
 	private readonly HashSet<Guid> _revertingIds = new(); // Interface IDs
 	private readonly Dictionary<string, DateTime> _lastVerifyTimes = new(); // UTC
 	private readonly Dictionary<string, DateTime> _lastOfflineTimes = new(); // UTC
-	private readonly Dictionary<Guid, int> _ownConnects = new(); // Numbers of connections by this app in progress
-	private readonly Dictionary<Guid, DateTime> _foreignConnects = new(); // UTC
+	private readonly ForeignConnectTracker _foreignConnects = new();
 	private readonly HashSet<Guid> _recheckIds = new(); // Interface IDs
 	private readonly object _switchLock = new();
-
-	/// <summary>
-	/// Period in which a connection started outside this app is regarded as in progress unless
-	/// its end is notified
-	/// </summary>
-	private static readonly TimeSpan _foreignConnectPeriod = TimeSpan.FromSeconds(40);
 
 	private static readonly TimeSpan _recheckLoadTimeout = TimeSpan.FromSeconds(5);
 	private static readonly TimeSpan _recheckMargin = TimeSpan.FromMilliseconds(300);
@@ -56,8 +49,7 @@ internal partial class AppController
 	{
 		lock (_switchLock)
 		{
-			_ownConnects.TryGetValue(interfaceId, out int count);
-			_ownConnects[interfaceId] = count + 1;
+			_foreignConnects.BeginOwn(interfaceId);
 		}
 	}
 
@@ -65,10 +57,7 @@ internal partial class AppController
 	{
 		lock (_switchLock)
 		{
-			if (_ownConnects.TryGetValue(interfaceId, out int count) && (count > 1))
-				_ownConnects[interfaceId] = count - 1;
-			else
-				_ownConnects.Remove(interfaceId);
+			_foreignConnects.EndOwn(interfaceId);
 		}
 	}
 
@@ -77,7 +66,8 @@ internal partial class AppController
 	/// </summary>
 	/// <remarks>
 	/// A connection started by the user (Windows Wi-Fi menu, netsh) or by the system must not be
-	/// taken over by automatic connection of this app. This method never throws an exception.
+	/// taken over by automatic connection of this app. A failed attempt does not end it because
+	/// Windows goes on with further attempts. This method never throws an exception.
 	/// </remarks>
 	internal void TrackForeignConnect(Guid interfaceId, ManagedNativeWifi.ConnectionChangedState changedState)
 	{
@@ -85,18 +75,7 @@ internal partial class AppController
 		{
 			lock (_switchLock)
 			{
-				switch (changedState)
-				{
-					case ManagedNativeWifi.ConnectionChangedState.Started:
-						if (!_ownConnects.ContainsKey(interfaceId))
-							_foreignConnects[interfaceId] = DateTime.UtcNow;
-						break;
-
-					case ManagedNativeWifi.ConnectionChangedState.Completed:
-					case ManagedNativeWifi.ConnectionChangedState.Failed:
-						_foreignConnects.Remove(interfaceId);
-						break;
-				}
+				_foreignConnects.Track(interfaceId, changedState, DateTime.UtcNow);
 			}
 		}
 		catch (Exception ex)
@@ -113,14 +92,7 @@ internal partial class AppController
 	{
 		lock (_switchLock)
 		{
-			if (!_foreignConnects.TryGetValue(interfaceId, out DateTime time))
-				return false;
-
-			if ((DateTime.UtcNow - time).Duration() < _foreignConnectPeriod)
-				return true;
-
-			_foreignConnects.Remove(interfaceId);
-			return false;
+			return _foreignConnects.IsConnecting(interfaceId, DateTime.UtcNow);
 		}
 	}
 

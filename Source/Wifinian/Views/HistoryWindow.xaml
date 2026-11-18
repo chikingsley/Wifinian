@@ -118,15 +118,15 @@
 						 GroupName="Range"
 						 Content="24 h" Tag="24"
 						 IsChecked="True"
-						 Click="OnRangeClick"/>
+						 Checked="OnRangeChecked"/>
 			<RadioButton Style="{StaticResource RangeButtonStyle}"
 						 GroupName="Range"
 						 Content="7 d" Tag="168"
-						 Click="OnRangeClick"/>
+						 Checked="OnRangeChecked"/>
 			<RadioButton Style="{StaticResource RangeButtonStyle}"
 						 GroupName="Range"
 						 Content="30 d" Tag="720"
-						 Click="OnRangeClick"/>
+						 Checked="OnRangeChecked"/>
 			<Button Style="{StaticResource BarButtonStyle}"
 					Content="Refresh"
 					Command="{Binding RefreshCommand, Mode=OneTime}"/>

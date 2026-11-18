@@ -818,6 +818,71 @@ public class HistoryServiceTest
 	}
 
 	[TestMethod]
+	public void TestUploadSpeedOfOldMethodIsBlanked()
+	{
+		SpeedSample Create(int minutes, double? up, long upBytes)
+		{
+			var sample = CreateSpeed(_start.AddMinutes(minutes), "Office", SpeedResult.Ok, 70);
+			sample.UpMbps = up;
+			sample.UpBytes = upBytes;
+			return sample;
+		}
+
+		using (var history = CreateHistory())
+		{
+			// Old method: a few megabytes handed to the system in a moment (rows of the owner)
+			history.AppendSpeed(Create(0, 40.0, 5_111_808L));
+			history.AppendSpeed(Create(1, 94.9, 5_439_488L));
+			history.AppendSpeed(Create(2, 124.2, 6_356_992L));
+
+			// Current method: at least 3 seconds after warm-up, or the cap of bytes
+			history.AppendSpeed(Create(3, 77.0, 40_108_032L));
+			history.AppendSpeed(Create(4, 6.0, 3_014_656L));
+			history.AppendSpeed(Create(5, 300.0, 80_019_456L));
+
+			// Nothing to blank
+			history.AppendSpeed(Create(6, null, 0L));
+		}
+
+		// The database is as an earlier build left it.
+		using (var connection = OpenDatabase())
+		{
+			Execute(connection, "PRAGMA user_version = 1;");
+		}
+
+		using (var history = CreateHistory())
+		{
+			var speeds = history.ReadSpeeds(_start, _start.AddHours(1));
+
+			CollectionAssert.AreEqual(new double?[] { null, null, null, 77.0, 6.0, 300.0, null },
+				speeds.OrderBy(x => x.Time).Select(x => x.UpMbps).ToArray());
+
+			// The other values are kept.
+			Assert.IsTrue(speeds.All(x => x.DownMbps == 70D));
+			Assert.IsTrue(speeds.All(x => x.Result == SpeedResult.Ok));
+			Assert.AreEqual(5_111_808L, speeds.OrderBy(x => x.Time).First().UpBytes);
+
+			Assert.AreEqual(77.0, history.GetSummary(HistoryService.GetKey("Office", _interfaceId)).UpMbps);
+		}
+
+		using (var connection = OpenDatabase())
+		{
+			Assert.AreEqual((long)HistoryService.SchemaVersion, Query(connection, "PRAGMA user_version;").Single());
+		}
+
+		// A row written by this build is never blanked afterwards.
+		using (var history = CreateHistory())
+		{
+			history.AppendSpeed(Create(10, 80.0, 20_054_016L));
+		}
+
+		using (var history = CreateHistory())
+		{
+			Assert.AreEqual(80.0, history.ReadSpeeds(_start.AddMinutes(10), _start.AddMinutes(10)).Single().UpMbps);
+		}
+	}
+
+	[TestMethod]
 	public void TestDatabaseOfNewerVersionIsUsed()
 	{
 		using (var history = CreateHistory())

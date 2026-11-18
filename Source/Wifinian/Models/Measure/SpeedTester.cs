@@ -90,16 +90,32 @@ internal sealed class SpeedTester
 	/// Gets the caps of upload. The time includes warm-up and is long enough for the minimum
 	/// window after it regardless of the interval of sampling.
 	/// </summary>
+	/// <remarks>
+	/// The bytes of a quick measurement, which automatic ones are, are capped as low as those of
+	/// its download so that hourly measurements fit in the daily budget. The cap is reached only
+	/// by a link faster than about 40 Mbps, on which the window after warm-up becomes shorter
+	/// than the minimum (about a second at 80 Mbps).
+	/// </remarks>
 	internal static (int capTime, long capBytes) GetUploadCap(SpeedTestSize size) => size switch
 	{
 		SpeedTestSize.Full => (UploadWarmup + 5000 + 2 * SampleInterval, 80_000_000L),
-		_ => (UploadWarmup + UploadMinWindow + 2 * SampleInterval, 40_000_000L)
+		_ => (UploadWarmup + UploadMinWindow + 2 * SampleInterval, QuickUploadBytes)
 	};
+
+	/// <summary>
+	/// Maximum bytes uploaded by a quick measurement
+	/// </summary>
+	internal const long QuickUploadBytes = 20_000_000L;
+
+	/// <summary>
+	/// Maximum bytes downloaded by a quick measurement
+	/// </summary>
+	internal const long QuickDownloadBytes = 20_000_000L;
 
 	private static (int capTime, long capBytes) GetDownloadCap(SpeedTestSize size) => size switch
 	{
 		SpeedTestSize.Full => (8000, 50_000_000L),
-		_ => (5000, 20_000_000L)
+		_ => (5000, QuickDownloadBytes)
 	};
 
 	#endregion

@@ -63,9 +63,9 @@ Both hosts can be changed in settings.xml (see below). If another connection (e.
 
 Automatic tests run 20 seconds after a network is connected (unless it was tested within the last 30 minutes), then once an hour while it stays connected, and only for networks with __Auto switch__ ticked and __Avoid__ unticked. An automatic test is put off while the link is carrying more than about 1 Mbps. __Test speed now__ in the menu tests the connected network at any time.
 
-Upload speed is that of the bytes actually sent: it is measured for at least 3 seconds after a second of warm-up, through sockets with small fixed send buffers so that bytes merely handed to the system are not counted.
+Upload speed is that of the bytes actually sent: it is measured for at least 3 seconds after a second of warm-up, through sockets with small fixed send buffers so that bytes merely handed to the system are not counted. An automatic test stops uploading at 20 MB, so on a link faster than about 40 Mbps it measures for less than 3 seconds (about a second at 80 Mbps). Upload speeds recorded by earlier builds, which counted bytes too early and showed several times the real speed, are blanked in the database the first time this build opens it; the rest of those rows is kept.
 
-Data use: an automatic test uses up to about 60 MB (20 MB down and, depending on the upload speed, up to 40 MB up), __Test speed now__ up to about 130 MB. Automatic tests stop for the day once 500 MB has been used. The metered connection setting of Windows is not consulted, so untick __Measure speed automatically__ on metered or tethered connections.
+Data use: an automatic test uses up to about 40 MB (up to 20 MB down and up to 20 MB up, less on links slower than about 35 Mbps), __Test speed now__ up to about 130 MB. Automatic tests stop for the day once 1000 MB has been used (`SpeedTestDailyBudget`), which is enough for a test every hour; a `settings.xml` saved by an earlier build keeps its 500. The metered connection setting of Windows is not consulted, so untick __Measure speed automatically__ on metered or tethered connections.
 
 ### How speed-aware Engage decides
 
@@ -106,7 +106,7 @@ These values are only in `%LOCALAPPDATA%\Wifinian\settings.xml`. Close the app b
 |ScanInterval|5|0-1440|Minutes between background scans (0 for never); a scan is skipped while the link is in use|
 |HistoryRetentionDays|90|7-365|Days history is kept|
 |SpeedTestInterval|60|15-240|Minutes between periodic tests of the connected network|
-|SpeedTestDailyBudget|500|50-5000|MB a day automatic tests may use|
+|SpeedTestDailyBudget|1000|50-5000|MB a day automatic tests may use|
 |SwitchDwellTime|10|2-60|Minutes to stay on a network before switching for speed|
 |SwitchMargin|50|20-200|Percent another network must be faster (50 means 1.5 times)|
 |SufficientSpeed|50|5-1000|Mbps at or above which the connected network is never left for a faster one|

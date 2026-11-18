@@ -152,12 +152,18 @@ public class Settings : DisposableBase
 	/// <summary>
 	/// Daily budget (MB) of data used by automatic speed measurements
 	/// </summary>
+	/// <remarks>
+	/// The default covers a day of hourly measurements each of which reaches both caps of bytes
+	/// (24 x 40 MB).
+	/// </remarks>
 	public int SpeedTestDailyBudget
 	{
 		get => _speedTestDailyBudget;
 		set => SetProperty(ref _speedTestDailyBudget, value, MinSpeedTestDailyBudget, MaxSpeedTestDailyBudget);
 	}
-	private int _speedTestDailyBudget = 500; // Default
+	private int _speedTestDailyBudget = DefaultSpeedTestDailyBudget;
+
+	internal const int DefaultSpeedTestDailyBudget = 1000;
 
 	internal const string DefaultSpeedTestDownloadUrl = "https://speed.cloudflare.com/__down?bytes=25000000";
 	internal const string DefaultSpeedTestUploadUrl = "https://speed.cloudflare.com/__up";

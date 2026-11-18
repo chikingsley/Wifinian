@@ -70,13 +70,21 @@ public partial class HistoryWindow : Window
 
 	#endregion
 
-	private void OnRangeClick(object sender, RoutedEventArgs e)
+	/// <summary>
+	/// Applies the range of a button when it gets checked by any means (mouse, keyboard or
+	/// UI Automation, which selects a button without clicking it).
+	/// </summary>
+	private void OnRangeChecked(object sender, RoutedEventArgs e)
 	{
+		// The initially checked button raises this event before the view model is set.
+		if (this.DataContext is not HistoryWindowViewModel viewModel)
+			return;
+
 		// The tag of each button holds the range in hours.
 		if ((sender is FrameworkElement { Tag: string tag })
 			&& int.TryParse(tag, NumberStyles.Integer, CultureInfo.InvariantCulture, out int hours))
 		{
-			ViewModel.RangeHours.Value = hours;
+			viewModel.RangeHours.Value = hours;
 		}
 	}
 

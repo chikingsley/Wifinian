@@ -350,6 +350,11 @@ internal static class SwitchPolicy
 	/// </remarks>
 	public static void Track(SwitchState state, string connectedName, DateTime now)
 	{
+		// A disconnection after the interface is seen connected, to whichever network, is no
+		// longer the consequence of an earlier failed connection by this app.
+		if (connectedName is not null)
+			state.OwnFailureAt = default;
+
 		if (string.Equals(state.ConnectedName, connectedName, StringComparison.Ordinal))
 			return;
 

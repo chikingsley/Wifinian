@@ -1211,6 +1211,130 @@ public class SwitchPolicyTest
 	}
 
 	[TestMethod]
+	public void TestGraceAfterOwnFailureFollowedByConnection()
+	{
+		var a = Profile("A", 80, 0);
+		var b = Profile("B", 70, 1);
+
+		foreach (var engagesSpeed in new[] { false, true })
+		{
+			// This app tried to switch from A to B and failed, which left the interface
+			// disconnected. Then the interface got connected again and, 20 seconds after
+			// the failure, the user chooses another network in the Wi-Fi menu of Windows.
+			foreach (var reconnectedName in new[] { "A", "B" })
+			{
+				var state = CreateState("A", TimeSpan.FromHours(1));
+				SwitchPolicy.RecordAttempt(state, "B", false, _now - TimeSpan.FromSeconds(20), setsCooldown: engagesSpeed);
+				SwitchPolicy.Track(state, null, _now - TimeSpan.FromSeconds(19));
+				SwitchPolicy.Track(state, reconnectedName, _now - TimeSpan.FromSeconds(17));
+				Assert.AreEqual(default, state.OwnFailureAt);
+
+				SwitchPolicy.Track(state, null, _now);
+
+				var decision = SwitchPolicy.Decide([a, b], null, CreateContext(engagesSpeed, TimeSpan.FromSeconds(1)), state);
+				Assert.IsNull(decision.Target, reconnectedName);
+				Assert.AreEqual(SwitchPolicy.GraceCode, decision.Code);
+			}
+
+			// The failed attempt did not disconnect the interface at all: it stays on A.
+			var staying = CreateState("A", TimeSpan.FromHours(1));
+			SwitchPolicy.RecordAttempt(staying, "B", false, _now - TimeSpan.FromSeconds(20), setsCooldown: engagesSpeed);
+			SwitchPolicy.Track(staying, "A", _now - TimeSpan.FromSeconds(17));
+			SwitchPolicy.Track(staying, null, _now);
+
+			var waiting = SwitchPolicy.GetConnectWait(CreateContext(engagesSpeed, TimeSpan.FromSeconds(1)), staying);
+			Assert.IsNotNull(waiting);
+			Assert.AreEqual(SwitchPolicy.GraceCode, waiting.Code);
+		}
+	}
+
+	[TestMethod]
+	public void TestForeignConnectTracker()
+	{
+		var other = Guid.NewGuid();
+		var tracker = new ForeignConnectTracker();
+		Assert.IsFalse(tracker.IsConnecting(_interfaceId, _utcNow));
+
+		// A connection started outside this app lasts until its end is notified.
+		tracker.Track(_interfaceId, ConnectionChangedState.Started, _utcNow);
+		Assert.IsTrue(tracker.IsConnecting(_interfaceId, _utcNow));
+		Assert.IsFalse(tracker.IsConnecting(other, _utcNow));
+
+		// A failed attempt is not the end: Windows goes on with another attempt.
+		tracker.Track(_interfaceId, ConnectionChangedState.Failed, _utcNow.AddSeconds(5));
+		tracker.Track(_interfaceId, ConnectionChangedState.Disconnected, _utcNow.AddSeconds(5));
+		Assert.IsTrue(tracker.IsConnecting(_interfaceId, _utcNow.AddSeconds(12)));
+
+		tracker.Track(_interfaceId, ConnectionChangedState.Completed, _utcNow.AddSeconds(16));
+		Assert.IsFalse(tracker.IsConnecting(_interfaceId, _utcNow.AddSeconds(16)));
+
+		// If the end is never notified, the record expires.
+		tracker.Track(_interfaceId, ConnectionChangedState.Started, _utcNow);
+		tracker.Track(_interfaceId, ConnectionChangedState.Failed, _utcNow.AddSeconds(5));
+		Assert.IsTrue(tracker.IsConnecting(_interfaceId, _utcNow.AddSeconds(39)));
+		Assert.IsFalse(tracker.IsConnecting(_interfaceId, _utcNow.AddSeconds(40)));
+		Assert.IsFalse(tracker.IsConnecting(_interfaceId, _utcNow.AddSeconds(41)));
+		Assert.AreEqual(TimeSpan.FromSeconds(40), ForeignConnectTracker.Period);
+
+		// A connection started by this app is not recorded.
+		tracker.BeginOwn(_interfaceId);
+		tracker.BeginOwn(_interfaceId);
+		tracker.EndOwn(_interfaceId);
+		tracker.Track(_interfaceId, ConnectionChangedState.Started, _utcNow);
+		Assert.IsFalse(tracker.IsConnecting(_interfaceId, _utcNow));
+
+		tracker.EndOwn(_interfaceId);
+		tracker.Track(_interfaceId, ConnectionChangedState.Started, _utcNow);
+		Assert.IsTrue(tracker.IsConnecting(_interfaceId, _utcNow));
+	}
+
+	[TestMethod]
+	public void TestReplayConnectionMadeOutsideWithFailedAttempt()
+	{
+		// The owner chooses weak EXT2 in the Wi-Fi menu of Windows. The first attempt of
+		// association fails and Windows makes another one. A load of profiles between the two
+		// sees the interface disconnected, 12 seconds after the disconnection from EXT, when
+		// the grace period is over.
+		var ext = Profile("EXT", 83, 0);
+		var ext2 = Profile("EXT2", 60, 1);
+		AddSample("EXT", TimeSpan.FromMinutes(5), SpeedResult.Ok, 101, 83);
+
+		foreach (var engagesSpeed in new[] { false, true })
+		{
+			var state = CreateState("EXT", TimeSpan.FromHours(1));
+			var tracker = new ForeignConnectTracker();
+
+			// What AppController.DecideTarget does: the state of the interface as of the load
+			// and the record of notifications together tell whether the interface is busy.
+			SwitchDecision Step(double seconds, bool isAssociating)
+			{
+				var context = CreateContext(engagesSpeed, TimeSpan.FromSeconds(seconds));
+				context.IsInterfaceBusy = isAssociating || tracker.IsConnecting(_interfaceId, context.UtcNow);
+
+				SwitchPolicy.Track(state, null, context.Now);
+				return SwitchPolicy.Decide([ext, ext2], null, context, state);
+			}
+
+			Assert.AreEqual(SwitchPolicy.GraceCode, Step(0, false).Code);
+
+			tracker.Track(_interfaceId, ConnectionChangedState.Started, _utcNow.AddSeconds(1));
+			Assert.AreEqual(SwitchPolicy.ConnectingCode, Step(2, true).Code);
+
+			tracker.Track(_interfaceId, ConnectionChangedState.Failed, _utcNow.AddSeconds(8));
+
+			var between = Step(12, false);
+			Assert.IsNull(between.Target);
+			Assert.AreEqual(SwitchPolicy.ConnectingCode, between.Code);
+			Assert.AreEqual(SwitchPolicy.ConnectingRecheck, between.RecheckAfter);
+
+			// The connection ends in failure after all. EXT is connected back to.
+			tracker.Track(_interfaceId, ConnectionChangedState.Completed, _utcNow.AddSeconds(20));
+			Assert.IsFalse(tracker.IsConnecting(_interfaceId, _utcNow.AddSeconds(20)));
+			Assert.AreSame(ext, Step(21, false).Target);
+		}
+	}
+
+	[TestMethod]
 	public void TestReplayConnectionMadeOutside()
 	{
 		// The owner is on EXT (about 100 Mbps) and chooses EXT2 in the Wi-Fi menu of Windows.

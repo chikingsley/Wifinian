@@ -114,7 +114,21 @@ internal class HistoryService : IDisposable
 		this._timeout = Math.Max(1, timeout);
 
 		// The database is created when the first row is written so that nothing is left on disk
-		// as long as nothing is recorded.
+		// as long as nothing is recorded. An existing database is upgraded before it is read
+		// because an upgrade may correct rows.
+		try
+		{
+			lock (_dbLock)
+			{
+				UpgradeExisting();
+			}
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to upgrade history database." + Environment.NewLine
+				+ ex);
+		}
+
 		try
 		{
 			LoadSpeeds();
@@ -310,7 +324,7 @@ internal class HistoryService : IDisposable
 	/// <summary>
 	/// Version of the schema (PRAGMA user_version) this class writes
 	/// </summary>
-	internal const int SchemaVersion = 1;
+	internal const int SchemaVersion = 2;
 
 	/// <summary>
 	/// Scripts to upgrade the schema, the element of index N upgrading version N to N+1
@@ -379,7 +393,19 @@ internal class HistoryService : IDisposable
 
 		CREATE TABLE meta (
 			key TEXT PRIMARY KEY,
-			value TEXT);"
+			value TEXT);",
+
+		// 1 -> 2
+		// Upload speed was once measured by counting bytes when they were handed to the system,
+		// over less than 3 seconds and up to 10 MB, which made it look several times faster than
+		// the link (e.g. 124 Mbps on a link of 77 Mbps). Since then it is measured over at least
+		// 3 seconds after warm-up unless 40 MB or more is sent. A row whose bytes are fewer than
+		// that rate would send in the window is of the old method and its upload speed is blanked.
+		// The other values of the row are kept.
+		@"UPDATE speed SET up_mbps = NULL
+			WHERE up_mbps IS NOT NULL
+			AND up_bytes < 40000000
+			AND up_bytes < up_mbps * 125000 * 2.7;"
 	};
 
 	private const string SignalTable = "signal";
@@ -467,6 +493,28 @@ internal class HistoryService : IDisposable
 		Pooling = false, // The file must be released when the connection is disposed.
 		DefaultTimeout = _timeout
 	}.ToString();
+
+	/// <summary>
+	/// Upgrades an existing database of an older version.
+	/// </summary>
+	/// <remarks>
+	/// Nothing is created and a file which is not a database is left as it is (it is set aside
+	/// only when a row is to be written). This method must be called inside the lock of
+	/// the database and can throw an exception.
+	/// </remarks>
+	private void UpgradeExisting()
+	{
+		if (!File.Exists(_filePath))
+			return;
+
+		using var connection = new SqliteConnection(GetConnectionString(SqliteOpenMode.ReadWrite));
+		connection.Open();
+
+		// Version 0 is a file with no table yet, which is prepared when a row is written.
+		var version = Convert.ToInt32(ExecuteScalar(connection, null, "PRAGMA user_version;"), CultureInfo.InvariantCulture);
+		if (version >= 1)
+			Migrate(connection);
+	}
 
 	private static void Migrate(SqliteConnection connection)
 	{

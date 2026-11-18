@@ -127,10 +127,26 @@ public class SpeedTesterTest
 		{
 			var (capTime, capBytes) = SpeedTester.GetUploadCap(size);
 			Assert.IsTrue(capTime - SpeedTester.UploadWarmup >= SpeedTester.UploadMinWindow + 100, size.ToString());
-			Assert.IsTrue(capBytes >= 40_000_000L, size.ToString());
+			Assert.IsTrue(capBytes >= SpeedTester.QuickUploadBytes, size.ToString());
 		}
 
 		Assert.IsTrue(SpeedTester.UploadMinWindow >= 3000);
+		Assert.AreEqual(SpeedTester.QuickUploadBytes, SpeedTester.GetUploadCap(SpeedTestSize.Quick).capBytes);
+		Assert.IsTrue(SpeedTester.GetUploadCap(SpeedTestSize.Full).capBytes >= 40_000_000L);
+
+		// A link of 35 Mbps is still measured over the whole time.
+		Assert.IsTrue(SpeedTester.QuickUploadBytes >= 35_000_000L / 8 * SpeedTester.GetUploadCap(SpeedTestSize.Quick).capTime / 1000);
+	}
+
+	[TestMethod]
+	public void TestDailyBudgetCoversHourlyTests()
+	{
+		// Automatic measurements are quick ones. A day of hourly measurements, each of which
+		// reaches both caps of bytes, must fit in the default daily budget.
+		var bytesPerTest = SpeedTester.QuickDownloadBytes + SpeedTester.QuickUploadBytes;
+
+		Assert.IsTrue(24 * bytesPerTest <= Settings.DefaultSpeedTestDailyBudget * 1_000_000L,
+			$"{24 * bytesPerTest} bytes a day");
 	}
 
 	#endregion
@@ -359,7 +375,7 @@ public class SpeedTesterTest
 		{
 			Assert.IsTrue(measuresSpeed);
 			Assert.AreEqual(60, speedTestInterval);
-			Assert.AreEqual(500, speedTestDailyBudget);
+			Assert.AreEqual(1000, speedTestDailyBudget);
 			Assert.AreEqual(5, scanInterval);
 			Assert.AreEqual("https://speed.cloudflare.com/__down?bytes=25000000", speedTestDownloadUrl);
 			Assert.AreEqual("https://speed.cloudflare.com/__up", speedTestUploadUrl);
