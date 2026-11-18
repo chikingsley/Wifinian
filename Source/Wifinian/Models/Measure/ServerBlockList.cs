@@ -30,6 +30,10 @@ internal sealed class RateLimit
 /// <para>A server which answers 429 (or 403/503 with Retry-After) refuses every request for a while
 /// and counts those made meanwhile against this PC. Without this list each measurement would ask
 /// it again, fail and make every network look untestable.</para>
+/// <para>A limit is of the public address the requests came from, which this PC does not know and
+/// which differs between networks. A block is therefore of a server on the network on which it
+/// answered so: another network asks the server itself, once, and is blocked in its turn if it is
+/// refused as well.</para>
 /// <para>The list is kept in a small file so that starting this app again does not forget it.
 /// One line is recorded when a block starts and one when it ends, not one per measurement.</para>
 /// <para>No method of this class throws an exception.</para>
@@ -82,15 +86,37 @@ internal sealed class ServerBlockList
 	/// <remarks>Download and upload on the same host share the block.</remarks>
 	public static string GetKey(Uri uri) => uri?.Authority.ToLowerInvariant();
 
+	private const char NetworkSeparator = '\n';
+
 	/// <summary>
-	/// Gets the time (UTC) until which a server is not to be used.
+	/// Gets the key of a block: the server and the network (none for every network).
 	/// </summary>
-	/// <returns>Time if the server is blocked now, null otherwise</returns>
-	public DateTime? GetBlockedUntil(Uri uri)
+	private static string GetBlockKey(string server, string network)
 	{
-		var key = GetKey(uri);
-		if (string.IsNullOrEmpty(key))
+		network = Clean(network);
+		return (network is null) ? server : $"{server}{NetworkSeparator}{network}";
+	}
+
+	private static (string server, string network) SplitBlockKey(string key)
+	{
+		int index = key.IndexOf(NetworkSeparator);
+		return (index < 0) ? (key, null) : (key.Substring(0, index), key.Substring(index + 1));
+	}
+
+	/// <summary>
+	/// Gets the time (UTC) until which a server is not to be used on a network.
+	/// </summary>
+	/// <param name="uri">URL of the server</param>
+	/// <param name="network">Name of the network (null for a block which holds on every network)</param>
+	/// <returns>Time if the server is blocked now, null otherwise</returns>
+	/// <remarks>A block of every network (one recorded without a network) holds on each network.</remarks>
+	public DateTime? GetBlockedUntil(Uri uri, string network = null)
+	{
+		var server = GetKey(uri);
+		if (string.IsNullOrEmpty(server))
 			return null;
+
+		var key = GetBlockKey(server, network);
 
 		var ended = new List<string>();
 		DateTime? until = null;
@@ -103,6 +129,13 @@ internal sealed class ServerBlockList
 
 				if (_blocks.TryGetValue(key, out var block))
 					until = block.until;
+
+				if (!string.Equals(key, server, StringComparison.Ordinal)
+					&& _blocks.TryGetValue(server, out var common)
+					&& !(until >= common.until))
+				{
+					until = common.until;
+				}
 			}
 		}
 		catch (Exception ex)
@@ -116,14 +149,20 @@ internal sealed class ServerBlockList
 	}
 
 	/// <summary>
-	/// Blocks a server which limited requests.
+	/// Blocks a server which limited requests on a network.
 	/// </summary>
+	/// <param name="uri">URL of the server</param>
+	/// <param name="limit">What the server answered</param>
+	/// <param name="network">Name of the network on which it answered so (null to block it on every network)</param>
 	/// <returns>True if the block started now, false if the server was blocked already</returns>
-	public bool Block(Uri uri, RateLimit limit)
+	public bool Block(Uri uri, RateLimit limit, string network = null)
 	{
-		var key = GetKey(uri);
-		if (string.IsNullOrEmpty(key) || (limit is null))
+		var server = GetKey(uri);
+		if (string.IsNullOrEmpty(server) || (limit is null))
 			return false;
+
+		network = Clean(network);
+		var key = GetBlockKey(server, network);
 
 		var ended = new List<string>();
 		var isStarted = false;
@@ -159,8 +198,8 @@ internal sealed class ServerBlockList
 
 		if (isStarted)
 		{
-			Record($"Speed test server {key} limits requests ({Clean(limit.Reason) ?? "no reason given"}). "
-				+ $"It is not used until {FormatTime(until)} ({Math.Ceiling((until - _getUtcNow.Invoke()).TotalMinutes):0} min); "
+			Record($"Speed test server {server} limits requests{((network is null) ? string.Empty : $" on {network}")} ({Clean(limit.Reason) ?? "no reason given"}). "
+				+ $"It is not used{((network is null) ? string.Empty : " there")} until {FormatTime(until)} ({Math.Ceiling((until - _getUtcNow.Invoke()).TotalMinutes):0} min); "
 				+ "speed tests use the other servers meanwhile.");
 		}
 		return isStarted;
@@ -233,7 +272,10 @@ internal sealed class ServerBlockList
 	private void RecordEnds(List<string> ended)
 	{
 		foreach (var key in ended)
-			Record($"Speed test server {key} is used again: the time it asked to wait is over.");
+		{
+			var (server, network) = SplitBlockKey(key);
+			Record($"Speed test server {server} is used again{((network is null) ? string.Empty : $" on {network}")}: the time it asked to wait is over.");
+		}
 	}
 
 	private void Record(string text)
@@ -290,7 +332,8 @@ internal sealed class ServerBlockList
 
 			foreach (var line in File.ReadAllLines(_filePath, Encoding.UTF8))
 			{
-				// Server, time (UTC) until which it is blocked and what it said, separated by tabs
+				// Server, time (UTC) until which it is blocked, what it said and the network
+				// (none in a list written by an earlier build: every network), separated by tabs
 				var fields = line.Split('\t');
 				if ((fields.Length < 2) || string.IsNullOrWhiteSpace(fields[0]))
 					continue;
@@ -301,7 +344,7 @@ internal sealed class ServerBlockList
 				// A time further ahead than any block lasts is of a clock which has been changed.
 				until = Min(DateTime.SpecifyKind(until, DateTimeKind.Utc), latest);
 
-				_blocks[fields[0].Trim()] = (until, (fields.Length >= 3) ? Clean(fields[2]) : null);
+				_blocks[GetBlockKey(fields[0].Trim().ToLowerInvariant(), (fields.Length >= 4) ? fields[3] : null)] = (until, (fields.Length >= 3) ? Clean(fields[2]) : null);
 			}
 		}
 		catch (Exception ex)
@@ -330,7 +373,11 @@ internal sealed class ServerBlockList
 
 			File.WriteAllLines(
 				_filePath,
-				_blocks.Select(x => $"{x.Key}\t{DateTime.SpecifyKind(x.Value.until, DateTimeKind.Utc).ToString("o", CultureInfo.InvariantCulture)}\t{x.Value.reason}"),
+				_blocks.Select(x =>
+				{
+					var (server, network) = SplitBlockKey(x.Key);
+					return $"{server}\t{DateTime.SpecifyKind(x.Value.until, DateTimeKind.Utc).ToString("o", CultureInfo.InvariantCulture)}\t{x.Value.reason}\t{network}";
+				}),
 				Encoding.UTF8);
 		}
 		catch (Exception ex)

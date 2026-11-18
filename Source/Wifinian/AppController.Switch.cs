@@ -523,11 +523,18 @@ internal partial class AppController
 	/// so is to be repeated: it could not run or is not a finding on the network.
 	/// </summary>
 	/// <remarks>
-	/// A measurement in which every test server failed is such a one. Internet access was
+	/// <para>A measurement in which every test server failed is such a one. Internet access was
 	/// confirmed before the servers were asked and so it says nothing against the network.
+	/// So is one which went through a server other than the first one, as long as the record
+	/// of the switch remains: its speed did not show the network to be fast enough and cannot
+	/// show it to be slow.</para>
+	/// <para>It is not repeated if servers known to limit requests made it so, because it would
+	/// come out the same until their times are over, which are far longer than the check lasts.
+	/// The switch then stays unchecked and its record expires.</para>
 	/// </remarks>
 	internal static bool IsLandingUnchecked(SpeedSample sample) =>
-		(sample is null) || !sample.Valid;
+		(sample is null)
+		|| ((!sample.Valid || sample.IsFallback) && !SpeedTester.IsLimited(sample));
 
 	/// <summary>
 	/// Tickets by which only the action scheduled last for an interface is run

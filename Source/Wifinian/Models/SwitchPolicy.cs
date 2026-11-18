@@ -492,6 +492,12 @@ internal static class SwitchPolicy
 		if (!canRevert || !(sample.DownMbps < RevertRatio * landing.FromScore.Value))
 			return LandingAction.Clear;
 
+		// A speed measured through a server other than the first one is a lower bound: the server
+		// can be what limited it. It can show that the network is fast enough (above) but not
+		// that it is slower, and so the switch is left unchecked by it.
+		if (sample.IsFallback)
+			return LandingAction.None;
+
 		// A single low result can be by chance.
 		return (++landing.LowCount >= 2) ? LandingAction.Revert : LandingAction.Retest;
 	}

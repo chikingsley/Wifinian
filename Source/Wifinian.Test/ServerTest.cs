@@ -200,9 +200,9 @@ public class ServerTest
 	/// Runs the stages of a measurement which use the test servers, as a measurement of
 	/// a network does after it has confirmed internet access.
 	/// </summary>
-	private static async Task<SpeedSample> MeasureAsync(Uri[] downloadUris, Uri[] uploadUris, ServerBlockList blocks, int retryDelay = 200)
+	private static async Task<SpeedSample> MeasureAsync(Uri[] downloadUris, Uri[] uploadUris, ServerBlockList blocks, int retryDelay = 200, string profile = "EXT", int seekTime = SpeedTester.ServerSeekTime)
 	{
-		var sample = new SpeedSample { Time = DateTime.UtcNow, Profile = "EXT", Trigger = SpeedTrigger.Periodic };
+		var sample = new SpeedSample { Time = DateTime.UtcNow, Profile = profile, Trigger = SpeedTrigger.Periodic };
 
 		await SpeedTester.MeasureTransfersAsync(
 			sample,
@@ -217,7 +217,8 @@ public class ServerTest
 			SpeedTester.SafetyBytes,
 			retryDelay,
 			blocks,
-			CancellationToken.None);
+			CancellationToken.None,
+			seekTime);
 
 		return sample;
 	}
@@ -285,8 +286,8 @@ public class ServerTest
 			// The block is recorded once, with what the server said and until when.
 			Assert.AreEqual(1, records.Count);
 			Assert.AreEqual(
-				$"Speed test server {first.Name} limits requests (HTTP 429 Too Many Requests (Retry-After 3600)). "
-				+ $"It is not used until {until} (60 min); speed tests use the other servers meanwhile.",
+				$"Speed test server {first.Name} limits requests on EXT (HTTP 429 Too Many Requests (Retry-After 3600)). "
+				+ $"It is not used there until {until} (60 min); speed tests use the other servers meanwhile.",
 				records[0]);
 
 			// This measurement, which found the limit, gets a line of the operation log.
@@ -320,7 +321,8 @@ public class ServerTest
 
 			utcNow = utcNow.AddMinutes(40);
 			var restarted = new ServerBlockList(filePath, () => utcNow, records.Add);
-			Assert.AreEqual(new DateTime(2026, 11, 18, 13, 0, 0, DateTimeKind.Utc), restarted.GetBlockedUntil(first.DownloadUri));
+			Assert.AreEqual(new DateTime(2026, 11, 18, 13, 0, 0, DateTimeKind.Utc), restarted.GetBlockedUntil(first.DownloadUri, "EXT"));
+			Assert.IsNull(restarted.GetBlockedUntil(first.DownloadUri, "HOME"));
 			Assert.IsNull(restarted.GetBlockedUntil(second.DownloadUri));
 
 			sample = await MeasureAsync(downloadUris, uploadUris, restarted);
@@ -347,7 +349,7 @@ public class ServerTest
 			Assert.AreEqual(3 * SpeedTester.DownloadCount, second.Downloads);
 
 			Assert.AreEqual(2, records.Count);
-			Assert.AreEqual($"Speed test server {first.Name} is used again: the time it asked to wait is over.", records[1]);
+			Assert.AreEqual($"Speed test server {first.Name} is used again on EXT: the time it asked to wait is over.", records[1]);
 			Assert.IsFalse(File.Exists(filePath));
 		}
 		finally
@@ -389,7 +391,7 @@ public class ServerTest
 		Assert.AreEqual(SpeedTester.DownloadCount, second.Downloads);
 
 		// Only the first one is blocked, for the default time.
-		Assert.AreEqual(utcNow + ServerBlockList.DefaultPeriod, blocks.GetBlockedUntil(first.DownloadUri));
+		Assert.AreEqual(utcNow + ServerBlockList.DefaultPeriod, blocks.GetBlockedUntil(first.DownloadUri, "EXT"));
 		Assert.IsNull(blocks.GetBlockedUntil(second.DownloadUri));
 		Assert.AreEqual(1, records.Count);
 		StringAssert.Contains(records[0], "(30 min)");
@@ -441,7 +443,7 @@ public class ServerTest
 		// Each connection of upload was refused once and did not ask again.
 		Assert.AreEqual(SpeedTester.UploadCount, up.Uploads);
 
-		Assert.AreEqual(utcNow.AddMinutes(2), blocks.GetBlockedUntil(up.UploadUri));
+		Assert.AreEqual(utcNow.AddMinutes(2), blocks.GetBlockedUntil(up.UploadUri, "EXT"));
 		Assert.IsNull(blocks.GetBlockedUntil(down.DownloadUri));
 		Assert.AreEqual(1, records.Count);
 
@@ -618,6 +620,17 @@ public class ServerTest
 			new[] { "proof.ovh.net", "speed.cloudflare.com", "cachefly.cachefly.net" },
 			uris.Select(x => x.Host).ToArray());
 
+		// A server is listed once: a URL set by the user on one of the default servers (an older
+		// default kept in the settings, for instance) replaces the default URL of that server.
+		uris = SpeedTester.GetServerUris("https://SPEED.cloudflare.com/__down?bytes=100000000", Settings.DefaultSpeedTestDownloadUrls);
+		CollectionAssert.AreEqual(
+			new[] { "https://speed.cloudflare.com/__down?bytes=100000000", "https://cachefly.cachefly.net/100mb.test", "https://proof.ovh.net/files/1Gb.dat" },
+			uris.Select(x => x.AbsoluteUri).ToArray());
+
+		// The same host on another port is another server.
+		uris = SpeedTester.GetServerUris("http://speed.cloudflare.com:8080/file", Settings.DefaultSpeedTestDownloadUrls);
+		Assert.AreEqual(4, uris.Count);
+
 		// What is not a URL of HTTP(S) is left out.
 		foreach (var url in new[] { null, " ", "ftp://example.test/file", "not a url" })
 			Assert.AreEqual(3, SpeedTester.GetServerUris(url, Settings.DefaultSpeedTestDownloadUrls).Count);
@@ -629,6 +642,246 @@ public class ServerTest
 
 		uris = SpeedTester.GetServerUris("https://example.test/up", Settings.DefaultSpeedTestUploadUrls);
 		CollectionAssert.AreEqual(new[] { "example.test", "speed.cloudflare.com" }, uris.Select(x => x.Host).ToArray());
+	}
+
+	[TestMethod]
+	public async Task TestLimitIsOfTheNetworkOnWhichItWasMet()
+	{
+		// A limit is of the public address the requests came from. The server refuses on one
+		// network (EXT) and would answer on another (HOME).
+		using var first = new TestServer { DownloadStatus = 429, UploadStatus = 429, RetryAfter = "3600" };
+		using var second = new TestServer();
+
+		var downloadUris = new[] { first.DownloadUri, second.DownloadUri };
+		var uploadUris = new[] { first.UploadUri };
+
+		var filePath = GetTempFilePath();
+		var utcNow = new DateTime(2026, 11, 18, 12, 0, 0, DateTimeKind.Utc);
+		var records = new List<string>();
+		try
+		{
+			var blocks = new ServerBlockList(filePath, () => utcNow, records.Add);
+
+			var sample = await MeasureAsync(downloadUris, uploadUris, blocks);
+			Assert.AreEqual(SpeedResult.Ok, sample.Result);
+			Assert.IsTrue(sample.IsFallback);
+			Assert.AreEqual(utcNow.AddHours(1), blocks.GetBlockedUntil(first.DownloadUri, "EXT"));
+			Assert.IsNull(blocks.GetBlockedUntil(first.DownloadUri, "HOME"));
+			Assert.IsNull(blocks.GetBlockedUntil(first.DownloadUri));
+
+			// On the other network the server is asked and, as it answers there, used for
+			// download and upload. The block of the first network stays, across a restart too.
+			first.DownloadStatus = 200;
+			first.UploadStatus = 200;
+			int downloads = first.Downloads;
+
+			var restarted = new ServerBlockList(filePath, () => utcNow, records.Add);
+			sample = await MeasureAsync(downloadUris, uploadUris, restarted, profile: "HOME");
+
+			Assert.AreEqual(SpeedResult.Ok, sample.Result);
+			Assert.IsFalse(sample.IsFallback);
+			Assert.IsNull(sample.Detail);
+			Assert.IsTrue(sample.UpMbps > 0D);
+			Assert.AreEqual(downloads + SpeedTester.DownloadCount, first.Downloads);
+			Assert.AreEqual(utcNow.AddHours(1), restarted.GetBlockedUntil(first.DownloadUri, "EXT"));
+			Assert.AreEqual(1, records.Count);
+
+			// The first network still leaves the server alone.
+			int connections = first.Connections;
+			sample = await MeasureAsync(downloadUris, uploadUris, restarted);
+			Assert.IsTrue(sample.IsFallback);
+			Assert.AreEqual(connections, first.Connections);
+
+			// If the other network is refused as well, it is blocked in its turn.
+			first.DownloadStatus = 429;
+			downloads = first.Downloads;
+			sample = await MeasureAsync(downloadUris, uploadUris, restarted, profile: "HOME");
+			Assert.IsTrue(sample.IsFallback);
+			Assert.AreEqual(downloads + SpeedTester.DownloadCount, first.Downloads);
+			Assert.AreEqual(utcNow.AddHours(1), restarted.GetBlockedUntil(first.DownloadUri, "HOME"));
+			Assert.AreEqual(2, records.Count);
+			StringAssert.Contains(records[1], "limits requests on HOME (");
+
+			// A line without a network, as written by an earlier build, holds on every network
+			// and is not shortened on one of them by a later answer there.
+			File.WriteAllText(filePath, $"{second.Name}\t{utcNow.AddHours(2):o}\tHTTP 429\r\n");
+			var loaded = new ServerBlockList(filePath, () => utcNow, records.Add);
+			Assert.AreEqual(utcNow.AddHours(2), loaded.GetBlockedUntil(second.DownloadUri));
+			Assert.AreEqual(utcNow.AddHours(2), loaded.GetBlockedUntil(second.DownloadUri, "HOME"));
+
+			loaded.Block(second.DownloadUri, new RateLimit(TimeSpan.FromMinutes(5), "HTTP 429"), "HOME");
+			Assert.AreEqual(utcNow.AddHours(2), loaded.GetBlockedUntil(second.DownloadUri, "HOME"));
+			Assert.AreEqual(utcNow.AddHours(2), loaded.GetBlockedUntil(second.DownloadUri, "EXT"));
+		}
+		finally
+		{
+			DeleteFolder(filePath);
+		}
+	}
+
+	[TestMethod]
+	public async Task TestEveryServerLimitingRequestsIsNotAskedOrRepeated()
+	{
+		using var first = new TestServer { DownloadStatus = 429, RetryAfter = "3600" };
+		using var second = new TestServer { DownloadStatus = 429, RetryAfter = "1800" };
+
+		var downloadUris = new[] { first.DownloadUri, second.DownloadUri };
+		var utcNow = new DateTime(2026, 11, 18, 12, 0, 0, DateTimeKind.Utc);
+		var records = new List<string>();
+		var blocks = new ServerBlockList(null, () => utcNow, records.Add);
+
+		// The measurement which meets the limits is told in the operation log and, after
+		// a switch, is repeated like any other in which the servers failed.
+		var sample = await MeasureAsync(downloadUris, [first.UploadUri], blocks);
+		Assert.AreEqual(SpeedResult.EndpointFailed, sample.Result);
+		Assert.IsFalse(SpeedTester.IsLimited(sample));
+		Assert.IsNotNull(AppController.GetMeasureFailureText(sample));
+		Assert.IsTrue(AppController.IsLandingUnchecked(sample));
+		Assert.AreEqual(2, records.Count);
+
+		// From then on no server is asked. Such a measurement would come out the same until
+		// the times are over: it gets no line of the operation log (the blocks have theirs) and
+		// the test after a switch is not repeated.
+		int firstConnections = first.Connections;
+		int secondConnections = second.Connections;
+		utcNow = utcNow.AddMinutes(10);
+
+		sample = await MeasureAsync(downloadUris, [first.UploadUri], blocks);
+
+		Assert.AreEqual(SpeedResult.EndpointFailed, sample.Result);
+		Assert.IsFalse(sample.Valid);
+		Assert.AreEqual(
+			$"{first.Name} limits requests until {ServerBlockList.FormatTime(utcNow.AddMinutes(50))}; "
+			+ $"{second.Name} limits requests until {ServerBlockList.FormatTime(utcNow.AddMinutes(20))}",
+			sample.Detail);
+		Assert.AreEqual(firstConnections, first.Connections);
+		Assert.AreEqual(secondConnections, second.Connections);
+
+		Assert.IsTrue(SpeedTester.IsLimited(sample));
+		Assert.IsNull(AppController.GetMeasureFailureText(sample));
+		Assert.IsFalse(AppController.IsLandingUnchecked(sample));
+		Assert.AreEqual(2, records.Count);
+
+		// It still is no finding on the network.
+		var landing = new SwitchLanding { FromName = "A", FromScore = 50, ToName = "EXT", Time = sample.Time };
+		Assert.AreEqual(LandingAction.None, SwitchPolicy.EvaluateLanding(landing, sample, sample.Time.AddSeconds(20)));
+		Assert.IsNull(SpeedSummary.Create([sample], sample.Time.AddSeconds(20)));
+	}
+
+	[TestMethod]
+	public async Task TestNoFurtherServerIsAskedOnceTheTimeIsUp()
+	{
+		// The first server fails. The time within which another server may be asked is over by
+		// then (it is none here), and so the measurement ends without asking the second one.
+		using var first = new TestServer { DownloadStatus = 503 };
+		using var second = new TestServer();
+
+		var blocks = new ServerBlockList(null, null, _ => { });
+
+		var sample = await MeasureAsync([first.DownloadUri, second.DownloadUri], [first.UploadUri], blocks, seekTime: 0);
+
+		Assert.AreEqual(SpeedResult.EndpointFailed, sample.Result);
+		StringAssert.StartsWith(sample.Detail,
+			$"{first.Name} failed: Download got no byte in two attempts: HTTP 503 Service Unavailable; {second.Name} was not asked: the servers before it took ");
+		Assert.AreEqual(0, second.Connections);
+
+		// It is told and, after a switch, repeated: the next one may go better.
+		Assert.IsFalse(SpeedTester.IsLimited(sample));
+		Assert.IsNotNull(AppController.GetMeasureFailureText(sample));
+		Assert.IsTrue(AppController.IsLandingUnchecked(sample));
+
+		// Within the time the second server is asked, as before.
+		sample = await MeasureAsync([first.DownloadUri, second.DownloadUri], [second.UploadUri], blocks);
+		Assert.AreEqual(SpeedResult.Ok, sample.Result);
+		Assert.IsTrue(sample.IsFallback);
+	}
+
+	[TestMethod]
+	public void TestSpeedThroughAnotherServerIsALowerBound()
+	{
+		var utcNow = new DateTime(2026, 11, 18, 12, 0, 0, DateTimeKind.Utc);
+
+		static SpeedSample Create(DateTime time, double down, double latency, string detail, SpeedResult result = SpeedResult.Ok) => new()
+		{
+			Time = time,
+			Profile = "B",
+			Signal = 70,
+			DownMbps = down,
+			UpMbps = 20,
+			LatencyMs = latency,
+			Result = result,
+			Detail = detail
+		};
+
+		const string Limited = "Server: proof.ovh.net (speed.cloudflare.com limits requests until 13:00, cachefly.cachefly.net limits requests until 13:10); Upload skipped: speed.cloudflare.com limits requests until 13:00";
+		const string Failed = "Server: cachefly.cachefly.net (speed.cloudflare.com failed: Download got no byte in two attempts: no response within 10 s)";
+
+		var limited = Create(utcNow, 250, 110, Limited);
+		var failed = Create(utcNow, 250, 30, Failed);
+		var direct = Create(utcNow, 250, 12, "Upload not measured: no byte was sent");
+
+		Assert.IsTrue(limited.IsFallback);
+		Assert.IsTrue(failed.IsFallback);
+		Assert.IsFalse(direct.IsFallback);
+		Assert.IsFalse(Create(utcNow, 0, 0, null).IsFallback);
+		Assert.IsFalse(Create(utcNow, 0, 0, Limited, SpeedResult.RouteMismatch).IsFallback);
+
+		Assert.IsTrue(SpeedTester.IsLimited(limited));
+		Assert.IsFalse(SpeedTester.IsLimited(failed));
+		Assert.IsFalse(SpeedTester.IsLimited(direct));
+		Assert.IsFalse(SpeedTester.IsLimited(null));
+
+		// (1) After a switch from A (600 Mbps), B measures 250 Mbps through another server.
+		// That does not show B to be slower and so B is not switched back from, however often.
+		var landing = new SwitchLanding { FromName = "A", FromScore = 600, ToName = "B", Time = utcNow.AddSeconds(-20) };
+		foreach (var sample in new[] { limited, failed, limited })
+		{
+			Assert.AreEqual(LandingAction.None, SwitchPolicy.EvaluateLanding(landing, sample, utcNow));
+			Assert.AreEqual(0, landing.LowCount);
+			Assert.IsFalse(SwitchPolicy.IsLandingKept(landing, sample));
+		}
+
+		// The test is repeated if the first server only failed, not if it limits requests.
+		Assert.IsTrue(AppController.IsLandingUnchecked(failed));
+		Assert.IsFalse(AppController.IsLandingUnchecked(limited));
+		Assert.IsFalse(AppController.IsLandingUnchecked(direct));
+
+		// The same speed through the first server counts as before.
+		Assert.AreEqual(LandingAction.Retest, SwitchPolicy.EvaluateLanding(landing, direct, utcNow));
+		Assert.AreEqual(LandingAction.Revert, SwitchPolicy.EvaluateLanding(landing, direct, utcNow));
+
+		// A speed through another server which is high enough does show that B is good to keep.
+		landing = new SwitchLanding { FromName = "A", FromScore = 300, ToName = "B", Time = utcNow.AddSeconds(-20) };
+		Assert.AreEqual(LandingAction.Clear, SwitchPolicy.EvaluateLanding(landing, limited, utcNow));
+		Assert.IsTrue(SwitchPolicy.IsLandingKept(landing, limited));
+
+		// No internet is found before any server is asked and counts whatever the servers do.
+		landing = new SwitchLanding { FromName = "A", FromScore = 600, ToName = "B", Time = utcNow.AddSeconds(-20) };
+		Assert.AreEqual(LandingAction.Revert, SwitchPolicy.EvaluateLanding(landing, Create(utcNow, 0, 0, null, SpeedResult.NoInternet), utcNow));
+
+		// (2) The typical speed and latency of a network are of the first server as long as it
+		// has such samples: the newer ones through another server do not pull them down.
+		var samples = new List<SpeedSample>
+		{
+			Create(utcNow.AddHours(-5), 700, 12, null),
+			Create(utcNow.AddHours(-4), 680, 14, null),
+			Create(utcNow.AddHours(-3), 250, 110, Limited),
+			Create(utcNow.AddHours(-2), 240, 112, Limited),
+			Create(utcNow.AddHours(-1), 260, 108, Limited)
+		};
+
+		var summary = SpeedSummary.Create(samples, utcNow);
+		Assert.AreEqual(5, summary.Count);
+		Assert.AreEqual(680D, summary.DownMbps);
+		Assert.AreEqual(14D, summary.LatencyMs);
+		Assert.AreEqual(20D, summary.UpMbps);
+		Assert.AreEqual(260D, summary.LastDownMbps);
+
+		// A network which has nothing else is given what the other server measured.
+		summary = SpeedSummary.Create(samples.Skip(2).ToArray(), utcNow);
+		Assert.AreEqual(3, summary.Count);
+		Assert.AreEqual(250D, summary.DownMbps);
+		Assert.AreEqual(110D, summary.LatencyMs);
 	}
 
 	[TestMethod]

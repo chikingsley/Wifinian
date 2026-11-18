@@ -610,6 +610,10 @@ internal partial class AppController
 		if (!isFailed && SpeedTester.IsRoutineDetail(sample.Detail))
 			return null;
 
+		// So is a measurement which asked no server because each of them limits requests.
+		if (isFailed && SpeedTester.IsLimited(sample))
+			return null;
+
 		return $"Speed test of {sample.Profile} ({sample.Trigger}) ended as {sample.Result} after {sample.DurationMs} ms"
 			+ $" (latency {(sample.LatencyMs.HasValue ? sample.LatencyMs.Value.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + " ms" : "not measured")},"
 			+ $" {sample.DownBytes} bytes down, {sample.UpBytes} bytes up): "

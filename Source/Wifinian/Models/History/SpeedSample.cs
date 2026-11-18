@@ -96,6 +96,26 @@ internal class SpeedSample
 	/// </remarks>
 	public bool Valid => Result is SpeedResult.Ok or SpeedResult.NoInternet or SpeedResult.CaptivePortal;
 
+	/// <summary>
+	/// Beginning of the detail of a measurement whose download used a test server other than
+	/// the first one
+	/// </summary>
+	internal const string ServerNote = "Server: ";
+
+	/// <summary>
+	/// Whether download speed and latency were measured through a test server other than
+	/// the first one
+	/// </summary>
+	/// <remarks>
+	/// The other servers are single files, some of them far away. On a fast link such a server,
+	/// not the network, can be what limits the speed, and so the speed is a lower bound: it can
+	/// show that a network is fast enough but not that it is slower than one measured through
+	/// the first server. The server is told at the beginning of the detail, which is what
+	/// the database keeps.
+	/// </remarks>
+	public bool IsFallback => (Result is SpeedResult.Ok)
+		&& (Detail?.StartsWith(ServerNote, StringComparison.Ordinal) is true);
+
 	public string Key => HistoryService.GetKey(Profile, InterfaceId);
 
 	public string ToCsv() => CsvLine.Join(

@@ -42,6 +42,7 @@ internal sealed class SpeedTester
 	private const int ResolveTimeout = 5000; // ms
 	private const int ConnectCount = 5;
 	private const int ConnectTimeout = 2000; // ms
+	private const int ConnectGiveUpCount = 2;
 	private const int RequestTimeout = 10000; // ms
 	private const int StopTimeout = 2000; // ms
 	private const int SampleInterval = 100; // ms
@@ -320,10 +321,15 @@ internal sealed class SpeedTester
 
 	/// <summary>
 	/// Gets the URLs of test servers in the order in which they are used: the one set by the user
-	/// if it is not among the default ones, then the default ones.
+	/// if any, then the default ones.
 	/// </summary>
 	/// <param name="url">URL in the settings</param>
 	/// <param name="defaultUrls">Default URLs</param>
+	/// <remarks>
+	/// A server (host and port) is listed once, by the URL which comes first, so that the one set
+	/// by the user replaces the default one of the same server. Listed twice, a server which
+	/// fails would be asked again at once as if it were another one.
+	/// </remarks>
 	internal static IReadOnlyList<Uri> GetServerUris(string url, IReadOnlyList<string> defaultUrls)
 	{
 		var uris = new List<Uri>();
@@ -331,7 +337,7 @@ internal sealed class SpeedTester
 		foreach (var value in new[] { url }.Concat(defaultUrls ?? Array.Empty<string>()))
 		{
 			if (TryGetUri(value, out Uri uri)
-				&& !uris.Any(x => string.Equals(x.AbsoluteUri, uri.AbsoluteUri, StringComparison.OrdinalIgnoreCase)))
+				&& !uris.Any(x => string.Equals(ServerBlockList.GetKey(x), ServerBlockList.GetKey(uri), StringComparison.Ordinal)))
 			{
 				uris.Add(uri);
 			}
@@ -344,7 +350,21 @@ internal sealed class SpeedTester
 	/// <summary>
 	/// Beginning of the part of the detail which tells the server used when it is not the first
 	/// </summary>
-	internal const string ServerNote = "Server: ";
+	internal const string ServerNote = SpeedSample.ServerNote;
+
+	/// <summary>
+	/// Time (ms) from the start of the transfers after which no further server is asked
+	/// </summary>
+	/// <remarks>
+	/// A server which refuses, cannot be resolved or cannot be connected to is passed over within
+	/// a few seconds and the next one is asked. Where nothing answers at all (a network which
+	/// passes the connectivity check but stalls other traffic), each server would take its
+	/// timeouts in turn while the PC stays on that network, and so the measurement ends with
+	/// the servers asked by this time, as it did when there was only one server.
+	/// </remarks>
+	internal const int ServerSeekTime = 20000;
+
+	private const string LimitedNote = " limits requests until ";
 
 	/// <summary>
 	/// Beginning of the part of the detail which tells that upload was left out
@@ -370,6 +390,30 @@ internal sealed class SpeedTester
 	}
 
 	/// <summary>
+	/// Determines whether a measurement was shaped by servers known to limit requests and so
+	/// would come out the same if repeated before their times are over: no server was asked
+	/// because each of them limits requests, or another server was used because those before it do.
+	/// </summary>
+	internal static bool IsLimited(SpeedSample sample)
+	{
+		if (string.IsNullOrWhiteSpace(sample?.Detail))
+			return false;
+
+		var parts = sample.Detail.Split(new[] { "; " }, StringSplitOptions.RemoveEmptyEntries);
+
+		return sample.Result switch
+		{
+			SpeedResult.EndpointFailed => parts.All(x => IsLimitPart(x)),
+			SpeedResult.Ok => sample.IsFallback && IsLimitPart(parts[0]),
+			_ => false
+		};
+
+		static bool IsLimitPart(string part) =>
+			(part.IndexOf(LimitedNote, StringComparison.Ordinal) >= 0)
+			&& (part.IndexOf(FailedNote, StringComparison.Ordinal) < 0);
+	}
+
+	/// <summary>
 	/// Measures latency, download speed and upload speed through the test servers and sets
 	/// the result.
 	/// </summary>
@@ -386,7 +430,10 @@ internal sealed class SpeedTester
 	/// <param name="retryDelay">Time (ms) to wait before the second attempt of download</param>
 	/// <param name="blocks">Test servers which limited requests (null not to remember them)</param>
 	/// <param name="token">Cancellation token</param>
+	/// <param name="seekTime">Time (ms) from the start after which no further server is asked</param>
 	/// <remarks>
+	/// <para>A limit of a server is remembered for the network of the sample (its profile),
+	/// because it is of the public address the requests came from.</para>
 	/// <para>A server which is known to limit requests is not asked. A server which cannot be
 	/// reached, gives no byte or gives no rate is passed over and the next one is used within
 	/// the same measurement. The detail tells the server used when it is not the first, because
@@ -409,8 +456,12 @@ internal sealed class SpeedTester
 		long capBytes,
 		int retryDelay,
 		ServerBlockList blocks,
-		CancellationToken token)
+		CancellationToken token,
+		int seekTime = ServerSeekTime)
 	{
+		var network = sample.Profile;
+		var seekStopwatch = Stopwatch.StartNew();
+
 		// (4) Latency and (5) Download
 		var oldBytes = getBytes?.Invoke() ?? default;
 		var oldReceived = (getBytes is not null) ? GetReceivedBytes() : null;
@@ -422,6 +473,7 @@ internal sealed class SpeedTester
 		long downBytes = 0L;
 		bool isFirst = true;
 		bool isRetried = true;
+		bool isAsked = false;
 
 		foreach (var uri in downloadUris)
 		{
@@ -429,13 +481,21 @@ internal sealed class SpeedTester
 
 			var server = ServerBlockList.GetKey(uri);
 
-			var until = blocks?.GetBlockedUntil(uri);
+			var until = blocks?.GetBlockedUntil(uri, network);
 			if (until.HasValue)
 			{
-				passed.Add($"{server} limits requests until {ServerBlockList.FormatTime(until.Value)}");
+				passed.Add($"{server}{LimitedNote}{ServerBlockList.FormatTime(until.Value)}");
 				isFirst = false;
 				continue;
 			}
+
+			// The first server asked is always asked. Another one is not once the time is up.
+			if (isAsked && (seekStopwatch.ElapsedMilliseconds >= seekTime))
+			{
+				passed.Add($"{server} was not asked: the servers before it took {seekStopwatch.ElapsedMilliseconds / 1000D:0} s");
+				break;
+			}
+			isAsked = true;
 
 			var remoteAddress = await ResolveAsync(uri.Host, token).ConfigureAwait(false);
 			if (remoteAddress is null)
@@ -478,7 +538,7 @@ internal sealed class SpeedTester
 			sample.DownBytes = downBytes;
 
 			if (limit is not null)
-				blocks?.Block(uri, limit);
+				blocks?.Block(uri, limit, network);
 
 			if (mbps.HasValue && (bytes > 0L))
 			{
@@ -526,13 +586,13 @@ internal sealed class SpeedTester
 
 		foreach (var uri in uploadUris)
 		{
-			var until = blocks?.GetBlockedUntil(uri);
+			var until = blocks?.GetBlockedUntil(uri, network);
 			if (!until.HasValue)
 			{
 				uploadUri = uri;
 				break;
 			}
-			blocked.Add($"{ServerBlockList.GetKey(uri)} limits requests until {ServerBlockList.FormatTime(until.Value)}");
+			blocked.Add($"{ServerBlockList.GetKey(uri)}{LimitedNote}{ServerBlockList.FormatTime(until.Value)}");
 		}
 
 		if (uploadUri is null)
@@ -576,7 +636,7 @@ internal sealed class SpeedTester
 				sample.UpBytes = uploadCounter.Value;
 
 				if (uploadLimit.Value is not null)
-					blocks?.Block(uploadUri, uploadLimit.Value);
+					blocks?.Block(uploadUri, uploadLimit.Value, network);
 			}
 
 			// The upload is bound to the address of the interface. This check is for the case
@@ -735,6 +795,10 @@ internal sealed class SpeedTester
 	/// <summary>
 	/// Measures the times (ms) of TCP connection to a remote end point from a local address.
 	/// </summary>
+	/// <remarks>
+	/// If the first two connections fail, the rest are not tried: a server which cannot be
+	/// connected to would otherwise take the timeout of each of them.
+	/// </remarks>
 	private static async Task<List<double>> ConnectAsync(IPAddress localAddress, IPEndPoint remoteEndPoint, CancellationToken token)
 	{
 		var times = new List<double>();
@@ -742,6 +806,9 @@ internal sealed class SpeedTester
 		for (int i = 0; i < ConnectCount; i++)
 		{
 			token.ThrowIfCancellationRequested();
+
+			if ((i >= ConnectGiveUpCount) && (times.Count == 0))
+				break;
 
 			try
 			{

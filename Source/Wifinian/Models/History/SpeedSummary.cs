@@ -127,9 +127,17 @@ internal class SpeedSummary
 		summary.Count = oks.Length;
 		if (oks.Length > 0)
 		{
-			summary.DownMbps = GetWeightedMedian(oks.Select(x => (x.sample.DownMbps, x.weight)));
+			// Download speed and latency measured through a server other than the first one are
+			// not the same quantities as those measured through it (the server can be slower
+			// than the link and is farther away). They are used only for a network which has
+			// nothing else, so that networks are compared by figures of the same server.
+			var rated = oks.Where(x => !x.sample.IsFallback).ToArray();
+			if (rated.Length == 0)
+				rated = oks;
+
+			summary.DownMbps = GetWeightedMedian(rated.Select(x => (x.sample.DownMbps, x.weight)));
 			summary.UpMbps = GetWeightedMedian(oks.Select(x => (x.sample.UpMbps, x.weight)));
-			summary.LatencyMs = GetWeightedMedian(oks.Select(x => (x.sample.LatencyMs, x.weight)));
+			summary.LatencyMs = GetWeightedMedian(rated.Select(x => (x.sample.LatencyMs, x.weight)));
 
 			var totalWeight = oks.Sum(x => x.weight);
 			summary.MeanSignal = (totalWeight > 0D)
