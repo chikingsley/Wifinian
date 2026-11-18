@@ -348,6 +348,17 @@ public class Settings : DisposableBase
 	}
 	private int _probeInterval = 6; // Default
 
+	/// <summary>
+	/// Whether to look for a new version of this application automatically
+	/// </summary>
+	/// <remarks>A new version found is only told. It is installed only when chosen in the menu.</remarks>
+	public bool ChecksUpdates
+	{
+		get => _checksUpdates;
+		set => SetProperty(ref _checksUpdates, value);
+	}
+	private bool _checksUpdates = true; // Default
+
 	#endregion
 
 	internal void Initiate()

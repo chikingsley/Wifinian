@@ -127,6 +127,14 @@
 					Command="{Binding ProbeCommand, Mode=OneTime}"/>
 		</ContentControl>
 
+		<ContentControl Style="{StaticResource MenuItemStyle}">
+			<Button Padding="8,4"
+					Style="{StaticResource MenuButtonItemStyle}"
+					FontSize="13"
+					Content="{Binding UpgradeText.Value, Mode=OneWay}"
+					Command="{Binding UpgradeCommand, Mode=OneTime}"/>
+		</ContentControl>
+
 		<Separator Style="{StaticResource MenuSeparatorStyle}"/>
 
 		<!-- Close -->

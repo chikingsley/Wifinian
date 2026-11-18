@@ -1,14 +1,30 @@
 ﻿<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
-  <Package Name="Wifinian" Manufacturer="emoacht" Version="3.8.0"
-           Language="1033" Codepage="1252" UpgradeCode="{A8357D71-600C-462A-AEEE-BF1B988DD2E4}">
+  <!-- This fork is installed for the current user only, without elevation, so that the application
+       can install its own updates. It has its own UpgradeCode because a per-user package cannot
+       upgrade the per-machine package of the original. -->
+  <Package Name="Wifinian" Manufacturer="chikingsley (fork of emoacht)" Version="3.9.0"
+           Language="1033" Codepage="1252" Scope="perUser"
+           UpgradeCode="{B3236D41-48D3-4642-9EBC-18E30BB7F56B}">
     <SummaryInformation Description="Installer for Wifinian"/>
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed."/>
+    <!-- The installed version is removed first so that every file is replaced whatever its file
+         version is. A package of the same version replaces the installed one as well.
+         It is removed within the transaction of this installation (after InstallInitialize), so
+         that the installed version is put back if this installation fails. -->
+    <MajorUpgrade Schedule="afterInstallInitialize" AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed."/>
 
     <Media Id="1" Cabinet="source.cab" EmbedCab="yes"/>
 
     <Property Id="VEM" Value="yes"/>
+
+    <!-- The folder chosen in the wizard is remembered so that an upgrade without the wizard
+         (/passive) installs to the same folder. -->
+    <Property Id="INSTALLDIR">
+      <RegistrySearch Id="RememberedInstallDir" Root="HKCU" Key="Software\[ProductName]\Install"
+                      Name="InstallDir" Type="raw"/>
+    </Property>
 
     <!-- UI -->
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLDIR"/>
@@ -25,190 +41,121 @@
     <WixVariable Id="WixUIBannerBmp" Value="Resources\banner.png"/>
     <WixVariable Id="WixUIDialogBmp" Value="Resources\dialog.png"/>
 
-    <!-- Program Files -->
-    <StandardDirectory Id="ProgramFilesFolder">
-      <Directory Id="INSTALLDIR" Name="$(var.Wifinian.ProjectName)"/>
+    <!-- Programs in Local AppData (per user) -->
+    <!-- This is not the working folder of the application (Wifinian in Local AppData) which holds
+         the settings, the logs and the database of history. The installer never touches that folder. -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLDIR" Name="$(var.Wifinian.ProjectName)"/>
+      </Directory>
     </StandardDirectory>
 
     <!-- Program Menu -->
     <StandardDirectory Id="ProgramMenuFolder"/>
 
-    <!-- Local AppData -->
-    <StandardDirectory Id="LocalAppDataFolder">
-      <Directory Id="ApplicationLocalAppDataFolder" Name="$(var.Wifinian.ProjectName)"/>
-    </StandardDirectory>    
-
+    <!-- A component in the user profile must have a registry value of HKCU as its key path and
+         must remove its folders by itself. The files are therefore grouped by folder. The Ids of
+         RemoveFolder are numbered from the deepest folder. -->
     <DirectoryRef Id="INSTALLDIR">
-      <Component Id="MainExecutable" Guid="{55649EB0-5DB2-4466-A042-969BF97139B0}">
+      <Component Id="MainExecutable" Guid="{0A49DB0E-4F80-4602-B582-33E6E05DFD3B}">
         <File Id="MainExecutable"
-              Source="$(var.Wifinian.TargetPath)" Name="$(var.Wifinian.TargetFileName)" KeyPath="yes"/>
-      </Component>
-
-      <Component Id="MainExecutableConfig" Guid="{BFF1C1AF-F676-4DA8-A126-3341FAFF7F62}">
+              Source="$(var.Wifinian.TargetPath)" Name="$(var.Wifinian.TargetFileName)"/>
         <File Id="MainExecutableConfig"
-              Source="$(var.Wifinian.TargetDir)" Name="$(var.Wifinian.TargetFileName).config" KeyPath="yes"/>
+              Source="$(var.Wifinian.TargetDir)" Name="$(var.Wifinian.TargetFileName).config"/>
+
+        <File Id="BehaviorsLibrary" Source="$(var.Wifinian.TargetDir)" Name="Microsoft.Xaml.Behaviors.dll"/>
+
+        <File Id="RpLibrary" Source="$(var.Wifinian.TargetDir)" Name="ReactiveProperty.dll"/>
+        <File Id="RpCoreLibrary" Source="$(var.Wifinian.TargetDir)" Name="ReactiveProperty.Core.dll"/>
+
+        <File Id="RxLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.Reactive.dll"/>
+        <File Id="RxCoreLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.Reactive.Core.dll"/>
+        <File Id="RxInterfacesLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.Reactive.Interfaces.dll"/>
+        <File Id="RxLinqLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.Reactive.Linq.dll"/>
+        <File Id="RxPlatformServicesLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.Reactive.PlatformServices.dll"/>
+        <File Id="RxWindowsThreadingLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.Reactive.Windows.Threading.dll"/>
+
+        <File Id="ComponentModelAnnotationsLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.ComponentModel.Annotations.dll"/>
+        <File Id="RuntimeCompilerServicesUnsafeLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.Runtime.CompilerServices.Unsafe.dll"/>
+        <File Id="ThreadingTasksExtensionsLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.Threading.Tasks.Extensions.dll"/>
+        <File Id="ValueTupleLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.ValueTuple.dll"/>
+
+        <File Id="BuffersLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.Buffers.dll"/>
+        <File Id="MemoryLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.Memory.dll"/>
+        <File Id="NumericsVectorsLibrary" Source="$(var.Wifinian.TargetDir)" Name="System.Numerics.Vectors.dll"/>
+
+        <!-- SQLite (history database) -->
+        <File Id="SqliteLibrary" Source="$(var.Wifinian.TargetDir)" Name="Microsoft.Data.Sqlite.dll"/>
+        <File Id="SqliteRawCoreLibrary" Source="$(var.Wifinian.TargetDir)" Name="SQLitePCLRaw.core.dll"/>
+        <File Id="SqliteRawBatteriesLibrary" Source="$(var.Wifinian.TargetDir)" Name="SQLitePCLRaw.batteries_v2.dll"/>
+        <File Id="SqliteRawProviderLibrary" Source="$(var.Wifinian.TargetDir)" Name="SQLitePCLRaw.provider.dynamic_cdecl.dll"/>
+
+        <File Id="WifiLibrary" Source="$(var.Wifinian.TargetDir)" Name="ManagedNativeWifi.dll"/>
+        <File Id="FrameLibrary" Source="$(var.Wifinian.TargetDir)" Name="ScreenFrame.dll"/>
+        <File Id="AgencyLibrary" Source="$(var.Wifinian.TargetDir)" Name="StartupAgency.dll"/>
+
+        <!-- Shortcut in Program Menu -->
+        <Shortcut Id="ApplicationProgramMenuShortcut" Name="$(var.Wifinian.ProjectName)"
+                  Directory="ProgramMenuFolder"
+                  Target="[#MainExecutable]" WorkingDirectory="INSTALLDIR"
+                  Icon="AppIcon.exe" IconIndex="0">
+          <ShortcutProperty Key="System.AppUserModel.ID" Value="[ProductName]"/>
+        </Shortcut>
+
+        <RemoveFolder Id="Remove3RuntimesFolder" Directory="RuntimesFolder" On="uninstall"/>
+        <RemoveFolder Id="Remove4InstallFolder" Directory="INSTALLDIR" On="uninstall"/>
+        <RemoveFolder Id="Remove5ProgramsFolder" Directory="ProgramsFolder" On="uninstall"/>
+        <RegistryValue Root="HKCU" Key="Software\[ProductName]\Install"
+                       Name="InstallDir" Type="string" Value="[INSTALLDIR]" KeyPath="yes"/>
       </Component>
 
-      <Component Id="BehaviorsLibrary" Guid="{1E37729C-6161-453D-81BC-1BE333FCA178}">
-        <File Id="BehaviorsLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="Microsoft.Xaml.Behaviors.dll" KeyPath="yes"/>
-      </Component>
-
-      <Component Id="RpLibrary" Guid="{15E45C59-C490-40F9-BA1B-C36E6932132F}">
-        <File Id="RpLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="ReactiveProperty.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="RpCoreLibrary" Guid="{4EBEE85A-C063-43BF-B3C8-CE68787D5F63}">
-        <File Id="RpCoreLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="ReactiveProperty.Core.dll" KeyPath="yes"/>
-      </Component>
-
-      <Component Id="RxLibrary" Guid="{D47B9C0B-A1C4-40D8-8932-22C863EB5DC2}">
-        <File Id="RxLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.Reactive.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="RxCoreLibrary" Guid="{11FE0FBB-888D-407A-93E5-F881B293326E}">
-        <File Id="RxCoreLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.Reactive.Core.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="RxInterfacesLibrary" Guid="{85EA74C1-1DE3-47D0-84DB-CB8475174BFD}">
-        <File Id="RxInterfacesLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.Reactive.Interfaces.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="RxLinqLibrary" Guid="{0392631C-7877-47E4-AB9D-DB6D6F0D79B5}">
-        <File Id="RxLinqLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.Reactive.Linq.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="RxPlatformServicesLibrary" Guid="{ED468260-8D34-4D9F-B18A-1A717E0587A5}">
-        <File Id="RxPlatformServicesLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.Reactive.PlatformServices.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="RxWindowsThreadingLibrary" Guid="{E4E4D6AA-FA11-41C7-BD7A-B0E875CCD32A}">
-        <File Id="RxWindowsThreadingLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.Reactive.Windows.Threading.dll" KeyPath="yes"/>
-      </Component>
-
-      <Component Id="ComponentModelAnnotationsLibrary" Guid="{D59C7605-C145-4B19-8C71-B7C44551921A}">
-        <File Id="ComponentModelAnnotationsLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.ComponentModel.Annotations.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="RuntimeCompilerServicesUnsafeLibrary" Guid="{9CE63FE8-F5A0-47F8-BC31-015EF594BA91}">
-        <File Id="RuntimeCompilerServicesUnsafeLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.Runtime.CompilerServices.Unsafe.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="ThreadingTasksExtensionsLibrary" Guid="{1DFEF52D-BD86-4B0F-8AC7-2B3191C7A4EF}">
-        <File Id="ThreadingTasksExtensionsLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.Threading.Tasks.Extensions.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="ValueTupleLibrary" Guid="{BD6EC270-54BB-4231-BB01-D1E08398B5AB}">
-        <File Id="ValueTupleLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.ValueTuple.dll" KeyPath="yes"/>
-      </Component>
-
-      <Component Id="BuffersLibrary" Guid="{F5CA87A2-8D6C-4557-8A87-66B6B25ED674}">
-        <File Id="BuffersLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.Buffers.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="MemoryLibrary" Guid="{FA924C8F-9F9D-48DD-B5D3-557B169A27E0}">
-        <File Id="MemoryLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.Memory.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="NumericsVectorsLibrary" Guid="{A68341F1-1CBB-4F75-B675-01F64A9CE0C1}">
-        <File Id="NumericsVectorsLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="System.Numerics.Vectors.dll" KeyPath="yes"/>
-      </Component>
-
-      <!-- SQLite (history database) -->
-      <Component Id="SqliteLibrary" Guid="{78FBE771-7313-4D51-B3DF-38E2DC26FB92}">
-        <File Id="SqliteLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="Microsoft.Data.Sqlite.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="SqliteRawCoreLibrary" Guid="{C22D9EE9-9660-40C4-8AA1-48AE05A178B6}">
-        <File Id="SqliteRawCoreLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="SQLitePCLRaw.core.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="SqliteRawBatteriesLibrary" Guid="{D3B8C148-46CB-4B6A-959F-51918A1A57B1}">
-        <File Id="SqliteRawBatteriesLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="SQLitePCLRaw.batteries_v2.dll" KeyPath="yes"/>
-      </Component>
-      <Component Id="SqliteRawProviderLibrary" Guid="{20D74DCE-B72B-4AAD-87B8-CD0C6E690C77}">
-        <File Id="SqliteRawProviderLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="SQLitePCLRaw.provider.dynamic_cdecl.dll" KeyPath="yes"/>
+      <Component Id="VisualManifest" Guid="{129322FE-BD33-41A2-A55A-931AF5814FA5}"
+                 Condition="VEM = &quot;yes&quot;">
+        <File Id="VisualManifest"
+              Source="$(var.Wifinian.TargetDir)" Name="$(var.Wifinian.TargetName).VisualElementsManifest.xml"/>
+        <RegistryValue Root="HKCU" Key="Software\[ProductName]\Install"
+                       Name="VisualManifest" Type="integer" Value="1" KeyPath="yes"/>
       </Component>
 
       <!-- Native libraries of SQLite, found by the architecture of the process -->
       <Directory Id="RuntimesFolder" Name="runtimes">
         <Directory Id="RuntimesX86Folder" Name="win-x86">
           <Directory Id="RuntimesX86NativeFolder" Name="native">
-            <Component Id="SqliteNativeX86Library" Guid="{8A5CBE3D-29DC-4F07-8D62-3DF78A7838D6}">
+            <Component Id="SqliteNativeX86Library" Guid="{0AAB095C-EA95-4DE4-B5BE-F9AEB2663751}">
               <File Id="SqliteNativeX86Library"
-                    Source="$(var.Wifinian.TargetDir)runtimes\win-x86\native\" Name="e_sqlite3.dll" DefaultLanguage="0" KeyPath="yes"/>
+                    Source="$(var.Wifinian.TargetDir)runtimes\win-x86\native\" Name="e_sqlite3.dll" DefaultLanguage="0"/>
+              <RemoveFolder Id="Remove1RuntimesX86NativeFolder" Directory="RuntimesX86NativeFolder" On="uninstall"/>
+              <RemoveFolder Id="Remove2RuntimesX86Folder" Directory="RuntimesX86Folder" On="uninstall"/>
+              <RegistryValue Root="HKCU" Key="Software\[ProductName]\Install"
+                             Name="SqliteNativeX86Library" Type="integer" Value="1" KeyPath="yes"/>
             </Component>
           </Directory>
         </Directory>
         <Directory Id="RuntimesX64Folder" Name="win-x64">
           <Directory Id="RuntimesX64NativeFolder" Name="native">
-            <Component Id="SqliteNativeX64Library" Guid="{996A2424-DBDA-4BA8-86D7-9F25D6863F7B}">
+            <Component Id="SqliteNativeX64Library" Guid="{80F0812C-E4CF-441A-856C-D79454657197}">
               <File Id="SqliteNativeX64Library"
-                    Source="$(var.Wifinian.TargetDir)runtimes\win-x64\native\" Name="e_sqlite3.dll" DefaultLanguage="0" KeyPath="yes"/>
+                    Source="$(var.Wifinian.TargetDir)runtimes\win-x64\native\" Name="e_sqlite3.dll" DefaultLanguage="0"/>
+              <RemoveFolder Id="Remove1RuntimesX64NativeFolder" Directory="RuntimesX64NativeFolder" On="uninstall"/>
+              <RemoveFolder Id="Remove2RuntimesX64Folder" Directory="RuntimesX64Folder" On="uninstall"/>
+              <RegistryValue Root="HKCU" Key="Software\[ProductName]\Install"
+                             Name="SqliteNativeX64Library" Type="integer" Value="1" KeyPath="yes"/>
             </Component>
           </Directory>
         </Directory>
         <Directory Id="RuntimesArm64Folder" Name="win-arm64">
           <Directory Id="RuntimesArm64NativeFolder" Name="native">
-            <Component Id="SqliteNativeArm64Library" Guid="{33BE9E49-4D42-4D1F-95AE-4C9AD6484169}">
+            <Component Id="SqliteNativeArm64Library" Guid="{EBA4E269-B100-4060-AA49-0418968C49C3}">
               <File Id="SqliteNativeArm64Library"
-                    Source="$(var.Wifinian.TargetDir)runtimes\win-arm64\native\" Name="e_sqlite3.dll" DefaultLanguage="0" KeyPath="yes"/>
+                    Source="$(var.Wifinian.TargetDir)runtimes\win-arm64\native\" Name="e_sqlite3.dll" DefaultLanguage="0"/>
+              <RemoveFolder Id="Remove1RuntimesArm64NativeFolder" Directory="RuntimesArm64NativeFolder" On="uninstall"/>
+              <RemoveFolder Id="Remove2RuntimesArm64Folder" Directory="RuntimesArm64Folder" On="uninstall"/>
+              <RegistryValue Root="HKCU" Key="Software\[ProductName]\Install"
+                             Name="SqliteNativeArm64Library" Type="integer" Value="1" KeyPath="yes"/>
             </Component>
           </Directory>
         </Directory>
       </Directory>
-
-      <Component Id="WifiLibrary" Guid="{50B8A962-E276-4DF8-8737-A1BE78B33153}">
-        <File Id="WifiLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="ManagedNativeWifi.dll" KeyPath="yes"/>
-      </Component>
-
-      <Component Id="FrameLibrary" Guid="{E7F84162-087A-4A1F-BB6A-01FE78A29C8E}">
-        <File Id="FrameLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="ScreenFrame.dll" KeyPath="yes"/>
-      </Component>
-
-      <Component Id="AgencyLibrary" Guid="{8F507D9C-979F-4293-AC03-9603D7781F10}">
-        <File Id="AgencyLibrary"
-              Source="$(var.Wifinian.TargetDir)" Name="StartupAgency.dll" KeyPath="yes"/>
-      </Component>
-
-      <Component Id="VisualManifest" Guid="{4DD773D0-D642-40DC-9576-D535D0AF89EB}"
-                 Condition="VEM = &quot;yes&quot;">        
-        <File Id="VisualManifest"
-              Source="$(var.Wifinian.TargetDir)" Name="$(var.Wifinian.TargetName).VisualElementsManifest.xml" KeyPath="yes"/>
-      </Component>
-    </DirectoryRef>
-
-    <!-- Shortcut in Program Menu -->
-    <StandardDirectory Id="ProgramMenuFolder">
-      <Component Id="ApplicationShortcut" Guid="{CA94F3D2-1BB8-4581-9B37-BA3C31049DC4}">
-        <Shortcut Id="ApplicationProgramMenuShortcut" Name="$(var.Wifinian.ProjectName)"
-                  Target="[#MainExecutable]" WorkingDirectory="INSTALLDIR"
-                  Icon="AppIcon.exe" IconIndex="0">
-          <ShortcutProperty Key="System.AppUserModel.ID" Value="[ProductName]"/>
-        </Shortcut>
-        <RegistryValue Root="HKCU" Key="Software\[ProductName]"
-                       Name="ApplicationShortcut" Type="integer" Value="1" KeyPath="yes"/>
-      </Component>
-    </StandardDirectory>
-
-    <!-- Working Folder in Local AppData -->
-    <!-- RemoveFile removes the files of this folder only, when uninstalled or upgraded. The database
-         of history is in "data" subfolder so as to be left, which leaves this folder as well. -->
-    <DirectoryRef Id="ApplicationLocalAppDataFolder">
-      <Component Id="ApplicationWorkingFolder" Guid="{64995AFD-6A46-47D7-8FFE-67C6376F0FF5}">
-        <RemoveFile Id="ApplicationLocalAppDataFiles" Directory="ApplicationLocalAppDataFolder" Name="*.*" On="uninstall"/>
-        <RemoveFolder Id="ApplicationLocalAppDataFolder" On="uninstall"/>
-        <RegistryValue Root="HKCU" Key="Software\[ProductName]"
-                       Name="ApplicationWorkingFolder" Type="integer" Value="1" KeyPath="yes"/>
-      </Component>
     </DirectoryRef>
 
     <Icon Id="AppIcon.exe" SourceFile="$(var.Wifinian.TargetPath)"/>
@@ -216,39 +163,15 @@
 
     <Feature Id="ProductFeature" Level="1">
       <ComponentRef Id="MainExecutable"/>
-      <ComponentRef Id="MainExecutableConfig"/>
-      <ComponentRef Id="BehaviorsLibrary"/>
-      <ComponentRef Id="RpLibrary"/>
-      <ComponentRef Id="RpCoreLibrary"/>
-      <ComponentRef Id="RxLibrary"/>
-      <ComponentRef Id="RxCoreLibrary"/>
-      <ComponentRef Id="RxInterfacesLibrary"/>
-      <ComponentRef Id="RxLinqLibrary"/>
-      <ComponentRef Id="RxPlatformServicesLibrary"/>
-      <ComponentRef Id="RxWindowsThreadingLibrary"/>
-      <ComponentRef Id="ComponentModelAnnotationsLibrary"/>
-      <ComponentRef Id="RuntimeCompilerServicesUnsafeLibrary"/>
-      <ComponentRef Id="ThreadingTasksExtensionsLibrary"/>
-      <ComponentRef Id="ValueTupleLibrary"/>
-      <ComponentRef Id="BuffersLibrary"/>
-      <ComponentRef Id="MemoryLibrary"/>
-      <ComponentRef Id="NumericsVectorsLibrary"/>
-      <ComponentRef Id="SqliteLibrary"/>
-      <ComponentRef Id="SqliteRawCoreLibrary"/>
-      <ComponentRef Id="SqliteRawBatteriesLibrary"/>
-      <ComponentRef Id="SqliteRawProviderLibrary"/>
+      <ComponentRef Id="VisualManifest"/>
       <ComponentRef Id="SqliteNativeX86Library"/>
       <ComponentRef Id="SqliteNativeX64Library"/>
       <ComponentRef Id="SqliteNativeArm64Library"/>
-      <ComponentRef Id="WifiLibrary"/>
-      <ComponentRef Id="FrameLibrary"/>
-      <ComponentRef Id="AgencyLibrary"/>
-      <ComponentRef Id="VisualManifest"/>
-      <ComponentRef Id="ApplicationShortcut"/>
-      <ComponentRef Id="ApplicationWorkingFolder"/>
     </Feature>
 
     <!-- Clean Current User Run -->
+    <!-- This is run when uninstalled but not when upgraded, so that the registration to start on
+         sign in survives an update. -->
     <CustomAction Id="CleanCurrentUserRun" Directory="TARGETDIR" Execute="immediate" Return="ignore"
                   ExeCommand="[SystemFolder]reg.exe delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v [ProductName] /f"/>
     <InstallExecuteSequence>

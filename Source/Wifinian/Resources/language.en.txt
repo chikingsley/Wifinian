@@ -29,6 +29,12 @@ TestSpeed=Test speed now
 TestAll=Test all networks
 CancelTest=Cancel test
 TestAllNote=Wi-Fi drops for about 30 seconds per network
+UpdateCheck=Check for updates
+UpdateChecking=Checking...
+UpdateLatest=Up to date ({0})
+UpdateInstall=Install {0} and restart
+UpdateDownloading=Downloading {0}...
+UpdateFailed=Update failed: {0}
 Close=Close
 
 [Message]

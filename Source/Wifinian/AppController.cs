@@ -204,6 +204,7 @@ internal partial class AppController : DisposableBase
 		#endregion
 
 		InitiateMeasure();
+		InitiateUpgrade();
 	}
 
 	public async Task InitiateAsync()
@@ -266,6 +267,7 @@ internal partial class AppController : DisposableBase
 			CloseProbe();
 			CancelProbe(true);
 			CancelMeasure();
+			CancelUpgrade();
 			_worker?.Dispose();
 			NotifyIconContainer.Dispose();
 			WindowPainter.Dispose();

@@ -121,6 +121,20 @@ These servers are free and public, and they throttle heavy use. Cloudflare limit
  * A test in which the servers failed is never taken as a finding on the network, because internet access was confirmed just before: it does not count in the typical speed, never marks a network as without internet, never causes a switch back, and the check after an automatic switch is simply repeated a minute later. The exception is a test shaped by servers known to limit requests (none could be asked, or another server was used because of it): repeating it would give the same until their times are over, so it is not repeated, the switch stays unchecked, and a test in which no server could be asked gets no line in `operation.log`.
  * A further server is asked only within 20 seconds of the start of the transfers, and a server that does not accept the first two connections is given up at once. On a network that passes the connectivity check but lets nothing else through, a test therefore ends about as soon as it did with a single server instead of waiting for the timeouts of all three.
 
+### Updates
+
+About 2 minutes after start and then once a day, the app asks `github.com` whether a newer version of this fork has been released (`https://github.com/chikingsley/Wifinian/releases/latest/download/latest.json`). Nothing is sent but the request itself (the address of this PC, as with any request, and the name `Wifinian-Updater`): no identifier, no version, no data on networks. The check is not made during a speed test or a test of networks; if it fails (e.g. no internet access) it is tried again an hour later and the failure is written to `operation.log` once a day at most. To turn the automatic check off, close the app and set `ChecksUpdates` to `false` in `settings.xml` (see below); the menu still checks when asked.
+
+The automatic check only tells: the item __Check for updates__ of the menu then reads __Install 3.9.1 and restart__ and a line is written to `operation.log`. Nothing is downloaded or installed until that item is chosen. Then the installer (.msi) is downloaded to `%LOCALAPPDATA%\Wifinian\update` and is used only if all of these hold; otherwise the item reads __Update failed:__ with the reason, `operation.log` has the details and nothing is installed:
+
+ * the version is newer than the running one,
+ * the installer is a release asset of this fork (`https://github.com/chikingsley/Wifinian/releases/download/...`),
+ * its SHA-256 is the one given by the release,
+ * its signature (RSA 3072, SHA-256) is valid for the public key built into the app. The private key is kept by the publisher and is not in the repository, so a file from anyone else is refused,
+ * the version written in the installer itself is the one the release names. The signature covers the installer, not the version the release names, so without this an installer of an older release could be offered again under a higher version.
+
+The app then closes in the way __Close__ does (a running test of networks restores the connection first; the reason in `operation.log` is "Closing to install update ..."), the installer runs showing only its progress, and the app is started again from the installed folder (if the installer failed, it puts the previous version back and that one is started). An app that was run from another folder, such as a copy or the output of a build, is thus replaced by the installed one; that copy stays as it is. The next start records the exit code of the installer in `operation.log`.
+
 ### Logs
 
 `operation.log` in `%LOCALAPPDATA%\Wifinian` records every start and every orderly shutdown of this app with its reason (Close in the menu, the main window closed, the Windows session ending) and a second instance that was started and ended at once. A process killed from outside (Task Manager, `taskkill`) cannot write anything, so the next start records that the previous run left no record of its end. Unhandled exceptions are always written to `exception.log` in the same folder before the process ends.
@@ -142,6 +156,7 @@ These values are only in `%LOCALAPPDATA%\Wifinian\settings.xml`. Close the app b
 |SpeedSignalThreshold|30|20-50|Signal (%) below which a tested network is left; a tested network is switched to only at 10 points above this|
 |SwitchMaxDeferral|15|0-120|Minutes to wait for a pause in traffic before switching anyway (0 for no wait)|
 |ProbeInterval|6|1-48|Hours between tests of other networks when idle|
+|ChecksUpdates|true|true, false|Whether to ask github.com once a day for a new version of this fork (see Updates)|
 |ConnectivityCheckUrl|`http://www.msftconnecttest.com/connecttest.txt`| |Must return the text "Microsoft Connect Test"|
 |SpeedTestDownloadUrl|`https://speed.cloudflare.com/__down?bytes=25000000`| |Any large file over HTTP(S); used first, the built-in servers follow|
 |SpeedTestUploadUrl|`https://speed.cloudflare.com/__up`| |Must accept HTTP POST; used first, the built-in server follows if this one is blocked|
@@ -157,6 +172,25 @@ dotnet build Source\Wifinian.slnf -c Release
 dotnet test Source\Wifinian.slnf -c Release --no-build
 Source\Wifinian\bin\Release\Wifinian.exe
 ```
+
+### Publishing an update
+
+A release which the installed apps pick up (see Updates) is made by one script, from a clean `master`:
+
+```
+powershell -ExecutionPolicy Bypass -File tools\publish.ps1 -Version 3.9.1 -Notes "what changed"
+```
+
+It needs the private key at `%USERPROFILE%\.wifinian\update-private-key.xml` (never in the repository; without it no update can be made which the apps accept, so keep a copy in a safe place) and git signed in to `github.com` (the token is taken from `git credential fill` when needed and is not written anywhere). In order, stopping at the first failure:
+
+ 1. Checks: branch `master`, nothing uncommitted, the version is of three numbers and newer than the current one, the private key is there. The current version is accepted as long as it has no tag yet (the first release), or if its tag is on the current commit (a publishing which was interrupted is taken up again).
+ 2. Sets the version in `Source\Wifinian\Properties\AssemblyInfo.cs`, `Source\Wifinian.Test\Properties\AssemblyInfo.cs` and `Source\Installer\Product.wxs`, builds Debug, runs the tests (`-SkipTests` leaves them out), builds Release and the installer.
+ 3. Computes SHA-256 of the installer, signs it, checks the signature against the public key in `UpdateVerifier.cs` in the way the app does, and writes `latest.json` next to the installer (`Source\Installer\bin\x86\Release`).
+ 4. Copies the installer to `%USERPROFILE%\Documents\Wifinian.Installer.msi`.
+ 5. Commits the version ("Release 3.9.1"), tags `v3.9.1`, pushes `master` and the tag, creates the release on GitHub with `Wifinian.Installer.msi` and `latest.json` and makes it the latest. The release is a draft until both files are there. If the release exists already, its two files are replaced.
+ 6. Tells the addresses of the release and of the two files.
+
+With `-DryRun` the script ends after step 4 and puts the version in the working tree back: nothing is committed, tagged or pushed and GitHub is not contacted. The version is put back as well whenever a run fails before the commit.
 
 ## Requirements
 

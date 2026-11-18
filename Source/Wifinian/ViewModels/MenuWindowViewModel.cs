@@ -5,6 +5,7 @@ using Reactive.Bindings.Extensions;
 
 using Wifinian.Common;
 using Wifinian.Models;
+using Wifinian.Models.Update;
 
 namespace Wifinian.ViewModels;
 
@@ -15,9 +16,11 @@ public class MenuWindowViewModel : DisposableBase
 	public ReactiveCommand HistoryCommand => _controller?.HistoryCommand;
 	public ReactiveCommand MeasureCommand => _controller?.MeasureCommand;
 	public ReactiveCommand ProbeCommand => _controller?.ProbeCommand;
+	public ReactiveCommand UpgradeCommand => _controller?.UpgradeCommand;
 	public ReactiveCommand CloseCommand => _controller?.CloseCommand;
 
 	public ReadOnlyReactivePropertySlim<string> ProbeText { get; }
+	public ReadOnlyReactivePropertySlim<string> UpgradeText { get; }
 
 	internal MenuWindowViewModel(AppController controller)
 	{
@@ -29,7 +32,27 @@ public class MenuWindowViewModel : DisposableBase
 			.Select(x => x ? LanguageService.CancelTest : LanguageService.TestAll)
 			.ToReadOnlyReactivePropertySlim()
 			.AddTo(this.Subscription);
+
+		// The command to look for a new version tells its state and, once a new version is
+		// known, works as the command to install it.
+		UpgradeText = _controller.UpgradeStatus
+			.Select(x => GetUpgradeText(x))
+			.ToReadOnlyReactivePropertySlim()
+			.AddTo(this.Subscription);
 	}
+
+	/// <summary>
+	/// Gets the text of the command to look for or install a new version.
+	/// </summary>
+	internal static string GetUpgradeText(UpdateStatus status) => status?.Phase switch
+	{
+		UpdatePhase.Checking => LanguageService.UpdateChecking,
+		UpdatePhase.Latest => string.Format(LanguageService.UpdateLatest, status.Version),
+		UpdatePhase.Available => string.Format(LanguageService.UpdateInstall, status.Version),
+		UpdatePhase.Downloading => string.Format(LanguageService.UpdateDownloading, status.Version),
+		UpdatePhase.Failed => string.Format(LanguageService.UpdateFailed, status.Reason),
+		_ => LanguageService.UpdateCheck
+	};
 
 	#region Startup
 

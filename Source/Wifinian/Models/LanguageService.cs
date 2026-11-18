@@ -47,6 +47,12 @@ internal static class LanguageService
 	public static string TestAll => GetContentValue();
 	public static string CancelTest => GetContentValue();
 	public static string TestAllNote => GetContentValue();
+	public static string UpdateCheck => GetContentValue();
+	public static string UpdateChecking => GetContentValue();
+	public static string UpdateLatest => GetContentValue();
+	public static string UpdateInstall => GetContentValue();
+	public static string UpdateDownloading => GetContentValue();
+	public static string UpdateFailed => GetContentValue();
 	public static string Close => GetContentValue();
 
 	// Message
