@@ -200,6 +200,8 @@
     </StandardDirectory>
 
     <!-- Working Folder in Local AppData -->
+    <!-- RemoveFile removes the files of this folder only, when uninstalled or upgraded. The database
+         of history is in "data" subfolder so as to be left, which leaves this folder as well. -->
     <DirectoryRef Id="ApplicationLocalAppDataFolder">
       <Component Id="ApplicationWorkingFolder" Guid="{64995AFD-6A46-47D7-8FFE-67C6376F0FF5}">
         <RemoveFile Id="ApplicationLocalAppDataFiles" Directory="ApplicationLocalAppDataFolder" Name="*.*" On="uninstall"/>

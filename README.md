@@ -27,13 +27,13 @@ This fork records how each saved network performs and can let __Engage__ choose 
 
 ### What is recorded and where
 
-History is kept in one local SQLite database, `%LOCALAPPDATA%\Wifinian\history.db`. Rows older than 90 days are deleted. Nothing is sent anywhere.
+History is kept in one local SQLite database, `%LOCALAPPDATA%\Wifinian\data\history.db`. Rows older than 90 days are deleted. Nothing is sent anywhere.
 
  * `signal` table - signal of every saved network in range, at most about once a minute while it changes and at least every 5 minutes: `time, interface_id, profile, connected, signal, rssi, band, channel, protocol, bssid, link_rate`
  * `speed` table - one row per speed test: `time, interface_id, profile, bssid, band, channel, signal, link_rate, gateway_ms, latency_ms, jitter_ms, down_mbps, up_mbps, down_bytes, up_bytes, duration_ms, trigger, result, valid`
  * `events` table - every automatic switch and the reason for it, decisions to stay, and what speed-aware Engage would have done while it is off: `time, interface_id, kind, from_profile, to_profile, from_score, to_score, reason`
 
-`time` is UTC as ISO 8601 text (`2026-11-17T23:37:29Z`), so it sorts and compares as text; each table is indexed by `time` and by profile and `time`. The database can be read with any SQLite tool while the app is running (it uses write-ahead logging, hence the `history.db-wal` and `history.db-shm` files beside it while the app runs), for example:
+`time` is UTC as ISO 8601 text (`2026-11-17T23:37:29Z`), so it sorts and compares as text; each table is indexed by `time` and by profile and `time`. The database can be read with any SQLite tool while the app is running (it uses write-ahead logging, hence the `history.db-wal` and `history.db-shm` files beside it while the app runs), for example the query below. Rows are written in the background, so the app does not wait while another program holds the database; if a program keeps it locked for writing, up to 5,000 rows wait in memory and are written once it is released.
 
 ```sql
 SELECT profile, count(*) AS tests, round(avg(down_mbps), 1) AS down, round(avg(latency_ms), 1) AS latency
@@ -41,6 +41,10 @@ FROM speed WHERE valid = 1 AND time >= '2026-11-01' GROUP BY profile;
 ```
 
 The schema version is kept in `PRAGMA user_version`. When a network is renamed in this app, its rows in `signal` and `speed` are moved to the new name; `events` are left as they were recorded.
+
+Old rows are deleted once a day. When that frees a quarter or more of the file (for example after `HistoryRetentionDays` is lowered), the database is rebuilt so that the file shrinks; otherwise the freed space is reused by new rows. If the file turns out not to be a valid database, it is renamed to `history-corrupt-yyyyMMdd-HHmmss.db` (never deleted) and a new database is started.
+
+The database is in the `data` subfolder so that it survives upgrading and uninstalling: the installer removes the files directly in `%LOCALAPPDATA%\Wifinian` (such as the settings) but not its subfolders. Delete the folder by hand to remove the history. A `history.db` which an earlier build of this fork left directly in `%LOCALAPPDATA%\Wifinian` is moved to `data` when the app starts.
 
 __History...__ in the menu opens a window with a summary per network, charts of signal and download speed (24 hours, 7 days or 30 days), the list of measurements and the list of decisions. __Open data folder__ opens the folder of the database. __Export CSV__ writes the shown range to three CSV files (`export-yyyyMMdd-HHmmss-signal.csv`, `-speed.csv` and `-events.csv`, UTF-8) in `%LOCALAPPDATA%\Wifinian\history` and opens that folder. The latest result is also shown at the right of each network's name in the main window (download / upload in Mbps, latency, age).
 

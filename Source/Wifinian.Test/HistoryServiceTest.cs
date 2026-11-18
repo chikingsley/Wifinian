@@ -1,8 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
@@ -522,6 +525,7 @@ public class HistoryServiceTest
 		using var history = CreateHistory();
 
 		history.AppendEvent(CreateEvent(_start, "first"));
+		history.Flush();
 
 		var changedKinds = new List<HistoryKind>();
 		history.Changed += (_, kind) => changedKinds.Add(kind);
@@ -535,21 +539,24 @@ public class HistoryServiceTest
 			history.AppendSpeed(CreateSpeed(_start.AddMinutes(2), "Office", SpeedResult.Ok, 71));
 			history.AppendSignals(new[] { CreateSignal(_start.AddMinutes(3), "Office", 50) });
 
-			// A speed sample is held in memory and notified even if it could not be written.
-			CollectionAssert.AreEqual(new[] { HistoryKind.Speed }, changedKinds);
+			// A speed sample is held in memory and notified before it is written.
 			Assert.AreEqual(71D, history.GetSummary(HistoryService.GetKey("Office", _interfaceId)).DownMbps);
 
-			// Reading is not blocked.
+			// Reading is not blocked, apart from waiting for the attempt to write.
 			Assert.AreEqual("first", history.ReadEvents(_start, _start.AddHours(1)).Single().Reason);
 			Assert.AreEqual(0, history.ReadSpeeds(_start, _start.AddHours(1)).Count);
+
+			history.Flush();
+			CollectionAssert.AreEqual(new[] { HistoryKind.Speed }, changedKinds);
 
 			Execute(connection, "ROLLBACK;");
 		}
 
-		// The held rows are written in order by the next append of any kind, only once.
+		// The held rows are written in order following the next append of any kind, only once.
 		history.AppendEvent(CreateEvent(_start.AddMinutes(4), "fourth"));
+		history.Flush();
 
-		CollectionAssert.AreEqual(new[] { HistoryKind.Speed, HistoryKind.Event }, changedKinds);
+		CollectionAssert.AreEqual(new[] { HistoryKind.Speed, HistoryKind.Signal, HistoryKind.Event }, changedKinds);
 		CollectionAssert.AreEqual(new[] { "first", "second", "fourth" },
 			history.ReadEvents(_start, _start.AddHours(1)).Select(x => x.Reason).ToArray());
 		Assert.AreEqual(71D, history.ReadSpeeds(_start, _start.AddHours(1)).Single().DownMbps);
@@ -570,6 +577,7 @@ public class HistoryServiceTest
 		using (var history = CreateHistory())
 		{
 			history.AppendEvent(CreateEvent(_start, "first"));
+			history.Flush();
 
 			using (var connection = OpenDatabase())
 			{
@@ -579,10 +587,11 @@ public class HistoryServiceTest
 				history.AppendSignals(Enumerable.Range(0, HistoryService.MaxPendingCount + excess)
 					.Select(x => CreateSignal(_start.AddSeconds(x), $"Network {x}", 50)));
 
+				// Reading waits until the attempt to write fails.
+				Assert.AreEqual(0, history.ReadSignals(_start, _start.AddDays(1)).Count);
+
 				Execute(connection, "ROLLBACK;");
 			}
-
-			Assert.AreEqual(0, history.ReadSignals(_start, _start.AddDays(1)).Count);
 		}
 
 		// The held rows, oldest dropped, are written when the instance is disposed.
@@ -593,6 +602,110 @@ public class HistoryServiceTest
 			Assert.AreEqual($"Network {excess}", signals[0].Profile);
 			Assert.AreEqual($"Network {HistoryService.MaxPendingCount + excess - 1}", signals.Last().Profile);
 		}
+	}
+
+	[TestMethod]
+	public void TestMethodsForUIThreadDoNotWaitForDatabase()
+	{
+		const int timeout = 10; // Seconds
+
+		using var history = new HistoryService(_filePath, () => _now, timeout);
+
+		history.AppendSpeed(CreateSpeed(_start.AddMinutes(-1), "Office", SpeedResult.Ok, 70));
+		history.Flush();
+
+		WriteCsvFiles();
+
+		var key = HistoryService.GetKey("Office", _interfaceId);
+		Task<int> importTask;
+		long elapsed;
+
+		// Another process is writing to the database.
+		using (var connection = OpenDatabase())
+		{
+			Execute(connection, "BEGIN IMMEDIATE;");
+
+			// Importing holds the lock of the database while it waits for the other process.
+			importTask = Task.Run(() => history.ImportCsv(_csvFolderPath));
+			Thread.Sleep(300);
+
+			var sw = Stopwatch.StartNew();
+
+			history.AppendSignals(new[] { CreateSignal(_start, "Office", 50) });
+			history.AppendSpeed(CreateSpeed(_start, "Office", SpeedResult.Ok, 90));
+			history.AppendSpeed(CreateSpeed(_start, "Home", SpeedResult.Ok, 30));
+			history.AppendEvent(CreateEvent(_start, "event"));
+			history.Rename(HistoryService.GetKey("Home", _interfaceId), HistoryService.GetKey("Home 2", _interfaceId));
+
+			Assert.AreEqual(2, history.GetSummary(key).Count);
+			Assert.AreEqual(2, history.GetSpeedSamples(key).Count);
+			Assert.AreEqual(75_000_000L, history.GetBytesToday());
+			Assert.AreEqual(30D, history.GetSummary(HistoryService.GetKey("Home 2", _interfaceId)).DownMbps);
+
+			elapsed = sw.ElapsedMilliseconds;
+
+			// Neither importing nor writing in the background has finished.
+			Assert.IsFalse(importTask.IsCompleted);
+			Assert.AreEqual(1, Query(connection, "SELECT count(*) FROM speed;").Cast<long>().Single());
+
+			Execute(connection, "ROLLBACK;");
+		}
+
+		Assert.IsTrue(elapsed < timeout * 1000 / 5, $"Methods took {elapsed} ms.");
+
+		Assert.AreEqual(8, importTask.Result);
+		history.Flush();
+
+		// Rows are written, and renamed, in the order they were appended.
+		CollectionAssert.AreEquivalent(new[] { "Office", "EXT", TrickyName, "Office", "Office", "Home 2" },
+			history.ReadSpeeds(DateTime.MinValue, DateTime.MaxValue).Select(x => x.Profile).ToArray());
+		Assert.AreEqual(4, history.ReadSignals(DateTime.MinValue, DateTime.MaxValue).Count);
+		Assert.AreEqual(3, history.ReadEvents(DateTime.MinValue, DateTime.MaxValue).Count);
+
+		// The samples appended in the meantime are kept when the summary is rebuilt.
+		Assert.AreEqual(3, history.GetSummary(key).Count);
+		Assert.AreEqual(30D, history.GetSummary(HistoryService.GetKey("Home 2", _interfaceId)).DownMbps);
+	}
+
+	[TestMethod]
+	public void TestNothingIsWrittenAfterDisposed()
+	{
+		var key = HistoryService.GetKey("Office", _interfaceId);
+
+		WriteCsvFiles();
+
+		var history = CreateHistory();
+		history.AppendEvent(CreateEvent(_start, "first"));
+		history.Dispose();
+
+		Assert.IsTrue(File.Exists(_filePath));
+
+		history.AppendSignals(new[] { CreateSignal(_start, "Office", 50) });
+		history.AppendSpeed(CreateSpeed(_start, "Office", SpeedResult.Ok, 70));
+		history.AppendEvent(CreateEvent(_start, "second"));
+		history.Rename(key, HistoryService.GetKey("Office 2", _interfaceId));
+		history.Purge(7);
+		Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
+		history.Flush();
+
+		Assert.AreEqual(0, history.ReadEvents(_start, _start).Count);
+		Assert.IsNull(history.GetSummary(key));
+		Assert.IsTrue(Directory.Exists(_csvFolderPath));
+
+		history.Dispose();
+
+		// The database is neither opened again nor left with a write-ahead log.
+		Assert.IsFalse(File.Exists(_filePath + "-wal"));
+		Assert.IsFalse(File.Exists(_filePath + "-shm"));
+
+		using (var other = CreateHistory())
+		{
+			Assert.AreEqual("first", other.ReadEvents(_start, _start).Single().Reason);
+			Assert.AreEqual(0, other.ReadSpeeds(_start, _start).Count);
+		}
+
+		File.Delete(_filePath);
+		Assert.IsFalse(File.Exists(_filePath));
 	}
 
 	[TestMethod]
@@ -622,6 +735,41 @@ public class HistoryServiceTest
 		// Appending works after purging.
 		history.AppendEvent(CreateEvent(_start.AddMinutes(1), "newer"));
 		Assert.AreEqual(2, history.ReadEvents(DateTime.MinValue, DateTime.MaxValue).Count);
+	}
+
+	[TestMethod]
+	public void TestPurgeShrinksFile()
+	{
+		using var history = CreateHistory();
+
+		// Each sample is the first one of its profile and so is to be written.
+		history.AppendSignals(Enumerable.Range(0, HistoryService.MaxPendingCount)
+			.Select(x => CreateSignal(_start.AddDays(-30).AddSeconds(x), $"Network {x}", 50)));
+		history.Flush();
+		history.AppendSignals(new[] { CreateSignal(_start, "Office", 60) });
+
+		// The write-ahead log is merged into the file when purged.
+		history.Purge(60);
+		Assert.AreEqual(HistoryService.MaxPendingCount + 1, history.ReadSignals(DateTime.MinValue, DateTime.MaxValue).Count);
+
+		var lengthBefore = new FileInfo(_filePath).Length;
+		Assert.IsTrue(lengthBefore > HistoryService.VacuumMinPageCount * 4096L * 2);
+
+		history.Purge(7);
+
+		var lengthAfter = new FileInfo(_filePath).Length;
+		Assert.IsTrue(lengthAfter < lengthBefore / 4, $"Length changed from {lengthBefore} to {lengthAfter}.");
+
+		Assert.AreEqual(60, history.ReadSignals(DateTime.MinValue, DateTime.MaxValue).Single().Signal);
+
+		// Appending works after the database is rebuilt.
+		history.AppendSignals(new[] { CreateSignal(_start.AddMinutes(10), "Office", 70) });
+		Assert.AreEqual(2, history.ReadSignals(DateTime.MinValue, DateTime.MaxValue).Count);
+
+		using var connection = OpenDatabase();
+		Assert.AreEqual("wal", Query(connection, "PRAGMA journal_mode;").Single());
+		Assert.AreEqual((long)HistoryService.SchemaVersion, Query(connection, "PRAGMA user_version;").Single());
+		Assert.AreEqual("ok", Query(connection, "PRAGMA integrity_check;").Single());
 	}
 
 	[TestMethod]
@@ -698,24 +846,142 @@ public class HistoryServiceTest
 	}
 
 	[TestMethod]
-	public void TestBrokenDatabaseDoesNotThrow()
+	public void TestBrokenDatabaseIsSetAside()
 	{
+		var junk = new string('x', 5000);
+
 		Directory.CreateDirectory(_folderPath);
-		File.WriteAllText(_filePath, new string('x', 5000));
+		File.WriteAllText(_filePath, junk);
 
-		using var history = CreateHistory();
+		var asidePath = Path.Combine(_folderPath, $"history-corrupt-{_start.ToLocalTime():yyyyMMdd-HHmmss}.db");
 
-		history.AppendEvent(CreateEvent(_start, "event"));
-		history.AppendSpeed(CreateSpeed(_start, "Office", SpeedResult.Ok, 70));
-		history.Purge(7);
-		history.Rename(HistoryService.GetKey("Office", _interfaceId), HistoryService.GetKey("Office 2", _interfaceId));
+		using (var history = CreateHistory())
+		{
+			// Reading alone leaves the file as it is.
+			Assert.AreEqual(0, history.ReadEvents(_start, _start).Count);
+			Assert.AreEqual(junk, File.ReadAllText(_filePath));
 
-		Assert.AreEqual(0, history.ReadEvents(_start, _start).Count);
-		Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
-		Assert.AreEqual(0, history.ExportCsv(Path.Combine(_filePath, "export"), _start, _start).Count);
+			history.AppendEvent(CreateEvent(_start, "event"));
+			history.AppendSpeed(CreateSpeed(_start, "Office", SpeedResult.Ok, 70));
+			history.Purge(7);
+			history.Rename(HistoryService.GetKey("Office", _interfaceId), HistoryService.GetKey("Office 2", _interfaceId));
 
-		// The speed sample is still held in memory.
-		Assert.AreEqual(70D, history.GetSummary(HistoryService.GetKey("Office 2", _interfaceId)).DownMbps);
+			// The rows are written to a new database.
+			Assert.AreEqual("event", history.ReadEvents(_start, _start).Single().Reason);
+			Assert.AreEqual("Office 2", history.ReadSpeeds(_start, _start).Single().Profile);
+
+			Assert.AreEqual(0, history.ImportCsv(_csvFolderPath));
+			Assert.AreEqual(0, history.ExportCsv(Path.Combine(_filePath, "export"), _start, _start).Count);
+
+			Assert.AreEqual(70D, history.GetSummary(HistoryService.GetKey("Office 2", _interfaceId)).DownMbps);
+		}
+
+		// The broken file is kept under another name.
+		Assert.AreEqual(junk, File.ReadAllText(asidePath));
+		Assert.AreEqual(2, Directory.GetFiles(_folderPath).Length);
+
+		using (var history = CreateHistory())
+		{
+			Assert.AreEqual(1, history.ReadEvents(_start, _start).Count);
+			Assert.AreEqual(70D, history.GetSummary(HistoryService.GetKey("Office 2", _interfaceId)).DownMbps);
+		}
+
+		using var connection = OpenDatabase();
+		Assert.AreEqual("ok", Query(connection, "PRAGMA integrity_check;").Single());
+	}
+
+	[TestMethod]
+	public void TestDatabaseCorruptedLaterIsSetAside()
+	{
+		using (var history = CreateHistory())
+		{
+			history.AppendSignals(Enumerable.Range(0, 2000)
+				.Select(x => CreateSignal(_start.AddSeconds(x), $"Network {x}", 50)));
+		}
+
+		// Pages in the middle of the file are overwritten.
+		var bytes = File.ReadAllBytes(_filePath);
+		Assert.IsTrue(bytes.Length > 4096 * 20);
+		for (int i = 4096 * 2; i < bytes.Length; i++)
+			bytes[i] = 0x78;
+
+		File.WriteAllBytes(_filePath, bytes);
+
+		using (var history = CreateHistory())
+		{
+			// The first attempt finds the corruption and the next one writes to a new database.
+			history.AppendSignals(new[] { CreateSignal(_start, "Office", 50) });
+			history.Flush();
+			history.AppendEvent(CreateEvent(_start, "event"));
+
+			Assert.AreEqual("event", history.ReadEvents(_start, _start).Single().Reason);
+			Assert.AreEqual("Office", history.ReadSignals(_start, _start).Single().Profile);
+		}
+
+		Assert.AreEqual(bytes.Length, new FileInfo(Path.Combine(_folderPath, $"history-corrupt-{_start.ToLocalTime():yyyyMMdd-HHmmss}.db")).Length);
+
+		using var connection = OpenDatabase();
+		Assert.AreEqual("ok", Query(connection, "PRAGMA integrity_check;").Single());
+	}
+
+	[TestMethod]
+	public void TestRelocate()
+	{
+		var newFilePath = Path.Combine(_folderPath, "data", "history.db");
+
+		// Nothing to be moved
+		Assert.AreEqual(newFilePath, HistoryService.Relocate(_filePath, newFilePath));
+		Assert.IsFalse(Directory.Exists(_folderPath));
+
+		using (var history = CreateHistory())
+		{
+			history.AppendEvent(CreateEvent(_start, "old"));
+		}
+		File.WriteAllBytes(_filePath + "-wal", new byte[0]);
+		File.WriteAllText(_filePath + "-shm", "shm");
+
+		// The database in use is left and used where it is.
+		using (new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.None))
+		{
+			Assert.AreEqual(_filePath, HistoryService.Relocate(_filePath, newFilePath));
+		}
+		Assert.IsFalse(File.Exists(newFilePath));
+
+		// The write-ahead log in use takes the database back.
+		using (new FileStream(_filePath + "-wal", FileMode.Open, FileAccess.Read, FileShare.None))
+		{
+			Assert.AreEqual(_filePath, HistoryService.Relocate(_filePath, newFilePath));
+		}
+		Assert.IsTrue(File.Exists(_filePath));
+		Assert.IsTrue(File.Exists(_filePath + "-shm"));
+		Assert.IsFalse(File.Exists(newFilePath));
+
+		Assert.AreEqual(newFilePath, HistoryService.Relocate(_filePath, newFilePath));
+		Assert.AreEqual(0, Directory.GetFiles(_folderPath).Length);
+		Assert.AreEqual(3, Directory.GetFiles(Path.GetDirectoryName(newFilePath)).Length);
+
+		using (var history = new HistoryService(newFilePath, () => _now, 1))
+		{
+			Assert.AreEqual(Path.GetDirectoryName(newFilePath), history.FolderPath);
+			Assert.AreEqual("old", history.ReadEvents(_start, _start).Single().Reason);
+
+			history.AppendEvent(CreateEvent(_start, "new"));
+			Assert.AreEqual(2, history.ReadEvents(_start, _start).Count);
+		}
+
+		// A database which exists at the current location is never replaced.
+		using (var history = CreateHistory())
+		{
+			history.AppendEvent(CreateEvent(_start, "another"));
+		}
+
+		Assert.AreEqual(newFilePath, HistoryService.Relocate(_filePath, newFilePath));
+		Assert.IsTrue(File.Exists(_filePath));
+
+		using (var history = new HistoryService(newFilePath, () => _now, 1))
+		{
+			Assert.AreEqual(2, history.ReadEvents(_start, _start).Count);
+		}
 	}
 
 	#endregion
@@ -1096,6 +1362,7 @@ public class HistoryServiceTest
 		Assert.IsFalse(Directory.Exists(_folderPath));
 
 		history.AppendEvent(CreateEvent(_start, "event"));
+		history.Flush();
 		Assert.IsTrue(File.Exists(_filePath));
 		Assert.AreEqual(1, history.ReadEvents(_start, _start).Count);
 	}

@@ -74,7 +74,7 @@ internal partial class AppController : DisposableBase
 		WindowPainter = new WindowPainter();
 
 		this._worker = worker;
-		History = new HistoryService(AppDataService.HistoryFilePath);
+		History = new HistoryService(HistoryService.Relocate(AppDataService.OldHistoryFilePath, AppDataService.HistoryFilePath));
 
 		IsUpdating = new BooleanNotifier();
 		IsWorking = new BooleanNotifier();

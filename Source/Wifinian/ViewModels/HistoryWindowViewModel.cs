@@ -94,7 +94,7 @@ public class HistoryWindowViewModel : DisposableBase
 		OpenFolderCommand = new ReactiveCommand()
 			.AddTo(this.Subscription);
 		OpenFolderCommand
-			.Subscribe(_ => OpenFolder(AppDataService.FolderPath))
+			.Subscribe(_ => OpenFolder(_controller.History.FolderPath))
 			.AddTo(this.Subscription);
 
 		ExportCommand = new ReactiveCommand()

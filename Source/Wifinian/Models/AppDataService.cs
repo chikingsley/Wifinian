@@ -28,7 +28,16 @@ internal static class AppDataService
 	/// <summary>
 	/// File path of the database of history
 	/// </summary>
-	public static string HistoryFilePath => Path.Combine(FolderPath, "history.db");
+	/// <remarks>
+	/// The database is in a subfolder because the installer removes the files (not the subfolders)
+	/// of the folder when this application is uninstalled, which upgrading includes.
+	/// </remarks>
+	public static string HistoryFilePath => Path.Combine(FolderPath, "data", "history.db");
+
+	/// <summary>
+	/// File path of the database of history of previous versions
+	/// </summary>
+	public static string OldHistoryFilePath => Path.Combine(FolderPath, "history.db");
 
 	/// <summary>
 	/// Folder path of exported history files (and of the files of previous versions to be imported)

@@ -5,6 +5,8 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
 
 namespace Wifinian.Models.History;
@@ -24,7 +26,12 @@ public enum HistoryKind
 /// </summary>
 /// <remarks>
 /// No public method of this class throws an exception. Failures are written to trace.
-/// The database is accessed only through a single connection inside the lock.
+/// The methods called on the UI thread (Append*, Get* and Rename) only take the lock of the
+/// state in memory and never wait for the database: appended rows are queued and written by
+/// a single background task. The connection for writing is used only inside its own lock, by
+/// that task, Purge, ImportCsv and Dispose. Each reading uses a read-only connection of its
+/// own, which write-ahead logging lets run alongside the writer, and holds no lock.
+/// The order of locks is the lock of the database and then the lock of the state.
 /// Time is stored as UTC ISO 8601 text of fixed length (yyyy-MM-ddTHH:mm:ssZ) and so can be
 /// compared as text.
 /// </remarks>
@@ -36,9 +43,10 @@ internal class HistoryService : IDisposable
 	private const string ImportImported = "imported"; // Rows are imported but the folder is not renamed yet.
 	private const string ImportDone = "done";
 	private const string ImportedSuffix = "-csv-imported";
+	private const string CorruptSuffix = "-corrupt-";
 
 	/// <summary>
-	/// Maximum number of rows kept in memory while the database cannot be written
+	/// Maximum number of rows kept in memory until they are written to the database
 	/// </summary>
 	internal const int MaxPendingCount = 5000;
 
@@ -62,16 +70,34 @@ internal class HistoryService : IDisposable
 	/// </summary>
 	internal const int DefaultTimeout = 3;
 
+	/// <summary>
+	/// Minimum number of free pages (4 KiB each by default) to rebuild the database when purged
+	/// </summary>
+	internal const int VacuumMinPageCount = 64;
+
+	/// <summary>
+	/// Minimum ratio of free pages to all the pages to rebuild the database when purged
+	/// </summary>
+	internal const double VacuumMinRatio = 0.25;
+
 	private readonly string _filePath;
 	private readonly Func<DateTime> _utcNow;
 	private readonly int _timeout;
 
+	// State in memory
 	private readonly object _lock = new();
 	private readonly Dictionary<string, List<SpeedSample>> _speeds = new();
 	private readonly Dictionary<string, SignalSample> _lastSignals = new();
-	private readonly Queue<object> _pending = new();
+	private readonly Queue<object> _pending = new(); // Rows and renames to be written, in order
+	private Task _flushTask;
+	private bool _isFlushing;
+	private volatile bool _isDisposed;
 
+	// Connection for writing
+	private readonly object _dbLock = new();
 	private SqliteConnection _connection;
+	private bool _isLastWriteFailed;
+	private bool _isClosed;
 
 	/// <summary>
 	/// Occurs after rows are appended.
@@ -91,19 +117,19 @@ internal class HistoryService : IDisposable
 		// as long as nothing is recorded.
 		try
 		{
-			lock (_lock)
-			{
-				LoadSpeeds();
-			}
+			LoadSpeeds();
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to load speed history." + Environment.NewLine
 				+ ex);
-
-			CloseConnection();
 		}
 	}
+
+	/// <summary>
+	/// Folder path of the database
+	/// </summary>
+	public string FolderPath => Path.GetDirectoryName(_filePath);
 
 	public static string GetKey(string profileName, Guid interfaceId) =>
 		profileName + "|" + interfaceId.ToString("D");
@@ -127,10 +153,9 @@ internal class HistoryService : IDisposable
 	/// Appends signal samples reducing those which have not changed much.
 	/// </summary>
 	/// <param name="samples">Signal samples</param>
+	/// <remarks>The samples are written in the background.</remarks>
 	public void AppendSignals(IEnumerable<SignalSample> samples)
 	{
-		bool isWritten = false;
-
 		try
 		{
 			if (samples is null)
@@ -138,7 +163,10 @@ internal class HistoryService : IDisposable
 
 			lock (_lock)
 			{
-				var rows = new List<object>();
+				if (_isDisposed)
+					return;
+
+				int count = 0;
 
 				foreach (var sample in samples)
 				{
@@ -152,13 +180,12 @@ internal class HistoryService : IDisposable
 						continue;
 
 					_lastSignals[key] = sample;
-					rows.Add(sample);
+					_pending.Enqueue(sample);
+					count++;
 				}
 
-				if (rows.Count == 0)
-					return;
-
-				isWritten = WriteRows(rows);
+				if (count > 0)
+					ScheduleFlush();
 			}
 		}
 		catch (Exception ex)
@@ -166,9 +193,6 @@ internal class HistoryService : IDisposable
 			Trace.WriteLine("Failed to append signal history." + Environment.NewLine
 				+ ex);
 		}
-
-		if (isWritten)
-			OnChanged(HistoryKind.Signal);
 	}
 
 	internal static bool ShouldWrite(SignalSample last, SignalSample sample)
@@ -198,6 +222,10 @@ internal class HistoryService : IDisposable
 	/// Appends a speed sample.
 	/// </summary>
 	/// <param name="sample">Speed sample</param>
+	/// <remarks>
+	/// The sample is held in memory at once, and so is reflected in the summary, and is written
+	/// in the background.
+	/// </remarks>
 	public void AppendSpeed(SpeedSample sample)
 	{
 		bool isAdded = false;
@@ -209,6 +237,9 @@ internal class HistoryService : IDisposable
 
 			lock (_lock)
 			{
+				if (_isDisposed)
+					return;
+
 				var oldest = GetNow() - SpeedSummary.Period;
 				if (_speeds.TryGetValue(sample.Key, out List<SpeedSample> samples))
 					samples.RemoveAll(x => CsvLine.ToUtc(x.Time) < oldest);
@@ -216,7 +247,8 @@ internal class HistoryService : IDisposable
 				HoldSpeed(sample);
 				isAdded = true;
 
-				WriteRows(new List<object> { sample });
+				_pending.Enqueue(sample);
+				ScheduleFlush();
 			}
 		}
 		catch (Exception ex)
@@ -225,7 +257,7 @@ internal class HistoryService : IDisposable
 				+ ex);
 		}
 
-		// The sample is held in memory even if it could not be written to the database yet.
+		// The sample is held in memory even if it has not been written to the database yet.
 		if (isAdded)
 			OnChanged(HistoryKind.Speed);
 	}
@@ -234,10 +266,9 @@ internal class HistoryService : IDisposable
 	/// Appends a switching event.
 	/// </summary>
 	/// <param name="switchEvent">Switching event</param>
+	/// <remarks>The event is written in the background.</remarks>
 	public void AppendEvent(SwitchEvent switchEvent)
 	{
-		bool isWritten = false;
-
 		try
 		{
 			if (switchEvent is null)
@@ -245,7 +276,11 @@ internal class HistoryService : IDisposable
 
 			lock (_lock)
 			{
-				isWritten = WriteRows(new List<object> { switchEvent });
+				if (_isDisposed)
+					return;
+
+				_pending.Enqueue(switchEvent);
+				ScheduleFlush();
 			}
 		}
 		catch (Exception ex)
@@ -253,9 +288,6 @@ internal class HistoryService : IDisposable
 			Trace.WriteLine("Failed to append event history." + Environment.NewLine
 				+ ex);
 		}
-
-		if (isWritten)
-			OnChanged(HistoryKind.Event);
 	}
 
 	private void OnChanged(HistoryKind kind)
@@ -371,53 +403,70 @@ internal class HistoryService : IDisposable
 	};
 
 	/// <summary>
-	/// Gets the connection opening the database if necessary.
+	/// Gets the connection for writing opening the database if necessary.
 	/// </summary>
 	/// <param name="creates">Whether to create the database if it does not exist</param>
-	/// <returns>Connection, null if the database does not exist and is not to be created</returns>
-	/// <remarks>This method must be called inside the lock and can throw an exception.</remarks>
+	/// <returns>Connection, null if the database does not exist and is not to be created or if this instance has been disposed</returns>
+	/// <remarks>
+	/// A file which is not a database or is corrupt is set aside (renamed, not deleted) and
+	/// a new database takes its place.
+	/// This method must be called inside the lock of the database and can throw an exception.
+	/// </remarks>
 	private SqliteConnection GetConnection(bool creates)
 	{
+		if (_isClosed)
+			return null;
+
 		if (_connection is not null)
 			return _connection;
 
-		if (!File.Exists(_filePath))
+		for (int i = 0; ; i++)
 		{
-			if (!creates)
-				return null;
+			if (!File.Exists(_filePath))
+			{
+				if (!creates)
+					return null;
 
-			var folderPath = Path.GetDirectoryName(_filePath);
-			if (!string.IsNullOrEmpty(folderPath))
-				Directory.CreateDirectory(folderPath);
+				var folderPath = Path.GetDirectoryName(_filePath);
+				if (!string.IsNullOrEmpty(folderPath))
+					Directory.CreateDirectory(folderPath);
+			}
+
+			var connection = new SqliteConnection(GetConnectionString(SqliteOpenMode.ReadWriteCreate));
+			try
+			{
+				connection.Open();
+
+				Execute(connection, null, "PRAGMA journal_mode = WAL;");
+				Execute(connection, null, "PRAGMA synchronous = NORMAL;");
+
+				Migrate(connection);
+
+				_connection = connection;
+				return _connection;
+			}
+			catch (Exception ex)
+			{
+				connection.Dispose();
+
+				if ((i > 0) || !IsCorrupt(ex))
+					throw;
+
+				Trace.WriteLine("Failed to open history database, which is to be set aside." + Environment.NewLine
+					+ ex);
+			}
+
+			SetAside();
 		}
-
-		var builder = new SqliteConnectionStringBuilder
-		{
-			DataSource = _filePath,
-			Mode = SqliteOpenMode.ReadWriteCreate,
-			Pooling = false, // The file must be released when this instance is disposed.
-			DefaultTimeout = _timeout
-		};
-
-		var connection = new SqliteConnection(builder.ToString());
-		try
-		{
-			connection.Open();
-
-			Execute(connection, null, "PRAGMA journal_mode = WAL;");
-			Execute(connection, null, "PRAGMA synchronous = NORMAL;");
-
-			Migrate(connection);
-		}
-		catch
-		{
-			connection.Dispose();
-			throw;
-		}
-
-		_connection = connection;
-		return _connection;
 	}
+
+	private string GetConnectionString(SqliteOpenMode mode) => new SqliteConnectionStringBuilder
+	{
+		DataSource = _filePath,
+		Mode = mode,
+		Pooling = false, // The file must be released when the connection is disposed.
+		DefaultTimeout = _timeout
+	}.ToString();
 
 	private static void Migrate(SqliteConnection connection)
 	{
@@ -436,24 +485,153 @@ internal class HistoryService : IDisposable
 	}
 
 	/// <summary>
-	/// Closes the connection so that it will be opened anew at the next access.
+	/// Closes the connection for writing so that it will be opened anew at the next access.
 	/// </summary>
 	private void CloseConnection()
 	{
-		try
+		lock (_dbLock)
 		{
-			lock (_lock)
+			try
 			{
 				_connection?.Dispose();
-				_connection = null;
 			}
+			catch (Exception ex)
+			{
+				Trace.WriteLine("Failed to close history database." + Environment.NewLine
+					+ ex);
+			}
+
+			_connection = null;
+		}
+	}
+
+	private const int SqliteCorrupt = 11; // SQLITE_CORRUPT
+	private const int SqliteNotADb = 26; // SQLITE_NOTADB
+
+	/// <summary>
+	/// Determines whether an exception tells that the file is not a database or is corrupt.
+	/// </summary>
+	private static bool IsCorrupt(Exception ex) =>
+		ex is SqliteException { SqliteErrorCode: SqliteCorrupt or SqliteNotADb };
+
+	private static readonly string[] _accompanyingSuffixes = { "-wal", "-shm" };
+
+	/// <summary>
+	/// Renames the file of database, and the files which accompany it, to history-corrupt-(local
+	/// time).db and so on so that a new database will be created.
+	/// </summary>
+	/// <remarks>
+	/// The files are never deleted. This method must be called inside the lock of the database
+	/// after the connection is closed and can throw an exception, in which case it will be
+	/// tried again at the next access.
+	/// </remarks>
+	private void SetAside()
+	{
+		if (!File.Exists(_filePath))
+			return;
+
+		var folderPath = Path.GetDirectoryName(_filePath) ?? string.Empty;
+		var name = Path.GetFileNameWithoutExtension(_filePath);
+		var extension = Path.GetExtension(_filePath);
+		var stamp = GetNow().ToLocalTime().ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+
+		var newPath = Path.Combine(folderPath, name + CorruptSuffix + stamp + extension);
+		for (int i = 2; File.Exists(newPath) || Directory.Exists(newPath); i++)
+			newPath = Path.Combine(folderPath, name + CorruptSuffix + stamp + "-" + i.ToString(CultureInfo.InvariantCulture) + extension);
+
+		File.Move(_filePath, newPath);
+
+		foreach (var suffix in _accompanyingSuffixes)
+		{
+			try
+			{
+				if (File.Exists(_filePath + suffix))
+					File.Move(_filePath + suffix, newPath + suffix);
+			}
+			catch (Exception ex)
+			{
+				Trace.WriteLine("Failed to rename file of history database." + Environment.NewLine
+					+ ex);
+			}
+		}
+
+		Trace.WriteLine($"History database is set aside as {newPath}.");
+	}
+
+	/// <summary>
+	/// Closes the connection for writing after a failure and sets the database aside if the
+	/// failure tells that it is corrupt.
+	/// </summary>
+	private void HandleFailure(Exception ex)
+	{
+		lock (_dbLock)
+		{
+			CloseConnection();
+
+			if (!IsCorrupt(ex))
+				return;
+
+			try
+			{
+				SetAside();
+			}
+			catch (Exception inner)
+			{
+				Trace.WriteLine("Failed to set history database aside." + Environment.NewLine
+					+ inner);
+			}
+		}
+	}
+
+	/// <summary>
+	/// Moves the database, and the files which accompany it, of a previous location to the
+	/// current location unless a database exists there already.
+	/// </summary>
+	/// <param name="oldFilePath">File path of previous location</param>
+	/// <param name="newFilePath">File path of current location</param>
+	/// <returns>File path to be used, that of previous location if the database could not be moved</returns>
+	/// <remarks>This method must be called before the database is opened.</remarks>
+	public static string Relocate(string oldFilePath, string newFilePath)
+	{
+		try
+		{
+			if (File.Exists(newFilePath) || !File.Exists(oldFilePath))
+				return newFilePath;
+
+			var folderPath = Path.GetDirectoryName(newFilePath);
+			if (!string.IsNullOrEmpty(folderPath))
+				Directory.CreateDirectory(folderPath);
+
+			// The write-ahead log, which is left if the application did not exit normally, holds
+			// rows and so must be found beside the database when it is opened.
+			foreach (var suffix in _accompanyingSuffixes.Where(x => File.Exists(newFilePath + x)))
+				File.Delete(newFilePath + suffix);
+
+			File.Move(oldFilePath, newFilePath);
+
+			try
+			{
+				foreach (var suffix in _accompanyingSuffixes.Where(x => File.Exists(oldFilePath + x)))
+					File.Move(oldFilePath + suffix, newFilePath + suffix);
+			}
+			catch
+			{
+				// The database and its write-ahead log must not be separated.
+				foreach (var suffix in _accompanyingSuffixes.Where(x => File.Exists(newFilePath + x)))
+					File.Move(newFilePath + suffix, oldFilePath + suffix);
+
+				File.Move(newFilePath, oldFilePath);
+				throw;
+			}
+
+			return newFilePath;
 		}
 		catch (Exception ex)
 		{
-			Trace.WriteLine("Failed to close history database." + Environment.NewLine
+			Trace.WriteLine("Failed to move history database." + Environment.NewLine
 				+ ex);
 
-			_connection = null;
+			return File.Exists(newFilePath) ? newFilePath : oldFilePath;
 		}
 	}
 
@@ -492,33 +670,161 @@ internal class HistoryService : IDisposable
 	#region Write
 
 	/// <summary>
-	/// Writes rows to the database following the rows which could not be written before.
+	/// Rename of a profile to be applied to the database in the order of rows
 	/// </summary>
-	/// <param name="rows">Rows (signal samples, speed samples and switching events)</param>
-	/// <returns>True if the rows are written, false if the rows are kept in memory for the next attempt</returns>
-	/// <remarks>
-	/// All the rows are written in a transaction. This method must be called inside the lock.
-	/// </remarks>
-	private bool WriteRows(List<object> rows)
+	private class RenameOperation
 	{
-		var buffer = (_pending.Count > 0)
-			? _pending.Concat(rows).ToList()
-			: rows;
+		public Guid InterfaceId { get; set; }
+		public string OldName { get; set; }
+		public string NewName { get; set; }
+	}
 
-		if (buffer.Count == 0)
-			return false;
+	/// <summary>
+	/// Starts the background task to write the queued rows unless it is running.
+	/// </summary>
+	/// <remarks>This method must be called inside the lock of the state.</remarks>
+	private void ScheduleFlush()
+	{
+		// The oldest rows are dropped while the database cannot be written.
+		while (_pending.Count > MaxPendingCount)
+			_pending.Dequeue();
+
+		if (_isFlushing || _isDisposed)
+			return;
+
+		_isFlushing = true;
+		_flushTask = Task.Run(() => FlushPending());
+	}
+
+	/// <summary>
+	/// Writes the queued rows until none is left or writing fails. If it fails, the rows are
+	/// kept for the next attempt, which the next append will start.
+	/// </summary>
+	private void FlushPending()
+	{
+		try
+		{
+			while (true)
+			{
+				bool isWritten;
+				bool hasSignal;
+				bool hasEvent;
+
+				lock (_dbLock)
+				{
+					isWritten = WritePending(out hasSignal, out hasEvent);
+				}
+
+				if (hasSignal)
+					OnChanged(HistoryKind.Signal);
+				if (hasEvent)
+					OnChanged(HistoryKind.Event);
+
+				lock (_lock)
+				{
+					if (!isWritten || (_pending.Count == 0) || _isDisposed)
+					{
+						_isFlushing = false;
+						return;
+					}
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to write history." + Environment.NewLine
+				+ ex);
+
+			lock (_lock)
+			{
+				_isFlushing = false;
+			}
+		}
+	}
+
+	/// <summary>
+	/// Waits for the background task, if running, to finish writing the rows appended so far.
+	/// </summary>
+	/// <remarks>
+	/// This method can take as long as the time to wait for the database locked by another
+	/// process and so must not be called on the UI thread.
+	/// </remarks>
+	internal void Flush()
+	{
+		try
+		{
+			Task task;
+			lock (_lock)
+			{
+				task = _flushTask;
+			}
+
+			// This method may be called by a handler of the event raised by the task itself.
+			if ((task is null) || (task.Id == Task.CurrentId) || Monitor.IsEntered(_dbLock))
+				return;
+
+			task.Wait();
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to wait for history to be written." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Writes the queued rows and renames to the database in a transaction.
+	/// </summary>
+	/// <param name="hasSignal">Whether signal samples are written</param>
+	/// <param name="hasEvent">Whether switching events are written</param>
+	/// <returns>True if nothing is left to be written, false if the rows are kept for the next attempt</returns>
+	/// <remarks>This method must be called inside the lock of the database.</remarks>
+	private bool WritePending(out bool hasSignal, out bool hasEvent)
+	{
+		hasSignal = false;
+		hasEvent = false;
+
+		object[] batch;
+		lock (_lock)
+		{
+			if (_pending.Count == 0)
+				return true;
+
+			batch = _pending.ToArray();
+		}
 
 		try
 		{
-			var connection = GetConnection(true);
+			// A rename alone does not create the database.
+			var hasRows = batch.Any(x => x is not RenameOperation);
 
-			using (var transaction = connection.BeginTransaction())
+			var connection = GetConnection(hasRows);
+			if (connection is not null)
 			{
-				InsertRows(connection, transaction, buffer);
+				using var transaction = connection.BeginTransaction();
+
+				InsertRows(connection, transaction, batch);
 				transaction.Commit();
 			}
+			else if (hasRows || _isClosed)
+			{
+				return false;
+			}
 
-			_pending.Clear();
+			lock (_lock)
+			{
+				// Rows may have been queued, or dropped, in the meantime.
+				var written = new HashSet<object>(batch);
+				var rest = _pending.Where(x => !written.Contains(x)).ToArray();
+
+				_pending.Clear();
+				foreach (var row in rest)
+					_pending.Enqueue(row);
+			}
+
+			_isLastWriteFailed = false;
+			hasSignal = (connection is not null) && batch.Any(x => x is SignalSample);
+			hasEvent = (connection is not null) && batch.Any(x => x is SwitchEvent);
 			return true;
 		}
 		catch (Exception ex)
@@ -526,15 +832,10 @@ internal class HistoryService : IDisposable
 			Trace.WriteLine("Failed to write history database." + Environment.NewLine
 				+ ex);
 
-			CloseConnection();
+			_isLastWriteFailed = true;
+			HandleFailure(ex);
+			return false;
 		}
-
-		// Keep the rows which have not been written, oldest dropped, for the next attempt.
-		_pending.Clear();
-		foreach (var row in buffer.Skip(Math.Max(0, buffer.Count - MaxPendingCount)))
-			_pending.Enqueue(row);
-
-		return false;
 	}
 
 	private static void InsertRows(SqliteConnection connection, SqliteTransaction transaction, IEnumerable<object> rows)
@@ -562,6 +863,17 @@ internal class HistoryService : IDisposable
 					case SwitchEvent switchEvent:
 						eventCommand ??= CreateInsertCommand(connection, transaction, EventTable, _eventColumns);
 						Insert(eventCommand, GetValues(switchEvent));
+						break;
+
+					case RenameOperation rename:
+						foreach (var table in new[] { SignalTable, SpeedTable })
+						{
+							Execute(connection, transaction,
+								$"UPDATE {table} SET profile = $new WHERE profile = $old AND interface_id = $id;",
+								("$new", rename.NewName),
+								("$old", rename.OldName),
+								("$id", rename.InterfaceId.ToString("D")));
+						}
 						break;
 				}
 			}
@@ -659,21 +971,25 @@ internal class HistoryService : IDisposable
 
 	#region Read
 
+	/// <summary>
+	/// Reads signal samples within a range of time in order of time.
+	/// </summary>
+	/// <remarks>
+	/// Read* methods wait for the rows appended so far to be written and take time in proportion
+	/// to the number of rows, and so must not be called on the UI thread.
+	/// </remarks>
 	public IReadOnlyList<SignalSample> ReadSignals(DateTime fromUtc, DateTime toUtc)
 	{
 		try
 		{
-			lock (_lock)
-			{
-				return ReadRows(SignalTable, _signalColumns, fromUtc, toUtc, ReadSignal);
-			}
+			Flush();
+
+			return ReadRows(SignalTable, _signalColumns, fromUtc, toUtc, ReadSignal);
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to read signal history." + Environment.NewLine
 				+ ex);
-
-			CloseConnection();
 			return Array.Empty<SignalSample>();
 		}
 	}
@@ -682,17 +998,14 @@ internal class HistoryService : IDisposable
 	{
 		try
 		{
-			lock (_lock)
-			{
-				return ReadRows(SpeedTable, _speedColumns, fromUtc, toUtc, ReadSpeed);
-			}
+			Flush();
+
+			return ReadRows(SpeedTable, _speedColumns, fromUtc, toUtc, ReadSpeed);
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to read speed history." + Environment.NewLine
 				+ ex);
-
-			CloseConnection();
 			return Array.Empty<SpeedSample>();
 		}
 	}
@@ -701,17 +1014,14 @@ internal class HistoryService : IDisposable
 	{
 		try
 		{
-			lock (_lock)
-			{
-				return ReadRows(EventTable, _eventColumns, fromUtc, toUtc, ReadEvent);
-			}
+			Flush();
+
+			return ReadRows(EventTable, _eventColumns, fromUtc, toUtc, ReadEvent);
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to read event history." + Environment.NewLine
 				+ ex);
-
-			CloseConnection();
 			return Array.Empty<SwitchEvent>();
 		}
 	}
@@ -719,7 +1029,10 @@ internal class HistoryService : IDisposable
 	/// <summary>
 	/// Reads the rows of a table within a range of time in order of time.
 	/// </summary>
-	/// <remarks>This method must be called inside the lock and can throw an exception.</remarks>
+	/// <remarks>
+	/// This method uses a read-only connection of its own, which does not wait for the writer,
+	/// and can throw an exception.
+	/// </remarks>
 	private List<T> ReadRows<T>(string table, string[] columns, DateTime fromUtc, DateTime toUtc, Func<SqliteDataReader, T> read) where T : class
 	{
 		var items = new List<T>();
@@ -740,9 +1053,11 @@ internal class HistoryService : IDisposable
 		if (toUtc < fromUtc)
 			return items;
 
-		var connection = GetConnection(false);
-		if (connection is null)
+		if (_isDisposed || !File.Exists(_filePath))
 			return items;
+
+		using var connection = new SqliteConnection(GetConnectionString(SqliteOpenMode.ReadOnly));
+		connection.Open();
 
 		// The rows of the same time are in order of insertion.
 		using var command = CreateCommand(connection, null,
@@ -854,17 +1169,23 @@ internal class HistoryService : IDisposable
 	/// <summary>
 	/// Loads speed samples within the period of summary from the database.
 	/// </summary>
-	/// <remarks>This method must be called inside the lock and can throw an exception.</remarks>
+	/// <remarks>
+	/// This method must be called while nothing is being written, that is, inside the lock of
+	/// the database or by the constructor, and can throw an exception.
+	/// </remarks>
 	private void LoadSpeeds()
 	{
 		var now = GetNow();
 		var samples = ReadRows(SpeedTable, _speedColumns, now - SpeedSummary.Period, now.AddDays(1), ReadSpeed);
 
-		_speeds.Clear();
+		lock (_lock)
+		{
+			_speeds.Clear();
 
-		// The samples which have not been written yet follow those in the database.
-		foreach (var sample in samples.Concat(_pending.OfType<SpeedSample>()))
-			HoldSpeed(sample);
+			// The samples which have not been written yet follow those in the database.
+			foreach (var sample in samples.Concat(_pending.OfType<SpeedSample>()))
+				HoldSpeed(sample);
+		}
 	}
 
 	private void HoldSpeed(SpeedSample sample)
@@ -955,8 +1276,8 @@ internal class HistoryService : IDisposable
 	/// <param name="oldKey">Old profile key</param>
 	/// <param name="newKey">New profile key</param>
 	/// <remarks>
-	/// Signal samples and speed samples in the database are moved as well as those held in
-	/// memory. Switching events are left as they were recorded.
+	/// Signal samples and speed samples in the database are moved, in the background, as well
+	/// as those held in memory. Switching events are left as they were recorded.
 	/// </remarks>
 	public void Rename(string oldKey, string newKey)
 	{
@@ -999,30 +1320,18 @@ internal class HistoryService : IDisposable
 				foreach (var sample in _pending.OfType<SignalSample>().Where(x => (x.InterfaceId == oldId) && (x.Profile == oldName)))
 					sample.Profile = newName;
 
-				var connection = GetConnection(false);
-				if (connection is null)
+				if (_isDisposed)
 					return;
 
-				using var transaction = connection.BeginTransaction();
-
-				foreach (var table in new[] { SignalTable, SpeedTable })
-				{
-					Execute(connection, transaction,
-						$"UPDATE {table} SET profile = $new WHERE profile = $old AND interface_id = $id;",
-						("$new", newName),
-						("$old", oldName),
-						("$id", oldId.ToString("D")));
-				}
-
-				transaction.Commit();
+				// The rows in the database are moved after the rows queued before are written.
+				_pending.Enqueue(new RenameOperation { InterfaceId = oldId, OldName = oldName, NewName = newName });
+				ScheduleFlush();
 			}
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to rename history." + Environment.NewLine
 				+ ex);
-
-			CloseConnection();
 		}
 	}
 
@@ -1031,9 +1340,11 @@ internal class HistoryService : IDisposable
 	#region Purge
 
 	/// <summary>
-	/// Deletes rows older than retention days.
+	/// Deletes rows older than retention days and, if the freed space is considerable, rebuilds
+	/// the database to give the space back to the disk.
 	/// </summary>
 	/// <param name="retentionDays">Retention days</param>
+	/// <remarks>This method takes time and so must not be called on the UI thread.</remarks>
 	public void Purge(int retentionDays)
 	{
 		try
@@ -1043,7 +1354,9 @@ internal class HistoryService : IDisposable
 
 			var oldest = CsvLine.FormatTime(GetNow().Date.AddDays(-retentionDays));
 
-			lock (_lock)
+			Flush();
+
+			lock (_dbLock)
 			{
 				var connection = GetConnection(false);
 				if (connection is null)
@@ -1057,6 +1370,24 @@ internal class HistoryService : IDisposable
 					transaction.Commit();
 				}
 
+				// Deleting rows leaves free pages in the file, which never shrinks by itself.
+				var pageCount = Convert.ToInt64(ExecuteScalar(connection, null, "PRAGMA page_count;"), CultureInfo.InvariantCulture);
+				var freeCount = Convert.ToInt64(ExecuteScalar(connection, null, "PRAGMA freelist_count;"), CultureInfo.InvariantCulture);
+
+				if ((freeCount >= VacuumMinPageCount) && (freeCount >= pageCount * VacuumMinRatio))
+				{
+					try
+					{
+						Execute(connection, null, "VACUUM;");
+					}
+					catch (SqliteException ex) when (!IsCorrupt(ex))
+					{
+						// It will be tried again when purging next time.
+						Trace.WriteLine("Failed to rebuild history database." + Environment.NewLine
+							+ ex);
+					}
+				}
+
 				// Let the file of write-ahead log start over.
 				Execute(connection, null, "PRAGMA wal_checkpoint(TRUNCATE);");
 			}
@@ -1066,7 +1397,7 @@ internal class HistoryService : IDisposable
 			Trace.WriteLine("Failed to purge history." + Environment.NewLine
 				+ ex);
 
-			CloseConnection();
+			HandleFailure(ex);
 		}
 	}
 
@@ -1086,6 +1417,8 @@ internal class HistoryService : IDisposable
 	/// All the rows are imported in a transaction which records the completion as well, and so
 	/// the files are never imported twice even if this method is interrupted or called again.
 	/// The folder is renamed (not deleted) to that with "-csv-imported" suffix.
+	/// The files are read before the lock of the database is taken, and that lock is never
+	/// taken by the methods called on the UI thread.
 	/// This method takes time and so must not be called on the UI thread.
 	/// </remarks>
 	public int ImportCsv(string folderPath)
@@ -1097,8 +1430,11 @@ internal class HistoryService : IDisposable
 			if (string.IsNullOrEmpty(folderPath))
 				return 0;
 
+			// The database may be about to be created by the rows appended so far.
+			Flush();
+
 			string state;
-			lock (_lock)
+			lock (_dbLock)
 			{
 				var connection = GetConnection(false);
 				state = (connection is not null) ? GetMeta(connection, ImportKey) : null;
@@ -1114,7 +1450,7 @@ internal class HistoryService : IDisposable
 				rows.AddRange(ReadCsvFiles<SpeedSample>(folderPath, "speed", SpeedSample.TryParse));
 				rows.AddRange(ReadCsvFiles<SwitchEvent>(folderPath, "events", SwitchEvent.TryParse));
 
-				lock (_lock)
+				lock (_dbLock)
 				{
 					// Nothing is created if there is nothing to be imported.
 					var connection = GetConnection(rows.Count > 0);
@@ -1141,9 +1477,11 @@ internal class HistoryService : IDisposable
 
 			if (RenameImportedFolder(folderPath))
 			{
-				lock (_lock)
+				lock (_dbLock)
 				{
-					SetMeta(GetConnection(true), null, ImportKey, ImportDone);
+					var connection = GetConnection(false);
+					if (connection is not null)
+						SetMeta(connection, null, ImportKey, ImportDone);
 				}
 			}
 		}
@@ -1152,7 +1490,7 @@ internal class HistoryService : IDisposable
 			Trace.WriteLine("Failed to import history files." + Environment.NewLine
 				+ ex);
 
-			CloseConnection();
+			HandleFailure(ex);
 		}
 
 		if (count > 0)
@@ -1316,8 +1654,6 @@ internal class HistoryService : IDisposable
 
 	#region IDisposable
 
-	private bool _isDisposed = false;
-
 	public void Dispose()
 	{
 		Dispose(true);
@@ -1326,33 +1662,49 @@ internal class HistoryService : IDisposable
 
 	protected virtual void Dispose(bool disposing)
 	{
-		if (_isDisposed)
+		if (!disposing)
 			return;
 
-		if (disposing)
+		try
 		{
-			try
+			Task task;
+			lock (_lock)
 			{
-				Changed = null;
+				if (_isDisposed)
+					return;
 
-				lock (_lock)
-				{
-					// Try to write the rows which could not be written before.
-					if (_pending.Count > 0)
-						WriteRows(new List<object>());
-				}
-			}
-			catch (Exception ex)
-			{
-				Trace.WriteLine("Failed to dispose history." + Environment.NewLine
-					+ ex);
+				// Nothing is appended or read from now on, and so nothing opens the database again.
+				_isDisposed = true;
+				task = _flushTask;
 			}
 
-			// The write-ahead log is merged into the database when the last connection is closed.
-			CloseConnection();
+			Changed = null;
+
+			var isFlushing = task is { IsCompleted: false };
+			task?.Wait();
+
+			lock (_dbLock)
+			{
+				// Try to write the rows which have not been written, unless it failed just now.
+				if (!(isFlushing && _isLastWriteFailed))
+					WritePending(out _, out _);
+
+				// The write-ahead log is merged into the database when the last connection is closed.
+				CloseConnection();
+				_isClosed = true;
+			}
 		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to dispose history." + Environment.NewLine
+				+ ex);
 
-		_isDisposed = true;
+			lock (_dbLock)
+			{
+				CloseConnection();
+				_isClosed = true;
+			}
+		}
 	}
 
 	#endregion
