@@ -231,7 +231,13 @@
 						<DataGridTextColumn Header="Down" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Down, Mode=OneTime}"/>
 						<DataGridTextColumn Header="Up" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Up, Mode=OneTime}"/>
 						<DataGridTextColumn Header="Trigger" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Trigger, Mode=OneTime}"/>
-						<DataGridTextColumn Header="Result" ElementStyle="{StaticResource GridTextStyle}" Binding="{Binding Result, Mode=OneTime}"/>
+						<DataGridTextColumn Header="Result" Binding="{Binding Result, Mode=OneTime}">
+							<DataGridTextColumn.ElementStyle>
+								<Style TargetType="{x:Type TextBlock}" BasedOn="{StaticResource GridTextStyle}">
+									<Setter Property="ToolTip" Value="{Binding ResultDetail, Mode=OneTime}"/>
+								</Style>
+							</DataGridTextColumn.ElementStyle>
+						</DataGridTextColumn>
 					</DataGrid.Columns>
 				</DataGrid>
 			</TabItem>

@@ -484,7 +484,14 @@ internal partial class AppController
 				if (_disposed)
 					return;
 
-				await MeasureConnectedAsync(SpeedTrigger.PostSwitch, interfaceId).ConfigureAwait(false);
+				var sample = await MeasureConnectedAsync(SpeedTrigger.PostSwitch, interfaceId).ConfigureAwait(false);
+
+				// A measurement which could not run (another one was running) or which is not
+				// a finding on the network (the test server failed, aborted) leaves the switch
+				// unchecked and so is repeated as long as the check is due. The record of
+				// the switch expires and so does this repetition.
+				if (((sample is null) || !sample.Valid) && !_disposed && !_isProbing && HasLanding(interfaceId))
+					MeasureAfterSwitch(interfaceId, _retestDelay);
 			}
 			catch (Exception ex)
 			{
@@ -543,7 +550,37 @@ internal partial class AppController
 			switch (action)
 			{
 				case LandingAction.Retest:
+					AppendSwitchEvent(new SwitchEvent
+					{
+						Time = DateTime.UtcNow,
+						InterfaceId = interfaceId,
+						Kind = SwitchKind.Stay,
+						From = landing.ToName,
+						To = string.Empty,
+						FromScore = sample.DownMbps,
+						Reason = string.Format(CultureInfo.InvariantCulture,
+							"{0} measured {1:0.#} Mbps after the switch, worse than {2} ({3:0} Mbps) - testing again in {4:0} s before switching back",
+							landing.ToName, sample.DownMbps ?? 0D, landing.FromName, landing.FromScore ?? 0D, _retestDelay.TotalSeconds)
+					});
+
 					MeasureAfterSwitch(interfaceId, _retestDelay);
+					break;
+
+				case LandingAction.Clear when SwitchPolicy.IsLandingKept(landing, sample):
+					AppendSwitchEvent(new SwitchEvent
+					{
+						Time = DateTime.UtcNow,
+						InterfaceId = interfaceId,
+						Kind = SwitchKind.Stay,
+						From = landing.ToName,
+						To = string.Empty,
+						FromScore = sample.DownMbps,
+						Reason = string.Format(CultureInfo.InvariantCulture,
+							(landing.LowCount > 0)
+								? "Keeping {0}: measured {1:0.#} Mbps at the second test after the switch from {2} ({3:0} Mbps)"
+								: "Keeping {0}: measured {1:0.#} Mbps after the switch from {2} ({3:0} Mbps)",
+							landing.ToName, sample.DownMbps ?? 0D, landing.FromName, landing.FromScore ?? 0D)
+					});
 					break;
 
 				case LandingAction.UplinkDown:
@@ -572,10 +609,31 @@ internal partial class AppController
 
 	private async Task RevertAsync(SwitchLanding landing, SpeedSample sample)
 	{
-		if (_disposed || _isProbing || !EngagesPriority.Value || !Settings.Current.EngagesSpeed)
+		var interfaceId = sample.InterfaceId;
+
+		if (_disposed)
 			return;
 
-		var interfaceId = sample.InterfaceId;
+		var why = (sample.Result is SpeedResult.Ok)
+			? string.Format(CultureInfo.InvariantCulture, "{0} measured {1:0.#} Mbps twice, worse than {2} ({3:0} Mbps)",
+				landing.ToName, sample.DownMbps ?? 0D, landing.FromName, landing.FromScore ?? 0D)
+			: $"{landing.ToName} has no internet";
+
+		if (_isProbing || !EngagesPriority.Value || !Settings.Current.EngagesSpeed)
+		{
+			// The decision is told even though it is not acted on.
+			AppendSwitchEvent(new SwitchEvent
+			{
+				Time = DateTime.UtcNow,
+				InterfaceId = interfaceId,
+				Kind = SwitchKind.Stay,
+				From = landing.ToName,
+				To = string.Empty,
+				FromScore = sample.DownMbps,
+				Reason = $"{why} but switching by speed has been turned off - staying"
+			});
+			return;
+		}
 
 		// The network to switch back to must satisfy the same rule as any other target so that
 		// a network whose signal has become weak is not returned to.
@@ -596,11 +654,6 @@ internal partial class AppController
 
 		if (!string.Equals(current?.Name, landing.ToName, StringComparison.Ordinal))
 			return;
-
-		var why = (sample.Result is SpeedResult.Ok)
-			? string.Format(CultureInfo.InvariantCulture, "{0} measured {1:0.#} Mbps, worse than {2} ({3:0} Mbps)",
-				landing.ToName, sample.DownMbps ?? 0D, landing.FromName, landing.FromScore ?? 0D)
-			: $"{landing.ToName} has no internet";
 
 		if (from is null)
 		{
@@ -654,7 +707,9 @@ internal partial class AppController
 			To = landing.FromName,
 			FromScore = sample.DownMbps,
 			ToScore = landing.FromScore,
-			Reason = $"{why} - switching back"
+			Reason = result
+				? $"{why} - switched back, not trying {landing.ToName} for {SwitchPolicy.RevertCooldown.TotalHours:0} h"
+				: $"{why} - could not switch back to {landing.FromName}"
 		});
 	}
 

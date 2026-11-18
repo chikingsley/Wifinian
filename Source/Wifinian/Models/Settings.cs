@@ -146,15 +146,16 @@ public class Settings : DisposableBase
 	}
 	private int _speedTestInterval = 60; // Default
 
-	private const int MinSpeedTestDailyBudget = 50;
-	private const int MaxSpeedTestDailyBudget = 5000;
+	private const int MinSpeedTestDailyBudget = 0;
+	private const int MaxSpeedTestDailyBudget = 100000;
 
 	/// <summary>
-	/// Daily budget (MB) of data used by automatic speed measurements
+	/// Daily budget (MB) of data used by automatic speed measurements (0 for no limit)
 	/// </summary>
 	/// <remarks>
-	/// The default covers a day of hourly measurements each of which reaches both caps of bytes
-	/// (24 x 40 MB).
+	/// There is no limit by default. A positive value, which a user on a metered connection may
+	/// set, stops automatic measurements for the day (UTC) once that much has been used. A value
+	/// saved by an earlier build (1000 or 500) is loaded as it is and so still limits.
 	/// </remarks>
 	public int SpeedTestDailyBudget
 	{
@@ -163,7 +164,15 @@ public class Settings : DisposableBase
 	}
 	private int _speedTestDailyBudget = DefaultSpeedTestDailyBudget;
 
-	internal const int DefaultSpeedTestDailyBudget = 1000;
+	internal const int DefaultSpeedTestDailyBudget = 0;
+
+	/// <summary>
+	/// Determines whether automatic speed measurements are stopped for the day by the daily budget.
+	/// </summary>
+	/// <param name="budget">Daily budget (MB), 0 or less for no limit</param>
+	/// <param name="bytesToday">Bytes used by speed measurements today</param>
+	internal static bool IsBudgetUsedUp(int budget, long bytesToday) =>
+		(budget > 0) && (bytesToday >= budget * 1_000_000L);
 
 	internal const string DefaultSpeedTestDownloadUrl = "https://speed.cloudflare.com/__down?bytes=25000000";
 	internal const string DefaultSpeedTestUploadUrl = "https://speed.cloudflare.com/__up";

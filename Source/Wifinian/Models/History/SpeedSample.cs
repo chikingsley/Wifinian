@@ -43,7 +43,7 @@ public enum SpeedResult
 /// </summary>
 internal class SpeedSample
 {
-	public const string Header = "Time,InterfaceId,Profile,Bssid,Band,Channel,Signal,LinkRate,GatewayMs,LatencyMs,JitterMs,DownMbps,UpMbps,DownBytes,UpBytes,DurationMs,Trigger,Result,Valid";
+	public const string Header = "Time,InterfaceId,Profile,Bssid,Band,Channel,Signal,LinkRate,GatewayMs,LatencyMs,JitterMs,DownMbps,UpMbps,DownBytes,UpBytes,DurationMs,Trigger,Result,Valid,Detail";
 
 	/// <summary>
 	/// Time (UTC)
@@ -83,6 +83,12 @@ internal class SpeedSample
 	public SpeedResult Result { get; set; }
 
 	/// <summary>
+	/// What went wrong in one line (HTTP status, error of the connection) or what is worth noting
+	/// about a successful measurement (null if nothing)
+	/// </summary>
+	public string Detail { get; set; }
+
+	/// <summary>
 	/// Whether this sample is a true finding on the network and so can be scored
 	/// </summary>
 	/// <remarks>
@@ -111,7 +117,8 @@ internal class SpeedSample
 		CsvLine.Format((int?)DurationMs),
 		Trigger.ToString(),
 		Result.ToString(),
-		CsvLine.Format(Valid));
+		CsvLine.Format(Valid),
+		Detail ?? string.Empty);
 
 	public static bool TryParse(IReadOnlyDictionary<string, int> columns, string[] fields, out SpeedSample sample)
 	{
@@ -153,10 +160,13 @@ internal class SpeedSample
 			UpBytes = CsvLine.ParseLong(CsvLine.GetField(columns, fields, nameof(UpBytes))) ?? 0L,
 			DurationMs = CsvLine.ParseInt(CsvLine.GetField(columns, fields, nameof(DurationMs))) ?? 0,
 			Trigger = trigger,
-			Result = result
+			Result = result,
+			Detail = NullIfEmpty(CsvLine.GetField(columns, fields, nameof(Detail)))
 		};
 		return true;
 	}
+
+	internal static string NullIfEmpty(string value) => string.IsNullOrWhiteSpace(value) ? null : value;
 
 	internal static bool TryParseEnum<TEnum>(string field, out TEnum value) where TEnum : struct
 	{

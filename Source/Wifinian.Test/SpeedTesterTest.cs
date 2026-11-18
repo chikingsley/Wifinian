@@ -120,33 +120,47 @@ public class SpeedTesterTest
 	}
 
 	[TestMethod]
-	public void TestUploadCap()
+	public void TestMeasurementsAreTimeBased()
 	{
-		// The time after warm-up is at least the minimum window even if a sample is late.
 		foreach (var size in new[] { SpeedTestSize.Quick, SpeedTestSize.Full })
 		{
-			var (capTime, capBytes) = SpeedTester.GetUploadCap(size);
-			Assert.IsTrue(capTime - SpeedTester.UploadWarmup >= SpeedTester.UploadMinWindow + 100, size.ToString());
-			Assert.IsTrue(capBytes >= SpeedTester.QuickUploadBytes, size.ToString());
+			var window = SpeedTester.GetMeasureWindow(size);
+			var (downloadTime, downloadBytes) = SpeedTester.GetDownloadCap(size);
+			var (uploadTime, uploadBytes) = SpeedTester.GetUploadCap(size);
+
+			// The time after warm-up is the window, for upload even if a sample is late.
+			Assert.AreEqual(SpeedTester.DownloadWarmup + window, downloadTime, size.ToString());
+			Assert.IsTrue(uploadTime - SpeedTester.UploadWarmup >= window + 100, size.ToString());
+			Assert.IsTrue(uploadTime - SpeedTester.UploadWarmup >= SpeedTester.UploadMinWindow + 100, size.ToString());
+
+			// No cap of bytes ends a measurement: the ceiling is beyond a link of 1 Gbps.
+			Assert.AreEqual(SpeedTester.SafetyBytes, downloadBytes, size.ToString());
+			Assert.AreEqual(SpeedTester.SafetyBytes, uploadBytes, size.ToString());
+			Assert.IsTrue(SpeedTester.SafetyBytes >= 1_000_000_000L / 8 * downloadTime / 1000, size.ToString());
+			Assert.IsTrue(SpeedTester.SafetyBytes >= 1_000_000_000L / 8 * uploadTime / 1000, size.ToString());
 		}
 
+		// Automatic measurements and the test of all networks measure for at least 4 seconds,
+		// the measurement by the user for longer.
+		Assert.IsTrue(SpeedTester.GetMeasureWindow(SpeedTestSize.Quick) >= 4000);
+		Assert.IsTrue(SpeedTester.GetMeasureWindow(SpeedTestSize.Full) >= 8000);
 		Assert.IsTrue(SpeedTester.UploadMinWindow >= 3000);
-		Assert.AreEqual(SpeedTester.QuickUploadBytes, SpeedTester.GetUploadCap(SpeedTestSize.Quick).capBytes);
-		Assert.IsTrue(SpeedTester.GetUploadCap(SpeedTestSize.Full).capBytes >= 40_000_000L);
-
-		// A link of 35 Mbps is still measured over the whole time.
-		Assert.IsTrue(SpeedTester.QuickUploadBytes >= 35_000_000L / 8 * SpeedTester.GetUploadCap(SpeedTestSize.Quick).capTime / 1000);
 	}
 
 	[TestMethod]
-	public void TestDailyBudgetCoversHourlyTests()
+	public void TestNoDailyBudgetByDefault()
 	{
-		// Automatic measurements are quick ones. A day of hourly measurements, each of which
-		// reaches both caps of bytes, must fit in the default daily budget.
-		var bytesPerTest = SpeedTester.QuickDownloadBytes + SpeedTester.QuickUploadBytes;
+		Assert.AreEqual(0, Settings.DefaultSpeedTestDailyBudget);
 
-		Assert.IsTrue(24 * bytesPerTest <= Settings.DefaultSpeedTestDailyBudget * 1_000_000L,
-			$"{24 * bytesPerTest} bytes a day");
+		// Nothing is ever blocked without a budget.
+		Assert.IsFalse(Settings.IsBudgetUsedUp(0, 0L));
+		Assert.IsFalse(Settings.IsBudgetUsedUp(0, long.MaxValue));
+		Assert.IsFalse(Settings.IsBudgetUsedUp(-1, long.MaxValue));
+
+		// A budget set by the user still limits.
+		Assert.IsFalse(Settings.IsBudgetUsedUp(1000, 999_999_999L));
+		Assert.IsTrue(Settings.IsBudgetUsedUp(1000, 1_000_000_000L));
+		Assert.IsTrue(Settings.IsBudgetUsedUp(50, 60_000_000L));
 	}
 
 	#endregion
@@ -258,8 +272,8 @@ public class SpeedTesterTest
 		Assert.IsNotNull(rate);
 		Assert.IsTrue(Math.Abs(rate.Value - expected) <= expected * 0.25, $"Measured {rate.Value:f2} Mbps, expected {expected:f2} Mbps");
 
-		// The measurement lasted for warm-up and the minimum window.
-		Assert.IsTrue(stopwatch.ElapsedMilliseconds >= SpeedTester.UploadWarmup + SpeedTester.UploadMinWindow,
+		// The measurement lasted for warm-up and the whole window regardless of bytes.
+		Assert.IsTrue(stopwatch.ElapsedMilliseconds >= SpeedTester.UploadWarmup + SpeedTester.GetMeasureWindow(SpeedTestSize.Quick),
 			$"Lasted {stopwatch.ElapsedMilliseconds} ms");
 
 		// The bytes counted in total exceed those sent only by what the buffers hold.
@@ -375,7 +389,7 @@ public class SpeedTesterTest
 		{
 			Assert.IsTrue(measuresSpeed);
 			Assert.AreEqual(60, speedTestInterval);
-			Assert.AreEqual(1000, speedTestDailyBudget);
+			Assert.AreEqual(0, speedTestDailyBudget); // No limit
 			Assert.AreEqual(5, scanInterval);
 			Assert.AreEqual("https://speed.cloudflare.com/__down?bytes=25000000", speedTestDownloadUrl);
 			Assert.AreEqual("https://speed.cloudflare.com/__up", speedTestUploadUrl);
@@ -386,10 +400,15 @@ public class SpeedTesterTest
 			settings.SpeedTestInterval = 1000;
 			Assert.AreEqual(240, settings.SpeedTestInterval);
 
-			settings.SpeedTestDailyBudget = 0;
-			Assert.AreEqual(50, settings.SpeedTestDailyBudget);
-			settings.SpeedTestDailyBudget = 100000;
-			Assert.AreEqual(5000, settings.SpeedTestDailyBudget);
+			// The values saved by earlier builds are kept as they are.
+			settings.SpeedTestDailyBudget = 1000;
+			Assert.AreEqual(1000, settings.SpeedTestDailyBudget);
+			settings.SpeedTestDailyBudget = 500;
+			Assert.AreEqual(500, settings.SpeedTestDailyBudget);
+			settings.SpeedTestDailyBudget = -5;
+			Assert.AreEqual(0, settings.SpeedTestDailyBudget);
+			settings.SpeedTestDailyBudget = int.MaxValue;
+			Assert.AreEqual(100000, settings.SpeedTestDailyBudget);
 
 			settings.ScanInterval = -1;
 			Assert.AreEqual(0, settings.ScanInterval);

@@ -336,6 +336,19 @@ internal static class SwitchPolicy
 	public static readonly TimeSpan FailureCooldown = TimeSpan.FromMinutes(10);
 	public static readonly TimeSpan MaxFailureCooldown = TimeSpan.FromHours(2);
 
+	/// <summary>
+	/// Period in which the newest measurement of a network other than the connected one is
+	/// required, in addition to its typical speed, to be faster by the margin
+	/// </summary>
+	/// <remarks>
+	/// The typical speed is a median of up to ten samples and so a network which was fast for
+	/// days and has become slow still looks fast after it was switched to, measured slow twice
+	/// and switched back from. The period of exclusion after switching back is kept in memory
+	/// only and ends in two hours. Without this rule the same switch and switching back would
+	/// be repeated after that period or after this app is started again.
+	/// </remarks>
+	public static readonly TimeSpan RecentPeriod = TimeSpan.FromHours(24);
+
 	#endregion
 
 	/// <summary>
@@ -484,6 +497,21 @@ internal static class SwitchPolicy
 	}
 
 	/// <summary>
+	/// Determines whether a sample measured after an automatic switch, which ended the check of
+	/// the switch, shows that the network switched to is good enough to keep.
+	/// </summary>
+	/// <remarks>
+	/// The check also ends without a finding (its time is over, the sample is of another network,
+	/// the previous network cannot be switched back to), which is not worth telling.
+	/// </remarks>
+	public static bool IsLandingKept(SwitchLanding landing, SpeedSample sample) =>
+		(landing is not null)
+		&& (sample is { Result: SpeedResult.Ok, DownMbps: not null })
+		&& string.Equals(sample.Profile, landing.ToName, StringComparison.Ordinal)
+		&& (landing.FromScore > 0D)
+		&& (sample.DownMbps.Value >= RevertRatio * landing.FromScore.Value);
+
+	/// <summary>
 	/// Decides the profile to connect to.
 	/// </summary>
 	/// <param name="candidates">Profiles allowed to be connected to except avoided ones (this may or may not include connected profile)</param>
@@ -571,6 +599,22 @@ internal static class SwitchPolicy
 
 			var factor = (s.MeanSignal > 0D) ? (p.Signal / s.MeanSignal) : 1D;
 			return s.DownMbps.Value * Math.Min(Math.Max(factor, 0.3D), 1D);
+		}
+
+		// The speed expected of a network to be switched to for speed: its typical speed or, if
+		// lower, what its newest measurement found when that is recent.
+		double? TargetScore(ProfileItem p)
+		{
+			var score = Score(p);
+			if (!score.HasValue)
+				return null;
+
+			var s = Summary(p);
+			if ((s is { LastResult: SpeedResult.Ok, LastDownMbps: not null })
+				&& (context.UtcNow - s.LastTime < RecentPeriod))
+				return Math.Min(score.Value, s.LastDownMbps.Value);
+
+			return score;
 		}
 
 		bool IsEligible(ProfileItem p) => Score(p).HasValue
@@ -816,7 +860,7 @@ internal static class SwitchPolicy
 		// Persistence, budget and pause in traffic required to leave a working network
 		SwitchDecision Leave(ProfileItem target, bool isExploring)
 		{
-			var b = Score(target);
+			var b = isExploring ? Score(target) : TargetScore(target);
 
 			var waiting = !isExploring
 				? $"{target.Name} looks faster ({F0(b.Value)} vs {F0(c)} Mbps)"
@@ -880,8 +924,11 @@ internal static class SwitchPolicy
 
 		// (6) Another profile is faster by the margin.
 		var rankedOthers = Rank(others);
-		var best = rankedOthers.FirstOrDefault(x => Score(x) >= SlowSpeed);
-		if ((best is not null) && IsMarginOk(Score(best).Value, c))
+		var best = rankedOthers
+			.Where(x => TargetScore(x) >= SlowSpeed)
+			.OrderByDescending(x => TargetScore(x).Value) // The order of rank is kept among equals.
+			.FirstOrDefault();
+		if ((best is not null) && IsMarginOk(TargetScore(best).Value, c))
 			return Leave(best, false);
 
 		// (7) Another profile is worth trying.
@@ -892,8 +939,8 @@ internal static class SwitchPolicy
 		// (8) Otherwise
 		state.ClearPending();
 
-		var stayReason = ((best is not null) && (Score(best).Value > c))
-			? $"Staying on {name}: {best.Name} is faster ({F0(Score(best).Value)} vs {F0(c)} Mbps) but not by enough"
+		var stayReason = ((best is not null) && (TargetScore(best).Value > c))
+			? $"Staying on {name}: {best.Name} is faster ({F0(TargetScore(best).Value)} vs {F0(c)} Mbps) but not by enough"
 			: $"Staying on {name}: no better network in range";
 
 		var untested = rankedOthers.FirstOrDefault(x => !Score(x).HasValue);

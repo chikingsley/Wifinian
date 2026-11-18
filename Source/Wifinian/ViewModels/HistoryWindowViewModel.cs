@@ -391,6 +391,12 @@ public class SpeedRow
 	public string Up { get; internal set; }
 	public string Trigger { get; internal set; }
 	public string Result { get; internal set; }
+
+	/// <summary>
+	/// What went wrong or what is worth noting, in full, shown as the tooltip of the result
+	/// (null if nothing)
+	/// </summary>
+	public string ResultDetail { get; internal set; }
 }
 
 /// <summary>
@@ -454,6 +460,32 @@ internal class HistorySnapshot
 {
 	/// <summary>
 	/// Formats the result of a speed measurement for a row.
+	/// </summary>
+	/// <param name="result">Result</param>
+	/// <param name="detail">What went wrong (null if not recorded)</param>
+	/// <returns>
+	/// Result followed, unless the measurement succeeded, by the beginning of what went wrong
+	/// </returns>
+	internal static string FormatResult(SpeedResult result, string detail)
+	{
+		var text = FormatResult(result);
+
+		if ((result is SpeedResult.Ok) || string.IsNullOrWhiteSpace(detail))
+			return text;
+
+		detail = detail.Trim();
+		return (detail.Length <= MaxDetailLength)
+			? $"{text}: {detail}"
+			: $"{text}: {detail.Substring(0, MaxDetailLength)}...";
+	}
+
+	/// <summary>
+	/// Maximum length of what went wrong shown in a row (the tooltip shows it in full)
+	/// </summary>
+	internal const int MaxDetailLength = 70;
+
+	/// <summary>
+	/// Formats the result of a speed measurement.
 	/// </summary>
 	internal static string FormatResult(SpeedResult result) => result switch
 	{
@@ -654,7 +686,8 @@ internal class HistorySnapshot
 					Down = Format(x.DownMbps),
 					Up = Format(x.UpMbps),
 					Trigger = x.Trigger.ToString(),
-					Result = FormatResult(x.Result)
+					Result = FormatResult(x.Result, x.Detail),
+					ResultDetail = string.IsNullOrWhiteSpace(x.Detail) ? null : x.Detail.Trim()
 				})
 				.ToArray(),
 			Decisions = events

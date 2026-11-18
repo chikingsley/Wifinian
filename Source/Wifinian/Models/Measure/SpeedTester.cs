@@ -17,7 +17,7 @@ using Wifinian.Models.History;
 namespace Wifinian.Models.Measure;
 
 /// <summary>
-/// Size of a speed measurement
+/// Size of a speed measurement, which is the time it lasts (no size caps the bytes)
 /// </summary>
 internal enum SpeedTestSize
 {
@@ -48,8 +48,8 @@ internal sealed class SpeedTester
 	private const int BufferSize = 64 * 1024;
 	private const int ConnectionLimit = 8;
 
-	private const int DownloadCount = 4;
-	private const int DownloadWarmup = 1000; // ms
+	internal const int DownloadCount = 4;
+	internal const int DownloadWarmup = 1000; // ms
 	internal const int UploadCount = 3;
 	internal const int UploadWarmup = 1000; // ms
 
@@ -87,36 +87,52 @@ internal sealed class SpeedTester
 	private const double UploadRouteRatio = 0.5;
 
 	/// <summary>
-	/// Gets the caps of upload. The time includes warm-up and is long enough for the minimum
-	/// window after it regardless of the interval of sampling.
+	/// Ceiling of bytes of a transfer in one direction
 	/// </summary>
 	/// <remarks>
-	/// The bytes of a quick measurement, which automatic ones are, are capped as low as those of
-	/// its download so that hourly measurements fit in the daily budget. The cap is reached only
-	/// by a link faster than about 40 Mbps, on which the window after warm-up becomes shorter
-	/// than the minimum (about a second at 80 Mbps).
+	/// This is not a cap which decides the result: every measurement lasts for a fixed time after
+	/// warm-up. It only ends a transfer which, by a defect, would otherwise go on. A link would
+	/// have to be faster than 1.7 Gbps to reach it.
 	/// </remarks>
-	internal static (int capTime, long capBytes) GetUploadCap(SpeedTestSize size) => size switch
+	internal const long SafetyBytes = 2_000_000_000L;
+
+	/// <summary>
+	/// Time (ms) to wait before the download is tried once more when it got no byte although
+	/// internet access and the test server were confirmed just before
+	/// </summary>
+	internal const int RetryDelay = 3000;
+
+	/// <summary>
+	/// Maximum length of the detail of a measurement
+	/// </summary>
+	internal const int MaxDetailLength = 300;
+
+	/// <summary>
+	/// Gets the time (ms) after warm-up over which speed is measured in each direction.
+	/// </summary>
+	/// <remarks>
+	/// Measurements were once ended by caps of bytes (20 MB), which left a window of about
+	/// a second on a link of 100 Mbps and made the results noisy. The window is now the same
+	/// on every link and so the data used is proportional to the speed of the link.
+	/// </remarks>
+	internal static int GetMeasureWindow(SpeedTestSize size) => size switch
 	{
-		SpeedTestSize.Full => (UploadWarmup + 5000 + 2 * SampleInterval, 80_000_000L),
-		_ => (UploadWarmup + UploadMinWindow + 2 * SampleInterval, QuickUploadBytes)
+		SpeedTestSize.Full => 8000,
+		_ => 4000
 	};
 
 	/// <summary>
-	/// Maximum bytes uploaded by a quick measurement
+	/// Gets the limits of upload. The time includes warm-up and is long enough for the window
+	/// after it regardless of the interval of sampling.
 	/// </summary>
-	internal const long QuickUploadBytes = 20_000_000L;
+	internal static (int capTime, long capBytes) GetUploadCap(SpeedTestSize size) =>
+		(UploadWarmup + GetMeasureWindow(size) + 2 * SampleInterval, SafetyBytes);
 
 	/// <summary>
-	/// Maximum bytes downloaded by a quick measurement
+	/// Gets the limits of download. The time includes warm-up.
 	/// </summary>
-	internal const long QuickDownloadBytes = 20_000_000L;
-
-	private static (int capTime, long capBytes) GetDownloadCap(SpeedTestSize size) => size switch
-	{
-		SpeedTestSize.Full => (8000, 50_000_000L),
-		_ => (5000, QuickDownloadBytes)
-	};
+	internal static (int capTime, long capBytes) GetDownloadCap(SpeedTestSize size) =>
+		(DownloadWarmup + GetMeasureWindow(size), SafetyBytes);
 
 	#endregion
 
@@ -170,6 +186,9 @@ internal sealed class SpeedTester
 			if ((networkInterface is not { OperationalStatus: OperationalStatus.Up }) || (localAddress is null))
 			{
 				sample.Result = SpeedResult.Error;
+				sample.Detail = (networkInterface is null)
+					? "The adapter was not found"
+					: $"The adapter is {networkInterface.OperationalStatus} and has {((localAddress is null) ? "no IPv4 address" : "an address")}";
 				return sample;
 			}
 
@@ -219,6 +238,7 @@ internal sealed class SpeedTester
 					{
 						Trace.WriteLine($"Connectivity check failed through {networkInterface.Name} ({localAddress}) but succeeded without binding.");
 						sample.Result = SpeedResult.RouteMismatch;
+						sample.Detail = $"The connectivity check failed through {networkInterface.Name} ({localAddress}) but succeeded without binding";
 					}
 					return sample;
 			}
@@ -231,6 +251,7 @@ internal sealed class SpeedTester
 			if (remoteAddress is null)
 			{
 				sample.Result = SpeedResult.EndpointFailed;
+				sample.Detail = $"Could not resolve {downloadUri.Host}";
 				return sample;
 			}
 
@@ -239,6 +260,7 @@ internal sealed class SpeedTester
 			if (latency is null)
 			{
 				sample.Result = SpeedResult.EndpointFailed;
+				sample.Detail = $"Could not connect to {remoteAddress}:{downloadUri.Port} from {localAddress}";
 				return sample;
 			}
 
@@ -250,43 +272,42 @@ internal sealed class SpeedTester
 			var oldReceived = GetReceivedBytes();
 
 			var (downloadCapTime, downloadCapBytes) = GetDownloadCap(size);
-			var downloadCounter = new Counter();
-			try
-			{
-				sample.DownMbps = Round(await TransferAsync(
-					(stop) => DownloadAsync(downloadUri, Bind, downloadCounter, stop),
-					DownloadCount,
-					downloadCounter,
-					DownloadWarmup,
-					downloadCapTime,
-					downloadCapBytes,
-					() => LinkInspector.GetBytes(networkInterface).received,
-					token).ConfigureAwait(false), 2);
-			}
-			finally
-			{
-				// The bytes are recorded even if aborted because they count for the daily budget.
-				sample.DownBytes = downloadCounter.Value;
-			}
 
-			if ((sample.DownBytes == 0L) || (sample.DownMbps is null))
+			var (downMbps, downBytes, downDetail) = await MeasureDownloadAsync(
+				downloadUri,
+				Bind,
+				downloadCapTime,
+				downloadCapBytes,
+				() => LinkInspector.GetBytes(networkInterface).received,
+				RetryDelay,
+				token,
+				x => sample.DownBytes = x).ConfigureAwait(false);
+
+			sample.DownBytes = downBytes;
+			sample.Detail = downDetail;
+
+			if ((downBytes == 0L) || (downMbps is null))
 			{
-				sample.DownMbps = null;
 				sample.Result = SpeedResult.EndpointFailed;
 				return sample;
 			}
+
+			sample.DownMbps = Round(downMbps, 2);
 
 			var newBytes = LinkInspector.GetBytes(networkInterface);
 			if (newBytes.received - oldBytes.received < RouteRatio * sample.DownBytes)
 			{
 				TraceCarrier(networkInterface, oldReceived, GetReceivedBytes(), sample.DownBytes);
+				sample.DownMbps = null;
 				sample.Result = SpeedResult.RouteMismatch;
+				sample.Detail = Join(sample.Detail, $"The download of {sample.DownBytes} bytes was not received through {networkInterface.Name}, which received {newBytes.received - oldBytes.received} bytes");
 				return sample;
 			}
 
 			// (6) Upload
 			var (uploadCapTime, uploadCapBytes) = GetUploadCap(size);
 			var uploadCounter = new Counter();
+			var uploadNote = new FailureNote();
 			var oldSent = LinkInspector.GetBytes(networkInterface).sent;
 			try
 			{
@@ -296,15 +317,21 @@ internal sealed class SpeedTester
 					uploadCounter,
 					uploadCapTime,
 					uploadCapBytes,
-					token).ConfigureAwait(false);
+					token,
+					uploadNote).ConfigureAwait(false);
 
 				sample.UpMbps = (uploadCounter.Value > 0L) ? Round(upMbps, 2) : null;
+
+				if (sample.UpMbps is null)
+					sample.Detail = Join(sample.Detail, $"Upload not measured: {uploadNote.Value ?? ((uploadCounter.Value > 0L) ? "it ended too early" : "no byte was sent")}");
 			}
 			catch (Exception ex) when (ex is not OperationCanceledException)
 			{
 				// Failure of upload alone leaves the upload speed blank.
 				Trace.WriteLine("Failed to measure upload speed." + Environment.NewLine
 					+ ex);
+
+				sample.Detail = Join(sample.Detail, $"Upload failed: {Describe(ex)}");
 			}
 			finally
 			{
@@ -320,6 +347,7 @@ internal sealed class SpeedTester
 				{
 					Trace.WriteLine($"Upload of {sample.UpBytes} bytes was not sent through {networkInterface.Name}. It sent {sent} bytes.");
 					sample.UpMbps = null;
+					sample.Detail = Join(sample.Detail, $"The upload of {sample.UpBytes} bytes was not sent through {networkInterface.Name}, which sent {sent} bytes");
 				}
 			}
 
@@ -338,6 +366,7 @@ internal sealed class SpeedTester
 				+ ex);
 
 			sample.Result = SpeedResult.Error;
+			sample.Detail = Join(sample.Detail, Describe(ex));
 			return sample;
 		}
 		finally
@@ -537,14 +566,14 @@ internal sealed class SpeedTester
 	}
 
 	/// <summary>
-	/// Runs parallel transfers until a cap is reached and computes the rate (Mbps).
+	/// Runs parallel transfers for a fixed time from the first byte and computes the rate (Mbps).
 	/// </summary>
 	/// <param name="work">Function to run a transfer until stopped (it must not throw)</param>
 	/// <param name="count">Number of parallel transfers</param>
 	/// <param name="counter">Counter of bytes to which the transfers add</param>
 	/// <param name="warmupTime">Time (ms) from the first byte to be discarded</param>
-	/// <param name="capTime">Maximum time (ms) from the first byte</param>
-	/// <param name="capBytes">Maximum bytes</param>
+	/// <param name="capTime">Time (ms) from the first byte after which the transfers are stopped</param>
+	/// <param name="capBytes">Ceiling of bytes (a safety limit which no real link is expected to reach)</param>
 	/// <param name="getAdapterBytes">Function to get the counter of the network interface</param>
 	/// <param name="token">Cancellation token</param>
 	/// <param name="minWindow">Minimum time (ms) over which the rate must be measured unless the cap of bytes is reached</param>
@@ -701,13 +730,173 @@ internal sealed class SpeedTester
 		}
 	}
 
-	private static async Task DownloadAsync(Uri uri, BindIPEndPoint bind, Counter counter, CancellationToken stop)
+	/// <summary>
+	/// First reason why a transfer failed, shared by parallel transfers
+	/// </summary>
+	internal sealed class FailureNote
+	{
+		private string _value;
+
+		public string Value => Volatile.Read(ref _value);
+
+		/// <summary>
+		/// Sets the reason unless one has been set already.
+		/// </summary>
+		public void Set(string value)
+		{
+			if (!string.IsNullOrWhiteSpace(value))
+				Interlocked.CompareExchange(ref _value, value, null);
+		}
+	}
+
+	/// <summary>
+	/// Describes an exception of a request in one line: the HTTP status if the server answered,
+	/// the status of the request and the innermost cause otherwise.
+	/// </summary>
+	internal static string Describe(Exception ex)
+	{
+		if (ex is null)
+			return null;
+
+		while ((ex is AggregateException) && (ex.InnerException is not null))
+			ex = ex.InnerException;
+
+		string text;
+		if (ex is WebException web)
+		{
+			if (web.Response is HttpWebResponse response)
+			{
+				text = $"HTTP {(int)response.StatusCode} {response.StatusDescription}";
+			}
+			else
+			{
+				Exception inner = web.InnerException;
+				while (inner?.InnerException is not null)
+					inner = inner.InnerException;
+
+				text = $"{web.Status}: {web.Message}"
+					+ ((inner is not null) ? $" ({Name(inner)}: {inner.Message})" : string.Empty);
+			}
+		}
+		else
+		{
+			text = $"{Name(ex)}: {ex.Message}";
+		}
+		return Trim(text);
+
+		static string Name(Exception x) => (x is SocketException socket)
+			? $"SocketException {socket.SocketErrorCode}"
+			: x.GetType().Name;
+	}
+
+	private static string Trim(string text)
+	{
+		if (string.IsNullOrWhiteSpace(text))
+			return null;
+
+		text = string.Join(" ", text.Split(new[] { '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries)).Trim();
+		return (text.Length <= MaxDetailLength) ? text : text.Substring(0, MaxDetailLength);
+	}
+
+	private static string Join(string first, string second)
+	{
+		if (string.IsNullOrWhiteSpace(first))
+			return Trim(second);
+
+		if (string.IsNullOrWhiteSpace(second))
+			return Trim(first);
+
+		return Trim($"{first}; {second}");
+	}
+
+	/// <summary>
+	/// Measures download speed (Mbps) by receiving from a URL through parallel connections and,
+	/// if not a single byte comes, tries once more after a delay.
+	/// </summary>
+	/// <param name="uri">URL to download from</param>
+	/// <param name="bind">Function to bind the connections to a local address (null not to bind)</param>
+	/// <param name="capTime">Time (ms) from the first byte including warm-up</param>
+	/// <param name="capBytes">Ceiling of bytes</param>
+	/// <param name="getAdapterBytes">Function to get the counter of the network interface</param>
+	/// <param name="retryDelay">Time (ms) to wait before the second attempt</param>
+	/// <param name="token">Cancellation token</param>
+	/// <param name="reportBytes">Action to be given the bytes received by an attempt when it ends, even by cancellation</param>
+	/// <returns>Rate (Mbps), received bytes and what went wrong if anything did</returns>
+	/// <remarks>
+	/// A download which got nothing right after the connectivity check and the connections to
+	/// the same server succeeded was seen twice in a row just after the adapter moved to another
+	/// network (in 0.1 to 0.2 seconds, far sooner than any timeout). Every request opens its own
+	/// connection (no keep-alive, a connection group of its own which is closed afterwards) and
+	/// so a connection left from the previous network is not what failed. What failed is given
+	/// in the detail from now on: the HTTP status if the server refused (e.g. 403, 429) or
+	/// the error of the connection otherwise.
+	/// </remarks>
+	internal static async Task<(double? mbps, long bytes, string detail)> MeasureDownloadAsync(
+		Uri uri,
+		BindIPEndPoint bind,
+		int capTime,
+		long capBytes,
+		Func<long> getAdapterBytes,
+		int retryDelay,
+		CancellationToken token,
+		Action<long> reportBytes = null)
+	{
+		string firstFailure = null;
+
+		for (int attempt = 0; ; attempt++)
+		{
+			var counter = new Counter();
+			var note = new FailureNote();
+			double? mbps;
+			try
+			{
+				mbps = await TransferAsync(
+					(stop) => DownloadAsync(uri, bind, counter, stop, note),
+					DownloadCount,
+					counter,
+					DownloadWarmup,
+					capTime,
+					capBytes,
+					getAdapterBytes,
+					token).ConfigureAwait(false);
+			}
+			finally
+			{
+				// The bytes are reported even if aborted because they are data used.
+				reportBytes?.Invoke(counter.Value);
+			}
+
+			if (counter.Value > 0L)
+			{
+				return (mbps, counter.Value, (firstFailure is not null)
+					? Trim($"Download worked at the second attempt; the first got no byte: {firstFailure}")
+					: null);
+			}
+
+			var failure = note.Value ?? $"no response within {RequestTimeout / 1000} s";
+
+			if (attempt >= 1)
+			{
+				return (null, 0L, string.Equals(firstFailure, failure, StringComparison.Ordinal)
+					? Trim($"Download got no byte in two attempts: {failure}")
+					: Trim($"Download got no byte in two attempts: {firstFailure}; then {failure}"));
+			}
+
+			firstFailure = failure;
+
+			Trace.WriteLine($"Download of speed measurement got no byte ({failure}). It is tried once more in {retryDelay} ms.");
+
+			await Task.Delay(retryDelay, token).ConfigureAwait(false);
+		}
+	}
+
+	private static async Task DownloadAsync(Uri uri, BindIPEndPoint bind, Counter counter, CancellationToken stop, FailureNote note = null)
 	{
 		try
 		{
 			var buffer = new byte[BufferSize];
 
-			// If the content is smaller than the cap, it is requested repeatedly.
+			// If the content ends before the time is up, it is requested again.
 			while (!stop.IsCancellationRequested)
 			{
 				long received = 0L;
@@ -727,7 +916,10 @@ internal sealed class SpeedTester
 					using (var stream = response.GetResponseStream())
 					{
 						if (response.StatusCode != HttpStatusCode.OK)
+						{
+							note?.Set($"HTTP {(int)response.StatusCode} {response.StatusDescription}");
 							return;
+						}
 
 						int read;
 						while ((read = await stream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0)
@@ -750,13 +942,22 @@ internal sealed class SpeedTester
 				}
 
 				if (received == 0L)
+				{
+					note?.Set("HTTP 200 with no content");
 					return;
+				}
 			}
 		}
 		catch (Exception ex)
 		{
-			// An aborted request comes here.
+			// An aborted request comes here. It is not a failure if aborted to stop the transfer.
 			Debug.WriteLine($"Download ended. {ex.Message}");
+
+			if (!stop.IsCancellationRequested)
+				note?.Set(Describe(ex));
+
+			if (ex is WebException { Response: not null } web)
+				web.Response.Dispose();
 		}
 	}
 
@@ -766,9 +967,10 @@ internal sealed class SpeedTester
 	/// <param name="uri">URL which accepts a POST request</param>
 	/// <param name="localAddress">Local address to which the connections are bound (null not to bind)</param>
 	/// <param name="counter">Counter of bytes to which the uploaded bytes are added</param>
-	/// <param name="capTime">Maximum time (ms) from the first byte including warm-up</param>
-	/// <param name="capBytes">Maximum bytes</param>
+	/// <param name="capTime">Time (ms) from the first byte including warm-up</param>
+	/// <param name="capBytes">Ceiling of bytes</param>
 	/// <param name="token">Cancellation token</param>
+	/// <param name="note">Note to which the first reason of failure is set</param>
 	/// <returns>Rate (Mbps) if measured over the minimum window, null otherwise</returns>
 	/// <remarks>
 	/// The rate is that of the bytes which left the send buffers of the sockets, which are small
@@ -781,14 +983,18 @@ internal sealed class SpeedTester
 		Counter counter,
 		int capTime,
 		long capBytes,
-		CancellationToken token)
+		CancellationToken token,
+		FailureNote note = null)
 	{
 		var remoteAddress = await ResolveAsync(uri.Host, token).ConfigureAwait(false);
 		if (remoteAddress is null)
+		{
+			note?.Set($"Could not resolve {uri.Host}");
 			return null;
+		}
 
 		return await TransferAsync(
-			(stop) => UploadAsync(uri, localAddress, remoteAddress, counter, stop),
+			(stop) => UploadAsync(uri, localAddress, remoteAddress, counter, stop, note),
 			UploadCount,
 			counter,
 			UploadWarmup,
@@ -799,7 +1005,7 @@ internal sealed class SpeedTester
 			UploadMinWindow).ConfigureAwait(false);
 	}
 
-	private static async Task UploadAsync(Uri uri, IPAddress localAddress, IPAddress remoteAddress, Counter counter, CancellationToken stop)
+	private static async Task UploadAsync(Uri uri, IPAddress localAddress, IPAddress remoteAddress, Counter counter, CancellationToken stop, FailureNote note = null)
 	{
 		try
 		{
@@ -872,6 +1078,9 @@ internal sealed class SpeedTester
 				{
 					// A closed socket comes here.
 					Debug.WriteLine($"Upload connection ended. {ex.Message}");
+
+					if (!stop.IsCancellationRequested)
+						note?.Set(Describe(ex));
 				}
 				finally
 				{

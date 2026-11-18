@@ -296,7 +296,8 @@ internal partial class AppController
 						break;
 				}
 
-				if (History.GetBytesToday() >= Settings.Current.SpeedTestDailyBudget * 1_000_000L)
+				// There is no daily budget unless the user set one.
+				if (Settings.IsBudgetUsedUp(Settings.Current.SpeedTestDailyBudget, History.GetBytesToday()))
 					return null;
 			}
 
@@ -509,6 +510,8 @@ internal partial class AppController
 			{
 				History.AppendSpeed(sample);
 				ApplySummary(profile);
+
+				RecordMeasureFailure(sample);
 			}
 		}
 		finally
@@ -526,6 +529,45 @@ internal partial class AppController
 		}
 
 		return (sample, isRecorded);
+	}
+
+	/// <summary>
+	/// Records a measurement which failed for a reason other than the network itself, or which
+	/// needed a second attempt, to the operation log so that it can be explained afterwards.
+	/// </summary>
+	/// <remarks>This method never throws an exception.</remarks>
+	private static void RecordMeasureFailure(SpeedSample sample)
+	{
+		try
+		{
+			var text = GetMeasureFailureText(sample);
+			if (text is not null)
+				Logger.RecordOperation(text);
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to record a failed speed measurement." + Environment.NewLine
+				+ ex);
+		}
+	}
+
+	/// <summary>
+	/// Gets the line of the operation log for a measurement.
+	/// </summary>
+	/// <returns>Line if the measurement is worth a line, null otherwise</returns>
+	internal static string GetMeasureFailureText(SpeedSample sample)
+	{
+		if (sample is null)
+			return null;
+
+		var isFailed = sample.Result is SpeedResult.EndpointFailed or SpeedResult.RouteMismatch or SpeedResult.Error;
+		if (!isFailed && !((sample.Result is SpeedResult.Ok) && !string.IsNullOrWhiteSpace(sample.Detail)))
+			return null;
+
+		return $"Speed test of {sample.Profile} ({sample.Trigger}) ended as {sample.Result} after {sample.DurationMs} ms"
+			+ $" (latency {(sample.LatencyMs.HasValue ? sample.LatencyMs.Value.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + " ms" : "not measured")},"
+			+ $" {sample.DownBytes} bytes down, {sample.UpBytes} bytes up): "
+			+ (string.IsNullOrWhiteSpace(sample.Detail) ? "no detail" : sample.Detail);
 	}
 
 	/// <summary>

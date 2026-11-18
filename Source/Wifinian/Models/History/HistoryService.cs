@@ -324,7 +324,7 @@ internal class HistoryService : IDisposable
 	/// <summary>
 	/// Version of the schema (PRAGMA user_version) this class writes
 	/// </summary>
-	internal const int SchemaVersion = 2;
+	internal const int SchemaVersion = 3;
 
 	/// <summary>
 	/// Scripts to upgrade the schema, the element of index N upgrading version N to N+1
@@ -405,7 +405,12 @@ internal class HistoryService : IDisposable
 		@"UPDATE speed SET up_mbps = NULL
 			WHERE up_mbps IS NOT NULL
 			AND up_bytes < 40000000
-			AND up_bytes < up_mbps * 125000 * 2.7;"
+			AND up_bytes < up_mbps * 125000 * 2.7;",
+
+		// 2 -> 3
+		// What went wrong in a measurement (HTTP status, error of the connection), which was
+		// recorded nowhere and so a failed measurement could not be explained afterwards.
+		@"ALTER TABLE speed ADD COLUMN detail TEXT;"
 	};
 
 	private const string SignalTable = "signal";
@@ -420,7 +425,7 @@ internal class HistoryService : IDisposable
 	private static readonly string[] _speedColumns =
 	{
 		"time", "interface_id", "profile", "bssid", "band", "channel", "signal", "link_rate", "gateway_ms", "latency_ms", "jitter_ms",
-		"down_mbps", "up_mbps", "down_bytes", "up_bytes", "duration_ms", "trigger", "result", "valid"
+		"down_mbps", "up_mbps", "down_bytes", "up_bytes", "duration_ms", "trigger", "result", "valid", "detail"
 	};
 
 	private static readonly string[] _eventColumns =
@@ -989,7 +994,8 @@ internal class HistoryService : IDisposable
 		sample.DurationMs,
 		sample.Trigger.ToString(),
 		sample.Result.ToString(),
-		sample.Valid ? 1 : 0
+		sample.Valid ? 1 : 0,
+		SpeedSample.NullIfEmpty(sample.Detail)
 	};
 
 	private static object[] GetValues(SwitchEvent switchEvent) => new object[]
@@ -1177,7 +1183,8 @@ internal class HistoryService : IDisposable
 			UpBytes = GetLong(reader, 14) ?? 0L,
 			DurationMs = (int)(GetLong(reader, 15) ?? 0L),
 			Trigger = trigger,
-			Result = result
+			Result = result,
+			Detail = SpeedSample.NullIfEmpty(GetString(reader, 19))
 		};
 	}
 

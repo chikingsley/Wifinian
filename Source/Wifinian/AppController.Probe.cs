@@ -23,7 +23,27 @@ internal partial class AppController
 	private static readonly TimeSpan _probeSettleDelay = TimeSpan.FromSeconds(3);
 	private static readonly TimeSpan _probeLoadTimeout = TimeSpan.FromSeconds(5);
 	private static readonly TimeSpan _probeFreshTimeout = TimeSpan.FromSeconds(8);
-	private static readonly TimeSpan _probeCloseTimeout = TimeSpan.FromSeconds(15);
+
+	/// <summary>
+	/// Time given, when this app is closed, to the test to end by itself or at least to ask for
+	/// the originally connected network
+	/// </summary>
+	/// <remarks>
+	/// After this time the closing thread asks for that network by itself. Closing must not take
+	/// long: Windows ends a process which does not finish within several seconds at sign-out.
+	/// </remarks>
+	private static readonly TimeSpan _probeCloseTimeout = TimeSpan.FromSeconds(3);
+
+	/// <summary>
+	/// Time given, when this app is closed, to the connection asked for to complete so that
+	/// the outcome can be recorded
+	/// </summary>
+	/// <remarks>
+	/// The request itself is carried out by Windows and so goes on after this app has ended.
+	/// </remarks>
+	private static readonly TimeSpan _probeCloseGrace = TimeSpan.FromSeconds(3);
+
+	private static readonly TimeSpan _probeCloseLoadTimeout = TimeSpan.FromSeconds(2);
 	private static readonly TimeSpan _probeMeasureWait = TimeSpan.FromSeconds(10);
 	private static readonly TimeSpan _probeRetryDelay = TimeSpan.FromSeconds(3);
 	private static readonly TimeSpan _probePollInterval = TimeSpan.FromMilliseconds(500);
@@ -61,6 +81,69 @@ internal partial class AppController
 	/// Command to test all networks in range or, while the test is running, to cancel it
 	/// </summary>
 	public ReactiveCommand ProbeCommand { get; private set; }
+
+	/// <summary>
+	/// How a test of networks of an interface ended
+	/// </summary>
+	internal enum ProbeEnd
+	{
+		Completed = 0,
+
+		/// <summary>
+		/// Stopped by the command (the measurement in progress was finished)
+		/// </summary>
+		Canceled,
+
+		/// <summary>
+		/// The user connected or disconnected during the test
+		/// </summary>
+		Interrupted,
+
+		/// <summary>
+		/// This app was closed during the test
+		/// </summary>
+		Closing
+	}
+
+	/// <summary>
+	/// Where the interface was left after a test of networks
+	/// </summary>
+	internal enum ProbeReturn
+	{
+		/// <summary>
+		/// The test never left the originally connected network
+		/// </summary>
+		Unchanged = 0,
+
+		Restored,
+		Failed,
+
+		/// <summary>
+		/// The user took over the connection and so it is left as it is
+		/// </summary>
+		LeftToUser,
+
+		NotConnectedBefore,
+
+		/// <summary>
+		/// The connection was asked for on closing and its completion was not waited for
+		/// </summary>
+		RequestedOnClosing
+	}
+
+	/// <summary>
+	/// What is to be restored by the test of networks in progress
+	/// </summary>
+	private sealed class ProbeRestore
+	{
+		public Guid InterfaceId { get; set; }
+		public ProfileItem Original { get; set; }
+		public SwitchKind Kind { get; set; }
+	}
+
+	private ProbeRestore _probeRestore;
+	private int _restoreIssued; // 1 once the connection to the original network has been asked for
+	private int _closeRecorded; // 1 once the end of the test has been recorded on closing
 
 	private CancellationTokenSource _probeCancellation;
 	private volatile bool _isProbeInterrupted;
@@ -132,13 +215,17 @@ internal partial class AppController
 	}
 
 	/// <summary>
-	/// Ends the running test of networks when this app is closed and waits, for a limited time,
-	/// for the originally connected network to be restored.
+	/// Ends the running test of networks when this app is closed and makes sure, within a limited
+	/// time, that the originally connected network has been asked for.
 	/// </summary>
 	/// <remarks>
-	/// Without this wait, closing this app during the test would leave the machine on the network
-	/// being tested. The test runs on thread pool threads and so the calling thread can wait.
-	/// This method never throws an exception.
+	/// Without this, closing this app (the menu, sign-out, shutdown) during a test of all networks
+	/// or a test when idle would leave the machine on the network being tested. The test is
+	/// canceled and normally asks for the original network by itself within a second or two.
+	/// If it has not done so in time (it can be in the middle of a connection, which is waited
+	/// for up to 10 seconds), this thread asks for that network. A connection asked for is
+	/// carried out by Windows even after this app has ended. The test runs on thread pool
+	/// threads and so the calling thread can wait. This method never throws an exception.
 	/// </remarks>
 	private void CloseProbe()
 	{
@@ -154,14 +241,111 @@ internal partial class AppController
 			// The measurement of the network being tested is of no use any longer.
 			CancelMeasure();
 
-			if (!SpinWait.SpinUntil(() => Volatile.Read(ref _probeCount) == 0, _probeCloseTimeout))
-				Trace.WriteLine("The test of networks did not end in time on closing.");
+			bool IsEnded() => Volatile.Read(ref _probeCount) == 0;
+
+			SpinWait.SpinUntil(() => IsEnded() || (Volatile.Read(ref _restoreIssued) != 0), _probeCloseTimeout);
+			if (IsEnded())
+				return;
+
+			var pending = Volatile.Read(ref _probeRestore);
+
+			// The test has neither ended nor asked for the original network yet.
+			Task<bool> connectTask = null;
+			if ((pending?.Original is not null)
+				&& !_isProbeInterrupted
+				&& (Interlocked.CompareExchange(ref _restoreIssued, 1, 0) == 0))
+			{
+				var original = pending.Original;
+				connectTask = Task.Run(() => ConnectNetworkAsync(original, false));
+			}
+
+			// The connection asked for, by the test or by this thread, is given a moment to complete.
+			if (connectTask is not null)
+			{
+				try
+				{
+					connectTask.Wait(_probeCloseGrace);
+				}
+				catch (Exception ex)
+				{
+					Trace.WriteLine("Failed to return to the original network on closing." + Environment.NewLine
+						+ ex);
+				}
+
+				// The exception of a task left behind must be observed.
+				_ = connectTask.ContinueWith(x => { _ = x.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+			}
+			else
+			{
+				SpinWait.SpinUntil(IsEnded, _probeCloseGrace);
+			}
+
+			if (IsEnded())
+				return;
+
+			// The test could not record its end in time and so it is recorded here.
+			if ((pending is not null) && (Interlocked.CompareExchange(ref _closeRecorded, 1, 0) == 0))
+			{
+				var isIssued = (Volatile.Read(ref _restoreIssued) != 0);
+				var isConnected = (connectTask is { Status: TaskStatus.RanToCompletion, Result: true });
+
+				var reason = (pending.Original is null)
+					? "Test ended by closing this app, no network was connected before"
+					: isConnected
+						? $"Test ended by closing this app, back on {pending.Original.Name}"
+						: isIssued
+							? $"Test ended by closing this app, returning to {pending.Original.Name} (asked for, not confirmed)"
+							: $"Test ended by closing this app, the connection was changed meanwhile and is left as it is";
+
+				AppendProbeEvent(pending.InterfaceId, pending.Kind, null, pending.Original?.Name, reason);
+				Logger.RecordOperation(reason + ".");
+			}
+
+			Trace.WriteLine("The test of networks did not end in time on closing.");
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to end the test of networks on closing." + Environment.NewLine
 				+ ex);
 		}
+	}
+
+	/// <summary>
+	/// Gets the sentence which tells how a test of networks of an interface ended.
+	/// </summary>
+	/// <param name="total">Number of networks to be tested</param>
+	/// <param name="tested">Names of the networks which gave a finding (speed or no internet access)</param>
+	/// <param name="notTested">Names of the networks attempted which gave none (not connected, no address, failed measurement)</param>
+	/// <param name="original">Name of the network connected before the test (null if none)</param>
+	/// <param name="end">How the test ended</param>
+	/// <param name="result">Where the interface was left</param>
+	internal static string GetProbeSummary(int total, IReadOnlyList<string> tested, IReadOnlyList<string> notTested, string original, ProbeEnd end, ProbeReturn result)
+	{
+		var count = tested?.Count ?? 0;
+		var networks = (total == 1) ? "1 network" : $"{total} networks";
+
+		var head = end switch
+		{
+			ProbeEnd.Canceled => $"Test stopped after {count} of {networks}",
+			ProbeEnd.Interrupted => $"Test interrupted after {count} of {networks}",
+			ProbeEnd.Closing => $"Test ended by closing this app after {count} of {networks}",
+			_ => (count == total) ? $"Tested {networks}" : $"Tested {count} of {networks}"
+		};
+
+		if (notTested is { Count: > 0 })
+			head += $" (could not test {string.Join(", ", notTested)})";
+
+		var tail = result switch
+		{
+			ProbeReturn.Restored => $"back on {original}",
+			ProbeReturn.Failed => $"could not return to {original}",
+			ProbeReturn.LeftToUser => "the connection was changed meanwhile and is left as it is",
+			ProbeReturn.NotConnectedBefore => "no network was connected before",
+			ProbeReturn.RequestedOnClosing => $"returning to {original} (asked for, not confirmed)",
+			_ => (original is not null) ? $"still on {original}" : "no network was connected before"
+		};
+
+		return $"{head}, {tail}";
 	}
 
 	/// <summary>
@@ -352,6 +536,10 @@ internal partial class AppController
 
 		ProfileItem original = null;
 		var isChanged = false;
+		var isStarted = false;
+		var total = 0;
+		var tested = new List<string>();
+		var notTested = new List<string>();
 		try
 		{
 			// The connected profile to be restored and the profiles which require connection are
@@ -380,6 +568,14 @@ internal partial class AppController
 			// What was pending on the interface is no longer valid after the test.
 			ClearPendingSwitch(interfaceId);
 
+			total = targets.Count;
+			isStarted = true;
+
+			// From this point, closing this app knows what to return to.
+			Interlocked.Exchange(ref _restoreIssued, 0);
+			Interlocked.Exchange(ref _closeRecorded, 0);
+			Volatile.Write(ref _probeRestore, new ProbeRestore { InterfaceId = interfaceId, Original = original, Kind = kind });
+
 			AppendProbeEvent(interfaceId, kind, original?.Name, null,
 				(targets.Count == 1) ? "Testing 1 network" : $"Testing {targets.Count} networks");
 
@@ -406,6 +602,7 @@ internal partial class AppController
 					var failure = await WaitForLinkAsync(target, _probeLinkTimeout - stopwatch.Elapsed, cancellationToken).ConfigureAwait(false);
 					if (failure is not null)
 					{
+						notTested.Add(target.Name);
 						RecordNotTested(target, trigger, original, failure, stopwatch.Elapsed);
 						continue;
 					}
@@ -418,13 +615,27 @@ internal partial class AppController
 				// The measurement requires that the connection is reflected to the profiles.
 				if (!await WaitForConnectedAsync(target, cancellationToken).ConfigureAwait(false))
 				{
+					notTested.Add(target.Name);
 					RecordNotTested(target, trigger, original, $"Could not test {target.Name}", measureStopwatch.Elapsed);
 					continue;
 				}
 
 				var (sample, _) = await MeasureProfileAsync(target, trigger, SpeedTestSize.Quick, false, _probeMeasureWait, isProbe: true).ConfigureAwait(false);
 				if (sample is null)
+				{
+					notTested.Add(target.Name);
 					RecordNotTested(target, trigger, original, $"Could not test {target.Name}", measureStopwatch.Elapsed);
+				}
+				else if (sample.Valid)
+				{
+					tested.Add(target.Name);
+				}
+				else if (sample.Result is not SpeedResult.Aborted)
+				{
+					// The measurement ran but found nothing about the network (the test server
+					// failed, for instance). Its row tells why.
+					notTested.Add(target.Name);
+				}
 			}
 		}
 		catch (OperationCanceledException)
@@ -437,8 +648,29 @@ internal partial class AppController
 		}
 		finally
 		{
-			if (isChanged)
-				await RestoreAsync(interfaceId, original, kind).ConfigureAwait(false);
+			var result = isChanged
+				? await RestoreAsync(original).ConfigureAwait(false)
+				: (original is null) ? ProbeReturn.NotConnectedBefore : ProbeReturn.Unchanged;
+
+			Volatile.Write(ref _probeRestore, null);
+
+			// The end of the test is recorded as its start is. On closing, it may have been
+			// recorded already by the closing thread, which could not wait any longer.
+			if (isStarted && !(_isClosing && (Interlocked.CompareExchange(ref _closeRecorded, 1, 0) != 0)))
+			{
+				var end = _isClosing
+					? ProbeEnd.Closing
+					: _isProbeInterrupted
+						? ProbeEnd.Interrupted
+						: cancellationToken.IsCancellationRequested ? ProbeEnd.Canceled : ProbeEnd.Completed;
+
+				var summary = GetProbeSummary(total, tested, notTested, original?.Name, end, result);
+
+				AppendProbeEvent(interfaceId, kind, null, (result is ProbeReturn.Restored or ProbeReturn.RequestedOnClosing) ? original?.Name : null, summary);
+
+				if (end is ProbeEnd.Closing)
+					RecordProbeOperation(summary + ".");
+			}
 
 			try
 			{
@@ -567,45 +799,82 @@ internal partial class AppController
 	/// <summary>
 	/// Connects again to the profile which was connected before the test of networks.
 	/// </summary>
+	/// <returns>Where the interface was left</returns>
 	/// <remarks>
 	/// If the user connected or disconnected during the test, the choice of the user is left
-	/// as it is. This method never throws an exception.
+	/// as it is. While this app is being closed, the connection is asked for once and without
+	/// delay because the closing thread waits only for a few seconds. This method never throws
+	/// an exception.
 	/// </remarks>
-	private async Task RestoreAsync(Guid interfaceId, ProfileItem original, SwitchKind kind)
+	private async Task<ProbeReturn> RestoreAsync(ProfileItem original)
 	{
 		try
 		{
-			if ((original is null) || _disposed || _isProbeInterrupted)
-				return;
+			if (original is null)
+				return ProbeReturn.NotConnectedBefore;
+
+			if (_isProbeInterrupted)
+				return ProbeReturn.LeftToUser;
+
+			if (_disposed)
+				return ProbeReturn.Failed;
 
 			// The connection is left as it is only when the original profile is confirmed to be
 			// connected by a load performed after the test. A load skipped because of another
 			// update would leave the profiles as they were before the test connected to others.
-			var isLoaded = await LoadProfilesFreshAsync(_probeFreshTimeout).ConfigureAwait(false);
+			var isLoaded = await LoadProfilesFreshAsync(_isClosing ? _probeCloseLoadTimeout : _probeFreshTimeout).ConfigureAwait(false);
 
-			if (_disposed || _isProbeInterrupted)
-				return;
+			if (_isProbeInterrupted)
+				return ProbeReturn.LeftToUser;
 
 			if (isLoaded && original.IsConnected)
-				return;
+				return ProbeReturn.Restored;
+
+			// The closing thread may have asked for the connection in the meantime.
+			if (Interlocked.CompareExchange(ref _restoreIssued, 1, 0) != 0)
+				return ProbeReturn.RequestedOnClosing;
+
+			if (_disposed)
+				return ProbeReturn.Failed;
 
 			var result = await ConnectNetworkAsync(original, false).ConfigureAwait(false);
 			if (!result && !_disposed && !_isProbeInterrupted && !_isClosing)
 			{
 				await Task.Delay(_probeRetryDelay).ConfigureAwait(false);
 
-				if (_disposed || _isProbeInterrupted)
-					return;
+				if (_isProbeInterrupted)
+					return ProbeReturn.LeftToUser;
 
-				result = await ConnectNetworkAsync(original, false).ConfigureAwait(false);
+				if (!_disposed)
+					result = await ConnectNetworkAsync(original, false).ConfigureAwait(false);
 			}
 
-			if (!result && !_isProbeInterrupted)
-				AppendProbeEvent(interfaceId, kind, null, original.Name, $"Could not return to {original.Name}");
+			if (result)
+				return ProbeReturn.Restored;
+
+			// On closing, the connection may only not have completed within the time waited.
+			if (_isClosing)
+				return ProbeReturn.RequestedOnClosing;
+
+			return _isProbeInterrupted ? ProbeReturn.LeftToUser : ProbeReturn.Failed;
 		}
 		catch (Exception ex)
 		{
 			Trace.WriteLine("Failed to restore the connection after the test of networks." + Environment.NewLine
+				+ ex);
+			return ProbeReturn.Failed;
+		}
+	}
+
+	private static void RecordProbeOperation(string content)
+	{
+		try
+		{
+			Logger.RecordOperation(content);
+		}
+		catch (Exception ex)
+		{
+			Trace.WriteLine("Failed to record the end of the test of networks." + Environment.NewLine
 				+ ex);
 		}
 	}
@@ -656,8 +925,8 @@ internal partial class AppController
 			if (DateTime.UtcNow - GetLastIdleProbeTime() < TimeSpan.FromHours(Settings.Current.ProbeInterval))
 				return;
 
-			// This test is automatic and so is subject to the daily budget.
-			if (History.GetBytesToday() >= Settings.Current.SpeedTestDailyBudget * 1_000_000L)
+			// This test is automatic and so is subject to the daily budget if the user set one.
+			if (Settings.IsBudgetUsedUp(Settings.Current.SpeedTestDailyBudget, History.GetBytesToday()))
 				return;
 
 			var signalThreshold = Settings.Current.SpeedSignalThreshold + SwitchPolicy.EntryMargin;

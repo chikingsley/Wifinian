@@ -847,7 +847,7 @@ public class HistoryServiceTest
 		// The database is as an earlier build left it.
 		using (var connection = OpenDatabase())
 		{
-			Execute(connection, "PRAGMA user_version = 1;");
+			Execute(connection, "ALTER TABLE speed DROP COLUMN detail; PRAGMA user_version = 1;");
 		}
 
 		using (var history = CreateHistory())
@@ -879,6 +879,58 @@ public class HistoryServiceTest
 		using (var history = CreateHistory())
 		{
 			Assert.AreEqual(80.0, history.ReadSpeeds(_start.AddMinutes(10), _start.AddMinutes(10)).Single().UpMbps);
+		}
+	}
+
+	[TestMethod]
+	public void TestSpeedDetailIsAddedAndKept()
+	{
+		using (var history = CreateHistory())
+		{
+			history.AppendSpeed(CreateSpeed(_start, "Office", SpeedResult.Ok, 70));
+		}
+
+		// The database is as the build before the detail of a measurement left it.
+		using (var connection = OpenDatabase())
+		{
+			Execute(connection, "ALTER TABLE speed DROP COLUMN detail; PRAGMA user_version = 2;");
+		}
+
+		using (var history = CreateHistory())
+		{
+			// The row of the earlier build is read with no detail.
+			var old = history.ReadSpeeds(_start, _start.AddHours(1)).Single();
+			Assert.AreEqual(70D, old.DownMbps);
+			Assert.IsNull(old.Detail);
+
+			var failed = CreateSpeed(_start.AddMinutes(1), "Office", SpeedResult.EndpointFailed, null);
+			failed.Detail = "Download got no byte in two attempts: HTTP 429 Too Many Requests";
+			history.AppendSpeed(failed);
+		}
+
+		using (var connection = OpenDatabase())
+		{
+			Assert.AreEqual((long)HistoryService.SchemaVersion, Query(connection, "PRAGMA user_version;").Single());
+			Assert.IsTrue(HistoryService.SchemaVersion >= 3);
+		}
+
+		using (var history = CreateHistory())
+		{
+			var speeds = history.ReadSpeeds(_start, _start.AddHours(1)).OrderBy(x => x.Time).ToArray();
+			Assert.AreEqual(2, speeds.Length);
+			Assert.IsNull(speeds[0].Detail);
+			Assert.AreEqual(SpeedResult.EndpointFailed, speeds[1].Result);
+			Assert.AreEqual("Download got no byte in two attempts: HTTP 429 Too Many Requests", speeds[1].Detail);
+
+			// The detail goes to the CSV as the last column and comes back from it.
+			var columns = CsvLine.GetColumns(SpeedSample.Header);
+			Assert.IsTrue(SpeedSample.TryParse(columns, CsvLine.Split(speeds[1].ToCsv()), out SpeedSample parsed));
+			Assert.AreEqual(speeds[1].Detail, parsed.Detail);
+
+			// A CSV of an earlier build has no such column.
+			var oldColumns = CsvLine.GetColumns(SpeedSample.Header.Replace(",Detail", string.Empty));
+			Assert.IsTrue(SpeedSample.TryParse(oldColumns, CsvLine.Split(speeds[0].ToCsv()), out parsed));
+			Assert.IsNull(parsed.Detail);
 		}
 	}
 
@@ -1215,9 +1267,9 @@ public class HistoryServiceTest
 
 		var lines = Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3).Split(new[] { "\r\n" }, StringSplitOptions.None);
 		Assert.AreEqual(4, lines.Length); // Header, rows and empty string after the last line end
-		Assert.AreEqual("Time,InterfaceId,Profile,Bssid,Band,Channel,Signal,LinkRate,GatewayMs,LatencyMs,JitterMs,DownMbps,UpMbps,DownBytes,UpBytes,DurationMs,Trigger,Result,Valid", lines[0]);
-		Assert.AreEqual("2026-11-17T10:00:00Z,11111111-2222-3333-4444-555555555555,\"Café, \"\"Guest\"\" 5G\",AA:BB:CC:00:00:01,5,36,53,866,1.5,18.2,2.1,70.3,12.3,20000000,5000000,9500,Periodic,Ok,1", lines[1]);
-		Assert.IsTrue(lines[2].EndsWith(",,12.3,20000000,5000000,9500,Periodic,RouteMismatch,0"));
+		Assert.AreEqual("Time,InterfaceId,Profile,Bssid,Band,Channel,Signal,LinkRate,GatewayMs,LatencyMs,JitterMs,DownMbps,UpMbps,DownBytes,UpBytes,DurationMs,Trigger,Result,Valid,Detail", lines[0]);
+		Assert.AreEqual("2026-11-17T10:00:00Z,11111111-2222-3333-4444-555555555555,\"Café, \"\"Guest\"\" 5G\",AA:BB:CC:00:00:01,5,36,53,866,1.5,18.2,2.1,70.3,12.3,20000000,5000000,9500,Periodic,Ok,1,", lines[1]);
+		Assert.IsTrue(lines[2].EndsWith(",,12.3,20000000,5000000,9500,Periodic,RouteMismatch,0,"));
 		Assert.AreEqual("", lines[3]);
 
 		lines = File.ReadAllLines(filePaths[0]);
