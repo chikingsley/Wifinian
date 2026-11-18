@@ -71,7 +71,13 @@ internal partial class AppController
 	/// <summary>
 	/// Period after which a measurement of a network is regarded as old enough to test it when idle
 	/// </summary>
-	internal static readonly TimeSpan ProbeStalePeriod = TimeSpan.FromDays(3);
+	/// <remarks>
+	/// This is shorter than the period within which the newest measurement of a network limits
+	/// its score for switching (<see cref="SwitchPolicy.RecentPeriod"/>, 24 hours) so that the next
+	/// test can come before that measurement leaves the period. A longer period, three days
+	/// originally, left the other networks judged by measurements days old.
+	/// </remarks>
+	internal static readonly TimeSpan ProbeStalePeriod = TimeSpan.FromHours(18);
 
 	/// <summary>
 	/// Whether networks are being connected to one after another for measurement
@@ -999,20 +1005,39 @@ internal partial class AppController
 			if (!Settings.Current.ProbesWhenIdle)
 				return;
 
-			if (!EngagesPriority.Value || !Settings.Current.EngagesSpeed)
+			// While the user operates this machine, the test is not due and nothing is noted.
+			if (IdleDetector.GetIdleTime() < _idleTime)
+			{
+				ClearIdleNotes();
 				return;
+			}
 
+			if (!EngagesPriority.Value || !Settings.Current.EngagesSpeed)
+			{
+				NoteIdle("off", "it runs only while switching by speed is turned on");
+				return;
+			}
+
+			// Other work in progress ends shortly and so is not noted.
 			if (!CanIdleProbe())
 				return;
 
-			if (DateTime.UtcNow - GetLastIdleProbeTime() < TimeSpan.FromHours(Settings.Current.ProbeInterval))
+			var interval = TimeSpan.FromHours(Settings.Current.ProbeInterval);
+			var elapsed = DateTime.UtcNow - GetLastIdleProbeTime();
+			if (elapsed < interval)
+			{
+				NoteIdle("interval", $"the last one was {elapsed.TotalMinutes:0} min ago and they are at least {interval.TotalHours:0} h apart");
 				return;
+			}
 
 			// This test is automatic and so is subject to the daily limit if the user set one.
 			if (IsDailyLimitReached())
 				return;
 
 			var signalThreshold = Settings.Current.SpeedSignalThreshold + SwitchPolicy.EntryMargin;
+			var hasCandidate = false;
+			var isConnected = false;
+			var isPending = false;
 
 			foreach (var subProfiles in GetProfiles().GroupBy(x => x.InterfaceId))
 			{
@@ -1020,14 +1045,25 @@ internal partial class AppController
 
 				// An automatic switch made just before is yet to be checked.
 				if (HasLanding(interfaceId))
+				{
+					isPending = true;
 					continue;
+				}
+
+				isConnected |= subProfiles.Any(x => x.IsConnected);
 
 				var candidate = SelectIdleCandidate(subProfiles, signalThreshold, GetLastProbeTime, DateTime.UtcNow);
 				if (candidate is null)
 					continue;
 
-				if (await LinkInspector.GetRateMbpsAsync(interfaceId, _idleRateWindow).ConfigureAwait(false) >= IdleRate)
+				hasCandidate = true;
+
+				var rate = await LinkInspector.GetRateMbpsAsync(interfaceId, _idleRateWindow).ConfigureAwait(false);
+				if (rate >= IdleRate)
+				{
+					NoteIdle("rate", $"the connection is in use ({rate:0.0} Mbps, it must be below {IdleRate:0.0} Mbps)");
 					continue;
+				}
 
 				// The conditions may have changed in the meantime.
 				if (!CanIdleProbe() || candidate.IsConnected)
@@ -1038,8 +1074,19 @@ internal partial class AppController
 					_lastIdleProbeTime = DateTime.UtcNow;
 				}
 
+				ClearIdleNotes();
+
 				await ProbeAsync(new[] { interfaceId }, new[] { candidate }, SpeedTrigger.IdleProbe).ConfigureAwait(false);
 				return;
+			}
+
+			if (!hasCandidate && !isPending && !isConnected)
+			{
+				NoteIdle("offline", "no network is connected (or the profiles are not loaded yet)");
+			}
+			else if (!hasCandidate && !isPending)
+			{
+				NoteIdle("none", $"no other network needs it (the connected one has Auto switch off, or each other one is measured within {ProbeStalePeriod.TotalHours:0} h, out of range, too weak, set aside or has Auto switch off)");
 			}
 		}
 		catch (Exception ex)
@@ -1047,6 +1094,31 @@ internal partial class AppController
 			Trace.WriteLine("Failed to test a network when idle." + Environment.NewLine
 				+ ex);
 		}
+	}
+
+	private readonly HashSet<string> _idleNotes = new(); // Reasons noted in this idle time
+
+	private void ClearIdleNotes()
+	{
+		lock (_idleNotes)
+		{
+			_idleNotes.Clear();
+		}
+	}
+
+	/// <summary>
+	/// Records, once per reason and per time this machine is idle, why the test when idle is
+	/// not run although the user is away.
+	/// </summary>
+	private void NoteIdle(string code, string why)
+	{
+		lock (_idleNotes)
+		{
+			if (!_idleNotes.Add(code))
+				return;
+		}
+
+		RecordIgnored(GetProbeName(SpeedTrigger.IdleProbe), why);
 	}
 
 	private bool CanIdleProbe() =>
