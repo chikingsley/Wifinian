@@ -211,7 +211,8 @@ With `-DryRun` the script ends after step 4 and puts the version in the working 
    ```
 
  * Other:<br>
-:floppy_disk: [Installer](https://github.com/emoacht/Wifinian/releases/download/3.8.0-Installer/WifinianInstaller380.zip)
+:floppy_disk: This fork (speed history, switching by speed, self-update; installs per user, no administrator needed): [Wifinian.Installer.msi](https://github.com/chikingsley/Wifinian/releases/latest/download/Wifinian.Installer.msi)<br>
+:floppy_disk: Original 3.8.0: [Installer](https://github.com/emoacht/Wifinian/releases/download/3.8.0-Installer/WifinianInstaller380.zip)
 
 ## Install/Uninstall
 
